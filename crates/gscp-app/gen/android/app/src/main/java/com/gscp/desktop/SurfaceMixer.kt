@@ -18,24 +18,37 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
+
 /**
- * 双层合成渲染（GLES2）：
- * - 底层 = 眼镜 camera 码流（MediaCodec 输出 Surface → EXTERNAL_OES），
- *   支持旋转/镜像/宽高比（cover 铺满）；
- * - 顶层 = overlay 码流，支持缩放/宽高比（contain 居中），2 秒无帧自动隐藏
- *   （与桌面端 overlay 静默语义一致）。
- * 输出可同时挂多个 Surface（屏幕 + 录制）。
+ * 双层合成渲染（GLES2），效果链与桌面端 WGSL 管线对齐：
+ * - 底层 = 眼镜 camera 码流（MediaCodec → EXTERNAL_OES），旋转/镜像/宽高比 cover；
+ * - 顶层 = overlay 码流，轴对齐矩形 contain 铺放 × overlay_scale，效果链：
+ *   5 点 AA + 边缘锐化 → 黑边抠像(luma 阈值+羽化) → 饱和度增强 → 加色混合，
+ *   overlay 区域内底图按 dim_strength 圆角蒙版压暗，2 秒无帧自动隐藏；
+ * - 输出可同时挂多个 Surface（屏幕 + 录制）。
  */
 class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
-    // 配置
+    // 底层配置
     private var bottomRotation = 90f
-    private var bottomScale = 1.0f
     private var bottomMirror = false
-    private var topRotation = 0.0f
-    private var topScale = 0.7f
+    private var bottomAspectRatio = 4f / 3f
+    private var baseBrightness = 1.0f
+
+    // 顶层配置
+    private var topRotationDeg = 0
     private var topMirror = false
     private var topAspectRatio = 4f / 3f
-    private var bottomAspectRatio = 4f / 3f
+    private var overlayScale = 1.0f
+
+    // overlay 效果参数（与桌面 EffectParams 同名同语义）
+    private var overlayAlpha = 1.0f
+    private var overlayBrightness = 1.0f
+    private var overlaySaturation = 1.0f
+    private var dimStrength = 0.0f
+    private var keyLow = 0.0f
+    private var keyHigh = 0.0f
+    private var featherPower = 1.35f
+    private var featherRadius = 0.0f
 
     private val lock = object {}
     private val renderSurfaces = mutableListOf<RenderSurface>()
@@ -53,7 +66,6 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private lateinit var vertexBuffer: FloatBuffer
     private lateinit var texBuffer: FloatBuffer
     private lateinit var bottomViewMatrix: FloatArray
-    private lateinit var topViewMatrix: FloatArray
 
     private var program = 0
     private var topTexture = 0
@@ -62,13 +74,22 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private var aTexCoordinator = 0
     private var uBottomTexture = 0
     private var uTopTexture = 0
-    private var uBottomTransform = 0
-    private var uTopTransform = 0
     private var uBottomViewMatrix = 0
-    private var uTopViewMatrix = 0
     private var uBottomMirror = 0
+    private var uBaseBrightness = 0
+    private var uTopRect = 0
+    private var uTopRotation = 0
     private var uTopMirror = 0
     private var uTopEnable = 0
+    private var uTopTexel = 0
+    private var uOverlayAlpha = 0
+    private var uOverlayBrightness = 0
+    private var uOverlaySaturation = 0
+    private var uDimStrength = 0
+    private var uKeyLow = 0
+    private var uKeyHigh = 0
+    private var uFeatherPower = 0
+    private var uFeatherRadius = 0
     private var topViewTimestamp: Long = 0
     private var bottomViewTimestamp: Long = 0
 
@@ -168,13 +189,22 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         aTexCoordinator = GLES20.glGetAttribLocation(program, "aTexCoord")
         uBottomTexture = GLES20.glGetUniformLocation(program, "uBottomTexture")
         uTopTexture = GLES20.glGetUniformLocation(program, "uTopTexture")
-        uBottomTransform = GLES20.glGetUniformLocation(program, "uBottomTransform")
-        uTopTransform = GLES20.glGetUniformLocation(program, "uTopTransform")
         uBottomViewMatrix = GLES20.glGetUniformLocation(program, "uBottomViewMatrix")
-        uTopViewMatrix = GLES20.glGetUniformLocation(program, "uTopViewMatrix")
         uBottomMirror = GLES20.glGetUniformLocation(program, "uBottomMirror")
+        uBaseBrightness = GLES20.glGetUniformLocation(program, "uBaseBrightness")
+        uTopRect = GLES20.glGetUniformLocation(program, "uTopRect")
+        uTopRotation = GLES20.glGetUniformLocation(program, "uTopRotation")
         uTopMirror = GLES20.glGetUniformLocation(program, "uTopMirror")
         uTopEnable = GLES20.glGetUniformLocation(program, "uTopEnable")
+        uTopTexel = GLES20.glGetUniformLocation(program, "uTopTexel")
+        uOverlayAlpha = GLES20.glGetUniformLocation(program, "uOverlayAlpha")
+        uOverlayBrightness = GLES20.glGetUniformLocation(program, "uOverlayBrightness")
+        uOverlaySaturation = GLES20.glGetUniformLocation(program, "uOverlaySaturation")
+        uDimStrength = GLES20.glGetUniformLocation(program, "uDimStrength")
+        uKeyLow = GLES20.glGetUniformLocation(program, "uKeyLow")
+        uKeyHigh = GLES20.glGetUniformLocation(program, "uKeyHigh")
+        uFeatherPower = GLES20.glGetUniformLocation(program, "uFeatherPower")
+        uFeatherRadius = GLES20.glGetUniformLocation(program, "uFeatherRadius")
 
         val vertices = floatArrayOf(
             -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
@@ -193,11 +223,8 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         texBuffer.put(textureCoordinates).position(0)
 
         bottomViewMatrix = FloatArray(16)
-        topViewMatrix = FloatArray(16)
         createSurface()
-
-        updateMatrix(bottomViewMatrix, bottomAspectRatio, bottomScale, bottomRotation, true)
-        updateMatrix(topViewMatrix, topAspectRatio, topScale, topRotation, false)
+        refreshMatrices()
     }
 
     fun attachOutputSurface(surface: Surface) {
@@ -236,16 +263,41 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         GLES20.glVertexAttribPointer(aTexCoordinator, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
 
         GLES20.glUniformMatrix4fv(uBottomViewMatrix, 1, false, bottomViewMatrix, 0)
-        GLES20.glUniformMatrix4fv(uTopViewMatrix, 1, false, topViewMatrix, 0)
-
         GLES20.glUniform1i(uBottomMirror, if (bottomMirror) 1 else 0)
+        GLES20.glUniform1f(uBaseBrightness, baseBrightness)
+
+        // overlay 几何：内容旋转 90/270 时宽高比取倒数后 contain 铺放 × overlay_scale
+        val contentAspect = if ((topRotationDeg / 90) % 2 == 1) 1f / topAspectRatio else topAspectRatio
+        val canvasAspect = width.toFloat() / height
+        var rw: Float
+        var rh: Float
+        if (contentAspect / canvasAspect > 1f) {
+            rh = 1f; rw = canvasAspect / contentAspect
+        } else {
+            rw = 1f; rh = contentAspect / canvasAspect
+        }
+        rw *= overlayScale; rh *= overlayScale
+        GLES20.glUniform4f(uTopRect, 0.5f, 0.5f, rw / 2f, rh / 2f)
+        GLES20.glUniform1i(uTopRotation, (topRotationDeg / 90) % 4)
         GLES20.glUniform1i(uTopMirror, if (topMirror) 1 else 0)
+        GLES20.glUniform2f(uTopTexel, 1f / width, 1f / height)
+
+        GLES20.glUniform1f(uOverlayAlpha, overlayAlpha)
+        GLES20.glUniform1f(uOverlayBrightness, overlayBrightness)
+        GLES20.glUniform1f(uOverlaySaturation, overlaySaturation)
+        GLES20.glUniform1f(uDimStrength, dimStrength)
+        GLES20.glUniform1f(uKeyLow, keyLow)
+        GLES20.glUniform1f(uKeyHigh, keyHigh)
+        GLES20.glUniform1f(uFeatherPower, featherPower)
+        GLES20.glUniform1f(uFeatherRadius, featherRadius)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, bottomTexture)
         GLES20.glUniform1i(uBottomTexture, 0)
 
-        if (System.currentTimeMillis() - topViewTimestamp < 2000) {
+        // overlay 2 秒无帧自动隐藏（与桌面端静默语义一致）
+        val topAlive = System.currentTimeMillis() - topViewTimestamp < 2000
+        if (topAlive) {
             GLES20.glUniform1i(uTopEnable, 1)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, topTexture)
@@ -253,9 +305,6 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         } else {
             GLES20.glUniform1i(uTopEnable, 0)
         }
-
-        GLES20.glEnable(GLES20.GL_BLEND)
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
         synchronized(renderSurfaces) {
             for (rs in renderSurfaces) {
@@ -267,7 +316,6 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
             }
         }
 
-        GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glDisableVertexAttribArray(aPosition)
         GLES20.glDisableVertexAttribArray(aTexCoordinator)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
@@ -325,19 +373,17 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         return shader
     }
 
-    private fun updateMatrix(matrix: FloatArray, aspectRatio: Float, scale: Float, rotation: Float, fill: Boolean) {
+    private fun updateMatrix(matrix: FloatArray, aspectRatio: Float, rotation: Float) {
         Matrix.setIdentityM(matrix, 0)
 
-        var scaleX = 1.0f / scale
-        var scaleY = 1.0f / scale
-        val viewAspect = width.toFloat() / height
-        if (viewAspect != aspectRatio) {
-            if (fill) {
-                if (aspectRatio > 1.0) scaleX = scaleY / aspectRatio
-                else scaleY = scaleX * aspectRatio
-            } else {
-                scaleY = scaleX * aspectRatio / viewAspect
-            }
+        // cover：铺满画布（宽高比不匹配时短边对齐，长边裁剪）
+        val canvasAspect = width.toFloat() / height
+        var scaleX = 1.0f
+        var scaleY = 1.0f
+        if (aspectRatio > canvasAspect) {
+            scaleX = canvasAspect / aspectRatio
+        } else {
+            scaleY = aspectRatio / canvasAspect
         }
 
         // 旋转
@@ -354,21 +400,9 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         Matrix.translateM(matrix, 0, offsetX.toFloat(), offsetY.toFloat(), 0f)
     }
 
-    /** value ∈ 0..100 → overlay 缩放 0.4..1.0 */
-    fun setTopScale(value: Int) {
-        topScale = 0.4f + 0.6f * value / 100.0f
-        refreshMatrices()
-    }
-
     fun setBottomRotation(rotation: Float, mirror: Boolean) {
         bottomRotation = rotation
         bottomMirror = mirror
-        refreshMatrices()
-    }
-
-    fun setTopRotation(rotation: Float, mirror: Boolean) {
-        topRotation = rotation
-        topMirror = mirror
         refreshMatrices()
     }
 
@@ -377,14 +411,48 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         refreshMatrices()
     }
 
+    fun setTopRotation(rotationDeg: Int, mirror: Boolean) {
+        topRotationDeg = rotationDeg
+        topMirror = mirror
+    }
+
     fun setTopAspectRatio(ratio: Float) {
         topAspectRatio = ratio
-        refreshMatrices()
+    }
+
+    /** overlay 相对 contain 铺放的缩放（1.0 = 铺满 contain 矩形）。 */
+    fun setOverlayScale(scale: Float) {
+        overlayScale = scale.coerceIn(0.1f, 8.0f)
+    }
+
+    /** 效果参数批量下发（与桌面 EffectParams 同名同语义）。 */
+    fun setOverlayParams(
+        alpha: Float,
+        brightness: Float,
+        saturation: Float,
+        dim: Float,
+        keyLow: Float,
+        keyHigh: Float,
+        featherPower: Float,
+        featherRadiusPx: Int,
+    ) {
+        overlayAlpha = alpha.coerceIn(0f, 1f)
+        overlayBrightness = brightness.coerceAtLeast(0f)
+        overlaySaturation = saturation.coerceIn(0f, 4f)
+        dimStrength = dim.coerceIn(0f, 1f)
+        this.keyLow = keyLow.coerceIn(0f, 1f)
+        this.keyHigh = keyHigh.coerceIn(0f, 1f)
+        this.featherPower = featherPower.coerceIn(0.1f, 8f)
+        this.featherRadius = featherRadiusPx / 255f
+    }
+
+    /** 底图亮度（与桌面 base_brightness 同语义）。 */
+    fun setBaseBrightness(value: Float) {
+        baseBrightness = value.coerceIn(0f, 4f)
     }
 
     private fun refreshMatrices() {
-        updateMatrix(bottomViewMatrix, bottomAspectRatio, bottomScale, bottomRotation, true)
-        updateMatrix(topViewMatrix, topAspectRatio, topScale, topRotation, false)
+        updateMatrix(bottomViewMatrix, bottomAspectRatio, bottomRotation)
     }
 
     companion object {

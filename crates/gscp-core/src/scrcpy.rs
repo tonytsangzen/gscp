@@ -446,7 +446,7 @@ fn tcp_keepalive_unix(stream: &TcpStream) {
             &idle as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             libc::setsockopt(
                 fd,

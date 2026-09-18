@@ -56,7 +56,16 @@ class MainActivity : AppCompatActivity() {
     private var playing = false
 
     // 可配置参数（连接页右上角设置）
-    private var topScalePercent = 50
+    private var overlayScalePct = 100          // overlay_scale ×100（100 = contain 铺满）
+    private var overlayAlphaPct = 100          // overlay_alpha ×100
+    private var overlayBrightnessPct = 100     // overlay_brightness ×100
+    private var overlaySaturationPct = 100     // saturation_boost ×100
+    private var dimStrengthPct = 0             // dim_strength ×100
+    private var keyLowPct = 0                  // overlay_black_key_low ×100
+    private var keyHighPct = 0                 // overlay_black_key_high ×100
+    private var featherPowerPct = 135          // overlay_feather_power ×100
+    private var featherRadiusPx = 0            // overlay_feather_radius（px/255）
+    private var baseBrightnessPct = 100        // base_brightness ×100
     private var bottomRotationDeg = 90
     private var bottomMirror = false
     private var topRotationDeg = 0
@@ -115,7 +124,16 @@ class MainActivity : AppCompatActivity() {
     // ── 参数设置 ──────────────────────────────────────────────
 
     private fun loadSettings() {
-        topScalePercent = prefs.getInt("topScalePercent", 50)
+        overlayScalePct = prefs.getInt("overlayScalePct", 100)
+        overlayAlphaPct = prefs.getInt("overlayAlphaPct", 100)
+        overlayBrightnessPct = prefs.getInt("overlayBrightnessPct", 100)
+        overlaySaturationPct = prefs.getInt("overlaySaturationPct", 100)
+        dimStrengthPct = prefs.getInt("dimStrengthPct", 0)
+        keyLowPct = prefs.getInt("keyLowPct", 0)
+        keyHighPct = prefs.getInt("keyHighPct", 0)
+        featherPowerPct = prefs.getInt("featherPowerPct", 135)
+        featherRadiusPx = prefs.getInt("featherRadiusPx", 0)
+        baseBrightnessPct = prefs.getInt("baseBrightnessPct", 100)
         bottomRotationDeg = prefs.getInt("bottomRotationDeg", 90)
         bottomMirror = prefs.getBoolean("bottomMirror", false)
         topRotationDeg = prefs.getInt("topRotationDeg", 0)
@@ -125,9 +143,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applySettingsToMixer() {
-        mixer.setTopScale(topScalePercent)
+        mixer.setOverlayScale(overlayScalePct / 100f)
+        mixer.setOverlayParams(
+            overlayAlphaPct / 100f,
+            overlayBrightnessPct / 100f,
+            overlaySaturationPct / 100f,
+            dimStrengthPct / 100f,
+            keyLowPct / 100f,
+            keyHighPct / 100f,
+            featherPowerPct / 100f,
+            featherRadiusPx,
+        )
+        mixer.setBaseBrightness(baseBrightnessPct / 100f)
         mixer.setBottomRotation(bottomRotationDeg.toFloat(), bottomMirror)
-        mixer.setTopRotation(topRotationDeg.toFloat(), topMirror)
+        mixer.setTopRotation(topRotationDeg, topMirror)
     }
 
     @SuppressLint("InflateParams")
@@ -155,17 +184,37 @@ class MainActivity : AppCompatActivity() {
             setSelection(initialDeg / 90)
         }
 
-        // overlay 缩放
-        container.addView(label("overlay 缩放"))
-        val scaleBar = SeekBar(this).apply { max = 100; progress = topScalePercent }
+        // overlay 缩放（相对 contain 铺放，%）
+        container.addView(label("overlay 缩放 (%)"))
+        val scaleBar = SeekBar(this).apply { max = 200; progress = overlayScalePct }
         container.addView(scaleBar)
 
-        // 底图（camera）旋转/镜像
+        // 底图（camera）旋转/镜像/亮度
         container.addView(label("底图旋转"))
         val bottomSpin = rotationSpinner(bottomRotationDeg)
         container.addView(bottomSpin)
         val bottomMirrorBox = CheckBox(this).apply { text = "底图镜像"; isChecked = bottomMirror }
         container.addView(bottomMirrorBox)
+        val baseBrightnessBar = SeekBar(this).apply { max = 200; progress = baseBrightnessPct }
+        container.addView(percentBarWithLabel("底图亮度 (%)", baseBrightnessBar))
+
+        // overlay 效果（与桌面端「渲染效果」同名同语义）
+        val overlayAlphaBar = SeekBar(this).apply { max = 100; progress = overlayAlphaPct }
+        container.addView(percentBarWithLabel("overlay 不透明度 (%)", overlayAlphaBar))
+        val overlayBrightnessBar = SeekBar(this).apply { max = 200; progress = overlayBrightnessPct }
+        container.addView(percentBarWithLabel("overlay 亮度 (%)", overlayBrightnessBar))
+        val overlaySaturationBar = SeekBar(this).apply { max = 200; progress = overlaySaturationPct }
+        container.addView(percentBarWithLabel("overlay 饱和度 (%)", overlaySaturationBar))
+        val dimBar = SeekBar(this).apply { max = 100; progress = dimStrengthPct }
+        container.addView(percentBarWithLabel("overlay 区域压暗 (%)", dimBar))
+        val keyLowBar = SeekBar(this).apply { max = 100; progress = keyLowPct }
+        container.addView(percentBarWithLabel("黑边抠像下限 (%)", keyLowBar))
+        val keyHighBar = SeekBar(this).apply { max = 100; progress = keyHighPct }
+        container.addView(percentBarWithLabel("黑边抠像上限 (%)（≤下限=关闭）", keyHighBar))
+        val featherPowerBar = SeekBar(this).apply { max = 400; progress = featherPowerPct }
+        container.addView(percentBarWithLabel("抠像羽化强度 (%)", featherPowerBar))
+        val featherRadiusBar = SeekBar(this).apply { max = 64; progress = featherRadiusPx }
+        container.addView(percentBarWithLabel("抠像羽化外扩 (px/255)", featherRadiusBar))
 
         // overlay 旋转/镜像
         container.addView(label("overlay 旋转"))
@@ -182,14 +231,32 @@ class MainActivity : AppCompatActivity() {
             .setTitle("参数设置")
             .setView(android.widget.ScrollView(this).apply { addView(container) })
             .setPositiveButton("保存") { _, _ ->
-                topScalePercent = scaleBar.progress
+                overlayScalePct = scaleBar.progress.coerceIn(30, 200)
+                baseBrightnessPct = baseBrightnessBar.progress
+                overlayAlphaPct = overlayAlphaBar.progress
+                overlayBrightnessPct = overlayBrightnessBar.progress
+                overlaySaturationPct = overlaySaturationBar.progress
+                dimStrengthPct = dimBar.progress
+                keyLowPct = keyLowBar.progress
+                keyHighPct = keyHighBar.progress
+                featherPowerPct = featherPowerBar.progress.coerceIn(50, 400)
+                featherRadiusPx = featherRadiusBar.progress
                 bottomRotationDeg = bottomSpin.selectedItemPosition * 90
                 bottomMirror = bottomMirrorBox.isChecked
                 topRotationDeg = topSpin.selectedItemPosition * 90
                 topMirror = topMirrorBox.isChecked
                 audioEnabled = audioBox.isChecked
                 prefs.edit()
-                    .putInt("topScalePercent", topScalePercent)
+                    .putInt("overlayScalePct", overlayScalePct)
+                    .putInt("baseBrightnessPct", baseBrightnessPct)
+                    .putInt("overlayAlphaPct", overlayAlphaPct)
+                    .putInt("overlayBrightnessPct", overlayBrightnessPct)
+                    .putInt("overlaySaturationPct", overlaySaturationPct)
+                    .putInt("dimStrengthPct", dimStrengthPct)
+                    .putInt("keyLowPct", keyLowPct)
+                    .putInt("keyHighPct", keyHighPct)
+                    .putInt("featherPowerPct", featherPowerPct)
+                    .putInt("featherRadiusPx", featherRadiusPx)
                     .putInt("bottomRotationDeg", bottomRotationDeg)
                     .putBoolean("bottomMirror", bottomMirror)
                     .putInt("topRotationDeg", topRotationDeg)
@@ -200,6 +267,19 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /** SeekBar 与其百分比标签组成一行。 */
+    private fun percentBarWithLabel(text: String, bar: SeekBar): android.view.View {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val label = TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            setPadding(0, 2, 0, 2)
+        }
+        row.addView(label)
+        row.addView(bar)
+        return row
     }
 
     // ── 连接 / 播放 ──────────────────────────────────────────
