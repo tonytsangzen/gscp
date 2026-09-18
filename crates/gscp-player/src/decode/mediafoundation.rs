@@ -15,9 +15,9 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::*;
@@ -270,6 +270,18 @@ impl Drop for MediaFoundationDecoder {
 
 impl Session {
     fn new(mft: IMFTransform, width: u32, height: u32) -> Result<Self> {
+        // 低延迟：内置解码器默认缓冲多帧用于重排，相机流无 B 帧时纯增加延迟
+        match unsafe { mft.GetAttributes() } {
+            Ok(attrs) => {
+                if let Err(err) = unsafe { attrs.SetUINT32(&MF_LOW_LATENCY, 1) } {
+                    gscp_core::logbus::emit(&format!("[decoder] 设置 MF_LOW_LATENCY 失败: {err}"));
+                }
+            }
+            Err(err) => {
+                gscp_core::logbus::emit(&format!("[decoder] MFT 属性不可用（跳过低延迟设置）: {err}"));
+            }
+        }
+
         // D3D11/DXVA：MFT 声明 D3D11 感知时挂设备管理器启用硬解
         let mut d3d = None;
         let aware = unsafe {
@@ -324,6 +336,11 @@ impl Session {
             & ((MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
                 as u32)
             == 0;
+        gscp_core::logbus::emit(&format!(
+            "[decoder] MFT 输出流 flags=0x{:x}（DXVA 管理器已挂={}，由宿主分配样本={provide_output}）",
+            out_info.dwFlags,
+            d3d.is_some()
+        ));
 
         unsafe {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
@@ -348,9 +365,12 @@ impl D3dCtx {
         unsafe {
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
-            // 优先硬件 GPU；WARP 兜底（虚机/无独显场景）
+            // 优先硬件 GPU；WARP 兜底（虚机/无独显场景）。
+            // VIDEO_SUPPORT：MF DXGI 管理器要求；BGRA_SUPPORT：MF 表面共享惯例
             for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-                let flags = D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0);
+                let flags = D3D11_CREATE_DEVICE_FLAG(
+                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 | D3D11_CREATE_DEVICE_BGRA_SUPPORT.0,
+                );
                 if D3D11CreateDevice(
                     None,
                     driver,

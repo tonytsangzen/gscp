@@ -231,16 +231,18 @@ pub struct EffectParams {
 }
 
 impl Default for EffectParams {
+    /// 中性默认：不改变画面（旧默认沿用 GlassConnect 调优值——overlay 65% 透明
+    /// 蒙版 + 压暗底图，新设备上表现为"发灰 + 半透明蒙版"，需要用户重调）。
     fn default() -> Self {
         Self {
             base_rotate_deg: 90,
-            base_brightness: 0.8,
-            overlay_scale: 1.2,
+            base_brightness: 1.0,
+            overlay_scale: 1.0,
             overlay_rotate_deg: 0,
-            overlay_alpha: 0.65,
-            overlay_brightness: 1.4,
-            dim_strength: 0.6,
-            saturation_boost: 1.45,
+            overlay_alpha: 1.0,
+            overlay_brightness: 1.0,
+            dim_strength: 0.0,
+            saturation_boost: 1.0,
             overlay_black_key_low: 0.0,
             overlay_black_key_high: 0.0,
             overlay_feather_power: 1.35,
