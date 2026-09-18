@@ -115,9 +115,11 @@ pub fn ensure_adb_available() -> Result<String> {
     find_adb().ok_or_else(|| anyhow!("platform-tools 安装后仍未找到 adb"))
 }
 
-fn new_server(addr: &str) -> Result<ADBServer> {
+/// 构造带 adb 二进制路径的 server 客户端：
+/// adb server 未运行时，adb_client 会用该二进制自动拉起服务。
+/// （ADBServer::new 不带路径，server 不在时只能从 PATH 找 adb 而失败。）
+pub(crate) fn new_server(addr: &str) -> Result<ADBServer> {
     let daemon_addr = parse_daemon_addr(addr)?;
-    // 提供二进制路径时 adb_client 会按需自动拉起 adb server
     Ok(ADBServer::new_from_path(daemon_addr, find_adb()))
 }
 
@@ -133,6 +135,7 @@ pub fn run_adb_command(args: &[&str]) -> Result<std::process::Output> {
 /// scrcpy 会话用的设备句柄。
 pub struct AdbDevice {
     daemon_addr: SocketAddrV4,
+    daemon_addr_str: String,
     device_serial: String,
 }
 
@@ -140,13 +143,13 @@ impl AdbDevice {
     pub fn new(server_addr: &str, device_serial: &str) -> Self {
         Self {
             daemon_addr: parse_daemon_addr(server_addr).unwrap_or(DAEMON_ADDR),
+            daemon_addr_str: server_addr.to_string(),
             device_serial: device_serial.to_string(),
         }
     }
 
     pub fn connect(server_addr: &str, host: &str, port: u16) -> Result<()> {
-        let addr = parse_daemon_addr(server_addr)?;
-        let mut server = ADBServer::new(addr);
+        let mut server = new_server(server_addr)?;
         let device_addr = SocketAddrV4::new(host.parse().context("无效的 IP 地址")?, port);
         server
             .connect_device(device_addr)
@@ -156,7 +159,7 @@ impl AdbDevice {
     fn device(&mut self) -> Result<ADBServerDevice> {
         let mut last_err = None;
         for _ in 0..DEVICE_RETRY_COUNT {
-            let mut server = ADBServer::new(self.daemon_addr);
+            let mut server = new_server(&self.daemon_addr_str)?;
             match server.get_device_by_name(&self.device_serial) {
                 Ok(device) => return Ok(device),
                 Err(e) => {

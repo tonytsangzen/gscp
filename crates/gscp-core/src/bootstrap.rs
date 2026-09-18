@@ -329,6 +329,24 @@ pub fn bootstrap_remote_guard(config: &ResolvedConfig) -> Result<RemoteBootstrap
     })
 }
 
+/// 带超时的 bootstrap：adb_client 在 server 半挂死时可能无限阻塞，
+/// 超时后放弃本次尝试（稍后由重试循环再次拉起），避免重连线程永久卡死。
+/// 超时后才完成的拉起线程会自行 Drop guard，清理 shell 与转发。
+pub fn bootstrap_remote_guard_with_timeout(
+    config: &ResolvedConfig,
+    timeout: Duration,
+) -> Result<RemoteBootstrapGuard> {
+    let config = config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(bootstrap_remote_guard(&config));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("bootstrap 超时（{}s），稍后自动重试", timeout.as_secs())),
+    }
+}
+
 // ── Manager ──
 
 struct RemoteBootstrapState {
@@ -660,7 +678,7 @@ impl RemoteBootstrapManager {
                     break;
                 }
             }
-            match bootstrap_remote_guard(&self.config) {
+            match bootstrap_remote_guard_with_timeout(&self.config, Duration::from_secs(120)) {
                 Ok(guard) => {
                     let mut state = self.state.lock().expect("bootstrap state poisoned");
                     if state.shutting_down {
@@ -761,7 +779,7 @@ impl RemoteBootstrapManager {
                 };
 
                 drop(old_guard);
-                let restart_result = bootstrap_remote_guard(&self.config);
+                let restart_result = bootstrap_remote_guard_with_timeout(&self.config, Duration::from_secs(60));
 
                 let mut state = self.state.lock().expect("bootstrap state poisoned");
                 state.restarting = false;
