@@ -21,7 +21,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_MULTITHREADED,
+};
 
 /// RPC_E_CHANGED_MODE：线程已是其他 COM 单元，可继续使用。
 const RPC_E_CHANGED_MODE: windows::core::HRESULT =
@@ -566,7 +569,9 @@ unsafe fn make_output_sample(session: &Session) -> Result<IMFSample> {
     Ok(sample)
 }
 
-/// 枚举同步 H.264 → NV12 解码 MFT（内置于 Windows，DXVA 感知）。
+/// 枚举同步 H.264 → NV12 解码 MFT。
+/// 回退链：SYNCMFT 枚举 → 全量枚举（跳过异步 MFT）→ CoCreateInstance
+/// 内置解码器（Windows 精简环境/CI 虚机枚举可能为空）。
 fn create_h264_mft() -> Result<IMFTransform> {
     unsafe {
         let input = MFT_REGISTER_TYPE_INFO {
@@ -577,25 +582,67 @@ fn create_h264_mft() -> Result<IMFTransform> {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
         };
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count = 0_u32;
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_DECODER,
-            MFT_ENUM_FLAG_SYNCMFT,
-            Some(&input),
-            Some(&output),
-            &mut activates,
-            &mut count,
-        )?;
-        for i in 0..count as usize {
-            let activate = (*activates.add(i))
-                .take()
-                .ok_or_else(|| anyhow!("MFT 激活对象为空"))?;
-            if let Ok(mft) = activate.cast::<IMFTransform>() {
-                return Ok(mft);
+        let enumerate = |flags: MFT_ENUM_FLAG| -> Vec<IMFTransform> {
+            let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+            let mut count = 0_u32;
+            if MFTEnumEx(
+                MFT_CATEGORY_VIDEO_DECODER,
+                flags,
+                Some(&input),
+                Some(&output),
+                &mut activates,
+                &mut count,
+            )
+            .is_err()
+            {
+                return Vec::new();
             }
+            let mut found = Vec::new();
+            for i in 0..count as usize {
+                if let Some(activate) = (*activates.add(i)).take() {
+                    if let Ok(mft) = activate.cast::<IMFTransform>() {
+                        found.push(mft);
+                    }
+                }
+            }
+            CoTaskMemFree(Some(activates as *const std::ffi::c_void));
+            found
+        };
+
+        // 1) 标准同步枚举
+        let mut candidates = enumerate(MFT_ENUM_FLAG_SYNCMFT);
+        // 2) 全量枚举：过滤掉需要事件驱动的异步 MFT
+        if candidates.is_empty() {
+            gscp_core::logbus::emit("[decoder] SYNCMFT 枚举为空，尝试全量枚举");
+            candidates = enumerate(MFT_ENUM_FLAG_ALL)
+                .into_iter()
+                .filter(|mft| {
+                    mft.GetAttributes()
+                        .ok()
+                        .and_then(|attrs| attrs.GetUINT32(&MF_TRANSFORM_ASYNC).ok())
+                        .unwrap_or(0)
+                        == 0
+                })
+                .collect();
         }
-        CoTaskMemFree(Some(activates as *const std::ffi::c_void));
-        bail!("未找到支持 H264→NV12 的同步解码 MFT")
+        if let Some(mft) = candidates.into_iter().next() {
+            return Ok(mft);
+        }
+
+        // 3) 内置 H.264 解码器 CLSID（SDK msmpeg2vdec.h：CMSH264DecoderMFT）
+        const CLSID_CMSH264DECODERMFT: windows::core::GUID =
+            windows::core::GUID::from_u128(0x62ce7e72_4c71_4d20_b15d_4522a53cb4a6);
+        let mft: IMFTransform = match CoCreateInstance(
+            &CLSID_CMSH264DECODERMFT,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            Ok(mft) => {
+                gscp_core::logbus::emit("[decoder] 使用内置 H.264 解码 MFT（直连 CLSID）");
+                mft
+            }
+            Err(err) => bail!("未找到可用的 H.264 解码 MFT（枚举与 CLSID 均失败）: {err}"),
+        };
+        Ok(mft)
     }
 }
