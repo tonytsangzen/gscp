@@ -1,3 +1,6 @@
+// release 为 GUI 子系统：不弹 cmd 控制台窗口；debug 保留控制台便于开发调试
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! gscp 桌面端入口。
 //!
 //! 单二进制双模式：

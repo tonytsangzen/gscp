@@ -64,7 +64,7 @@ pub fn find_adb() -> Option<String> {
         }
     }
 
-    if let Ok(path) = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+    if let Ok(path) = spawn_quiet(if cfg!(windows) { "where" } else { "which" })
         .arg("adb")
         .output()
     {
@@ -76,8 +76,20 @@ pub fn find_adb() -> Option<String> {
     None
 }
 
-fn platform_adb_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
+// Windows 下 spawn 子进程一律加 CREATE_NO_WINDOW，避免 GUI 应用闪出控制台窗口
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn spawn_quiet(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+fn platform_adb_candidates() -> Vec<String> {    let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = std::path::PathBuf::from(home);
         // Android SDK 标准位置
@@ -126,7 +138,7 @@ pub(crate) fn new_server(addr: &str) -> Result<ADBServer> {
 /// 运行 adb 子进程命令（用于 disconnect/forward 清理等批量操作）。
 pub fn run_adb_command(args: &[&str]) -> Result<std::process::Output> {
     let adb_path = ensure_adb_available()?;
-    std::process::Command::new(adb_path)
+    spawn_quiet(&adb_path)
         .args(args)
         .output()
         .map_err(Into::into)
