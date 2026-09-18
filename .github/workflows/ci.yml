@@ -121,6 +121,12 @@ jobs:
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "NDK: $NDK"
 
+      - name: 预构建 Rust 库（解包 registry 源码并预热编译）
+        run: cargo build --release --package gscp-app --lib --target aarch64-linux-android
+
+      - name: 生成 tauri.settings.gradle（BuildTask 直调 cargo，需自行生成）
+        run: ./scripts/gen-tauri-settings.sh
+
       - name: 构建 APK（arm64 release，未签名）
         working-directory: crates/gscp-app/gen/android
         run: |
