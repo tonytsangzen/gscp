@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "gscp-app"
-version = "0.2.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "gscp-core"
-version = "0.2.0"
+version = "1.2.0"
 dependencies = [
  "adb_client",
  "anyhow",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "gscp-player"
-version = "0.2.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
