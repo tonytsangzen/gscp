@@ -4,6 +4,7 @@
 //! 管理端转发）并广播给已注册的订阅者（管理端转发到 WebView 日志区）。
 //! 对控制台进度类输出做 ANSI/控制符清洗，移植自 GlassConnect。
 
+use std::io::Write;
 use std::sync::Mutex;
 
 type Subscriber = Box<dyn Fn(&str) + Send + Sync>;
@@ -22,7 +23,10 @@ pub fn emit(msg: &str) {
         return;
     }
     let line = format!("[{}]:{}", timestamp(), sanitized);
-    eprintln!("{}", line);
+    // stderr 可能已关闭（管理端退出后 player 子进程的管道断裂）：
+    // 写失败必须静默忽略 —— eprintln! 在 EPIPE 时会 panic，
+    // 配合 release 的 panic=abort 会直接崩溃整个进程。
+    let _ = writeln!(std::io::stderr(), "{}", line);
     for sub in SUBSCRIBERS.lock().unwrap().iter() {
         sub(&line);
     }

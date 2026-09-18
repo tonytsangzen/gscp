@@ -41,6 +41,7 @@ pub fn mobile_entry() {
             commands::install_platform_tools,
             commands::get_app_version,
             commands::resize_height_to,
+            commands::reset_effect,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用运行失败");

@@ -494,6 +494,19 @@ pub fn get_app_version() -> String {
     gscp_core::VERSION.to_string()
 }
 
+// ── 参数复位 ──
+
+/// 将渲染效果参数恢复为默认值（写入 settings.yaml，预览中实时生效）。
+#[tauri::command]
+pub fn reset_effect() -> Result<serde_json::Value, String> {
+    let defaults = EffectParams::default();
+    let mut opts = load_shared_or_default();
+    opts.apply_effects(&defaults);
+    let path = gscp_core::paths::settings_path();
+    settings::save(&opts, &path).map_err(|e| format!("{e:#}"))?;
+    Ok(effect_to_json(&defaults))
+}
+
 // ── 窗口外框随内容自适应 ──
 
 /// 按前端测量的内容高度调整窗口高度（逻辑像素）。

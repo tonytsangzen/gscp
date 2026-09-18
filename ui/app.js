@@ -373,6 +373,28 @@ for (const [inputId] of EFFECT_FIELDS) {
 document.getElementById("fx-base-rotate").addEventListener("change", scheduleEffectSave);
 document.getElementById("fx-overlay-rotate").addEventListener("change", scheduleEffectSave);
 
+// ── 恢复默认参数 ──
+document.getElementById("btn-reset-effect").addEventListener("click", async () => {
+  try {
+    const effects = await invoke("reset_effect");
+    for (const [inputId, apiKey] of EFFECT_FIELDS) {
+      if (typeof effects[apiKey] === "number") {
+        document.getElementById(inputId).value = effects[apiKey];
+      }
+    }
+    if (typeof effects.baseRotateDeg === "number") {
+      document.getElementById("fx-base-rotate").value = String(effects.baseRotateDeg);
+    }
+    if (typeof effects.overlayRotateDeg === "number") {
+      document.getElementById("fx-overlay-rotate").value = String(effects.overlayRotateDeg);
+    }
+    updateEffectLabels();
+    appendLog("渲染效果已恢复默认值");
+  } catch (e) {
+    appendLog("恢复默认失败: " + e);
+  }
+});
+
 // ── 页面切换（连接 / 设置）──
 function showView(view) {
   const isSettings = view === "settings";

@@ -11,6 +11,8 @@ use anyhow::Context;
 use gscp_core::settings::PlayerOptions;
 use gscp_core::logbus;
 
+use std::io::Write;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -41,7 +43,7 @@ fn main() {
     }
 
     if let Err(err) = run_gui() {
-        eprintln!("{err:#}");
+        let _ = writeln!(std::io::stderr(), "{err:#}");
         std::process::exit(1);
     }
 }
@@ -83,6 +85,7 @@ fn run_gui() -> anyhow::Result<()> {
             commands::install_platform_tools,
             commands::get_app_version,
             commands::resize_height_to,
+            commands::reset_effect,
         ])
         .run(tauri::generate_context!())
         .context("Tauri 应用运行失败")
