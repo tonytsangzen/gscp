@@ -35,7 +35,12 @@ fn http_get(url: &str) -> Result<ureq::Response> {
 
 /// 下载 platform-tools 并解压 adb（Windows 含两个依赖 dll）到数据目录 bin/。
 pub fn install_platform_tools() -> Result<()> {
-    let url = format!("{}_{}.zip", PLATFORM_TOOLS_URL_LATEST, platform_tag());
+    // 官方包名为连字符分隔：platform-tools-latest-{darwin|linux|windows}.zip
+    let url = format!(
+        "{}-{}.zip",
+        PLATFORM_TOOLS_URL_LATEST,
+        platform_tag()
+    );
     logbus::emit(&format!("[downloader] 下载 {url} ..."));
     let response = http_get(&url)?;
 
@@ -121,11 +126,11 @@ mod tests {
     #[test]
     fn url_templates() {
         assert_eq!(
-            format!("{}_{}.zip", PLATFORM_TOOLS_URL_LATEST, platform_tag()),
+            format!("{}-{}.zip", PLATFORM_TOOLS_URL_LATEST, platform_tag()),
             match platform_tag() {
-                "darwin" => "https://dl.google.com/android/repository/platform-tools-latest_darwin.zip",
-                "linux" => "https://dl.google.com/android/repository/platform-tools-latest_linux.zip",
-                _ => "https://dl.google.com/android/repository/platform-tools-latest_windows.zip",
+                "darwin" => "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+                "linux" => "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
+                _ => "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
             }
         );
         assert!(SCRCPY_RELEASE_URL.starts_with("https://github.com/Genymobile/scrcpy/releases"));
