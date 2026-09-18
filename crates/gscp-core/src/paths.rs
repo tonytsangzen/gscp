@@ -72,6 +72,11 @@ pub fn user_config_path() -> PathBuf {
     data_dir().join("user.ini")
 }
 
+/// 运行日志文件（追加写；诊断解码/渲染路径用）。
+pub fn log_path() -> PathBuf {
+    data_dir().join("gscp.log")
+}
+
 #[cfg(unix)]
 pub(crate) fn ensure_executable(path: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;

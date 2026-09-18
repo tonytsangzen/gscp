@@ -5,15 +5,39 @@
 //! 对控制台进度类输出做 ANSI/控制符清洗，移植自 GlassConnect。
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 type Subscriber = Box<dyn Fn(&str) + Send + Sync>;
 
 static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 /// 注册日志订阅者。返回后立即开始接收后续日志（不回放历史）。
 pub fn subscribe(sub: Subscriber) {
     SUBSCRIBERS.lock().unwrap().push(sub);
+}
+
+/// 初始化落盘日志（追加写，路径如 data_dir/gscp.log）。
+/// player 子进程日志由管理端转发到本进程统一写入。
+pub fn init_file(path: PathBuf) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            *LOG_FILE.lock().unwrap() = Some(file);
+            emit(&format!("[log] 日志文件: {}", path.display()));
+        }
+        Err(err) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[log] 打开日志文件失败 {}: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// 输出一条日志（自动清洗、加时间戳前缀）。
@@ -27,6 +51,11 @@ pub fn emit(msg: &str) {
     // 写失败必须静默忽略 —— eprintln! 在 EPIPE 时会 panic，
     // 配合 release 的 panic=abort 会直接崩溃整个进程。
     let _ = writeln!(std::io::stderr(), "{}", line);
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(file) = guard.as_mut() {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
     for sub in SUBSCRIBERS.lock().unwrap().iter() {
         sub(&line);
     }

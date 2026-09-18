@@ -391,6 +391,21 @@ pub fn is_stall_error(err: &std::io::Error) -> bool {
 /// 让半开连接（对端不可达）在 TCP 层尽快暴露为读错误，而不是永久阻塞。
 ///
 /// 之前沿袭 mixplayer 的做法是握手后彻底取消超时、只等 EOF——
+/// 是否还有已排队数据（非阻塞 peek）。true = 读循环已落后于实时流，
+/// 内核 socket 缓冲在积压 —— 上层应跳过本帧解码尽快消费，封顶端到端延迟。
+pub fn has_pending_data(stream: &TcpStream) -> bool {
+    let Ok(clone) = stream.try_clone() else {
+        return false;
+    };
+    let _ = clone.set_nonblocking(true);
+    let pending = clone
+        .peek(&mut [0u8; 1])
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let _ = clone.set_nonblocking(false);
+    pending
+}
+
 /// 但 WiFi 长连接的静默断链（省电、隧道老化）不会产生 EOF，
 /// 读线程会永久阻塞，画面从此卡死且不触发重连。
 pub fn enable_stream_mode(stream: &TcpStream, stall: Option<Duration>) -> Result<()> {

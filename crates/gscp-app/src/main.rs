@@ -53,6 +53,7 @@ fn main() {
 
 fn run_gui() -> anyhow::Result<()> {
     env_logger::init();
+    gscp_core::logbus::init_file(gscp_core::paths::log_path());
     let user_config = gscp_core::userconfig::UserConfig::load();
 
     use tauri::Manager;

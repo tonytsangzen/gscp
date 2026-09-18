@@ -673,6 +673,11 @@ impl WgpuRenderer {
             .copied()
             .find(TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
+        let adapter_info = adapter.get_info();
+        gscp_core::logbus::emit(&format!(
+            "[render] 后端={:?} 适配器=\"{}\" surface格式={surface_format:?} 候选={:?}",
+            adapter_info.backend, adapter_info.name, caps.formats
+        ));
         let alpha_mode = caps
             .alpha_modes
             .iter()

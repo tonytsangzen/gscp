@@ -153,6 +153,7 @@ fn run_video_source_session(
 
     let mut decoder = decode::create_decoder(backend)?;
     let mut decoder_open = false;
+    let mut backlog_packets = 0_u64;
     let mut seq = 0_u64;
     let mut packet_index = 0_u64;
     let mut last_packet_received_at: Option<Instant> = None;
@@ -244,6 +245,22 @@ fn run_video_source_session(
                 packet_size,
                 if is_config { "config" } else { "data" }
             ));
+        }
+
+        // 积压探测：socket 里还有未消费数据 = 读循环落后于实时流。
+        // 不能跳帧（P 帧依赖参考链），先量化积压程度用于诊断延迟来源。
+        if !is_config && scrcpy::has_pending_data(stream.stream_ref()) {
+            backlog_packets = backlog_packets.saturating_add(1);
+            if backlog_packets == 1 || backlog_packets == 450 {
+                logbus::emit(&format!(
+                    "[{role}] 检测到读循环积压（已连续 {backlog_packets} 包落后），解码速度不足"
+                ));
+            }
+        } else if backlog_packets != 0 {
+            if backlog_packets >= 150 {
+                logbus::emit(&format!("[{role}] 积压消退（共 {backlog_packets} 包）"));
+            }
+            backlog_packets = 0;
         }
 
         if is_config {
