@@ -7,7 +7,7 @@ use crate::slot::{self, SharedSlot};
 use anyhow::{anyhow, Result};
 use gscp_core::bootstrap::RemoteBootstrapManager;
 use gscp_core::logbus;
-use gscp_core::scrcpy::{AudioSource, VideoSource};
+use gscp_core::scrcpy::{AudioSource, VideoSource, CAMERA_STALL_SECS};
 use gscp_core::settings::{self, EffectParams, PlayerOptions, ResolvedConfig};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,7 +44,7 @@ pub fn run_player(opts: PlayerOptions) -> Result<()> {
         let port = config
             .camera_port
             .ok_or_else(|| anyhow!("远端模式缺少 camera 端口"))?;
-        let camera = VideoSource::new(
+        let mut camera = VideoSource::new(
             config.remote_host.clone(),
             port,
             config.camera_send_device_meta,
@@ -56,6 +56,8 @@ pub fn run_player(opts: PlayerOptions) -> Result<()> {
             config.remote_raw_stream,
             config.remote_debug,
         )?;
+        // 断联判定仅以 camera 码流为准：拍照占用会短暂停流，静默 6s 才判定
+        camera.stall_timeout = Some(Duration::from_secs(CAMERA_STALL_SECS));
         session::spawn_video_source(
             "camera",
             camera,

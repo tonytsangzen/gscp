@@ -371,19 +371,13 @@ pub fn configure_socket(stream: TcpStream) -> Result<TcpStream> {
     Ok(stream)
 }
 
-/// 流式阶段默认的卡死阈值：静默超过该时长即判定连接失效。
-/// 眼镜的 camera/overlay/audio 编码器都会持续输出，正常不会出现这么长的静默。
-pub const DEFAULT_STREAM_STALL: Duration = Duration::from_secs(15);
-
-/// 读取卡死阈值：可用环境变量 GSCP_STREAM_STALL_SECS 覆盖（秒）。
-pub fn stream_stall_timeout() -> Duration {
-    std::env::var("GSCP_STREAM_STALL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_STREAM_STALL)
-}
+/// camera 码流的断联判定阈值（秒）：拍照等场景会短暂占用码流，
+/// 静默超过该时长仍无数据才判定连接失效。
+///
+/// 注意：只有 camera 适合作为断联判定源——
+/// overlay 抓取的是渲染输出，渲染停止后没有数据属正常现象；
+/// audio 在无声音输出时也可能长时间静默。二者均不应触发重连。
+pub const CAMERA_STALL_SECS: u64 = 6;
 
 /// 读超时错误判定：socket 静默超过阈值后，阻塞读会以 WouldBlock/TimedOut 返回。
 pub fn is_stall_error(err: &std::io::Error) -> bool {
@@ -399,14 +393,18 @@ pub fn is_stall_error(err: &std::io::Error) -> bool {
 /// 之前沿袭 mixplayer 的做法是握手后彻底取消超时、只等 EOF——
 /// 但 WiFi 长连接的静默断链（省电、隧道老化）不会产生 EOF，
 /// 读线程会永久阻塞，画面从此卡死且不触发重连。
-pub fn enable_stream_mode(stream: &TcpStream, stall: Duration) -> Result<()> {
+pub fn enable_stream_mode(stream: &TcpStream, stall: Option<Duration>) -> Result<()> {
     stream.set_nodelay(true).context("设置 TCP_NODELAY 失败")?;
-    stream
-        .set_read_timeout(Some(stall))
-        .context("设置 socket 读超时失败")?;
-    stream
-        .set_write_timeout(Some(stall))
-        .context("设置 socket 写超时失败")?;
+    if let Some(stall) = stall {
+        stream
+            .set_read_timeout(Some(stall))
+            .context("设置 socket 读超时失败")?;
+        stream
+            .set_write_timeout(Some(stall))
+            .context("设置 socket 写超时失败")?;
+    }
+    // keepalive 对所有流启用：静默的 overlay/audio 连接若出现半开
+    // （路径失效而非数据静默），TCP 层约 35s 内暴露为读错误并重连。
     #[cfg(unix)]
     tcp_keepalive_unix(stream);
     Ok(())

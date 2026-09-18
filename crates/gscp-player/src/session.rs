@@ -158,13 +158,21 @@ fn run_video_source_session(
     let mut last_packet_received_at: Option<Instant> = None;
     let expected_rgba = rgba_bytes(size.width, size.height)?;
 
-    // 卡死保护：静默超过阈值即判定连接失效并自动重连
-    let stall = source.stall_timeout.unwrap_or_else(scrcpy::stream_stall_timeout);
+    // 断联判定：仅 camera 启用静默判定（拍照占用码流属正常，超过阈值才算断联）；
+    // overlay 渲染停止、audio 静默均为正常现象，不作判断依据，
+    // 仅依赖 EOF/读错误与 TCP keepalive 做失效恢复。
+    let stall = source.stall_timeout;
+    let stall_secs = stall.map(|d| d.as_secs()).unwrap_or(0);
     scrcpy::enable_stream_mode(stream.stream_ref(), stall)?;
-    logbus::emit(&format!(
-        "[{role}] 流模式已就绪（静默 {}s 未收到数据将自动重连）",
-        stall.as_secs()
-    ));
+    match stall {
+        Some(t) => logbus::emit(&format!(
+            "[{role}] 流模式已就绪（静默 {}s 未收到码流将判定断联并重连）",
+            t.as_secs()
+        )),
+        None => logbus::emit(&format!(
+            "[{role}] 流模式已就绪（本路流静默属正常现象，不启用断联判定）"
+        )),
+    }
     let frame_stall = std::time::Duration::from_secs(FRAME_STALL_SECS);
     let mut last_frame_at = Instant::now();
 
@@ -186,7 +194,7 @@ fn run_video_source_session(
             Err(err) if scrcpy::is_stall_error(&err) => {
                 logbus::emit(&format!(
                     "[{role}] 数据静默 {}s，连接可能已中断，准备重连",
-                    stall.as_secs()
+                    stall_secs
                 ));
                 break;
             }
@@ -200,7 +208,7 @@ fn run_video_source_session(
             Err(err) if scrcpy::is_stall_error(&err) => {
                 logbus::emit(&format!(
                     "[{role}] 包体读取静默 {}s，连接可能已中断，准备重连",
-                    stall.as_secs()
+                    stall_secs
                 ));
                 break;
             }
@@ -411,7 +419,8 @@ fn run_audio_source_session(
         }
     }
 
-    let stall = source.stall_timeout.unwrap_or_else(scrcpy::stream_stall_timeout);
+    let stall = source.stall_timeout;
+    let stall_secs = stall.map(|d| d.as_secs()).unwrap_or(0);
     scrcpy::enable_stream_mode(stream.stream_ref(), stall)?;
 
     if source.send_frame_meta {
@@ -423,7 +432,7 @@ fn run_audio_source_session(
                 Err(err) if scrcpy::is_stall_error(&err) => {
                     logbus::emit(&format!(
                         "[{role}] 音频数据静默 {}s，连接可能已中断，准备重连",
-                        stall.as_secs()
+                        stall_secs
                     ));
                     break;
                 }
@@ -437,7 +446,7 @@ fn run_audio_source_session(
                 Err(err) if scrcpy::is_stall_error(&err) => {
                     logbus::emit(&format!(
                         "[{role}] 音频包体静默 {}s，连接可能已中断，准备重连",
-                        stall.as_secs()
+                        stall_secs
                     ));
                     break;
                 }
@@ -467,7 +476,7 @@ fn run_audio_source_session(
                 Err(err) if scrcpy::is_stall_error(&err) => {
                     logbus::emit(&format!(
                         "[{role}] 音频数据静默 {}s，连接可能已中断，准备重连",
-                        stall.as_secs()
+                        stall_secs
                     ));
                     break;
                 }
