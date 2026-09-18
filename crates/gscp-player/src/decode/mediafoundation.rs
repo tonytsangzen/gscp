@@ -9,7 +9,8 @@
 //! （BT.601 limited range + 色度双线性），保证跨平台渲染效果一致。
 
 use anyhow::{anyhow, bail, Context, Result};
-use gscp_core::codec::{rgba_frame, DecodedFrame, VideoCodec, VideoDecoder};
+use gscp_core::codec::{rgba_frame, DecodedFrame, VideoDecoder};
+use gscp_core::scrcpy::VideoCodec;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{

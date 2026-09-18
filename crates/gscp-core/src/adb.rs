@@ -82,11 +82,16 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(target_os = "windows")]
 fn spawn_quiet(program: &str) -> std::process::Command {
     let mut command = std::process::Command::new(program);
-    #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_quiet(program: &str) -> std::process::Command {
+    std::process::Command::new(program)
 }
 
 fn platform_adb_candidates() -> Vec<String> {    let mut candidates = Vec::new();

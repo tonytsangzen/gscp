@@ -19,3 +19,8 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# libadb（conscrypt TLS 适配层）引用了仅在旧版 Android 存在的内部类：
+# 新平台上不会走到这些分支，忽略缺失警告即可。
+-dontwarn com.android.org.conscrypt.SSLParametersImpl
+-dontwarn org.apache.harmony.xnet.provider.jsse.SSLParametersImpl
