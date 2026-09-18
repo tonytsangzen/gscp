@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 桌面三端：测试 + 打包 ──
+  desktop:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (test + app/dmg)
+            bundles: "app dmg"
+          - os: ubuntu-latest
+            name: Linux (test + deb/AppImage)
+            bundles: "deb appimage"
+          - os: windows-latest
+            name: Windows (test + NSIS)
+            bundles: "nsis"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装 ffmpeg（供解码集成测试生成真实码流）
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: 安装 ffmpeg + Linux 系统依赖（WebKitGTK 等）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev \
+            build-essential curl wget file patchelf
+
+      - name: 安装 ffmpeg
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: 测试（62 项：协议/配置单测 + VideoToolbox/OpenH264 真实码流 + mock scrcpy 会话）
+        run: cargo test --workspace
+
+      - name: Tauri 打包（${{ matrix.bundles }}）
+        run: npx --yes @tauri-apps/cli@2 build --bundles ${{ matrix.bundles }}
+
+      - name: 压缩 .app（保留可执行位）
+        if: runner.os == 'macOS'
+        run: |
+          cd target/release/bundle/macos
+          ditto -c -k --keepParent gscp.app gscp.app.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: gscp-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/gscp.app.zip
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/nsis/*.exe
+
+  # ── Android：arm64 APK ──
+  android:
+    name: Android (arm64 APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      CC_aarch64_linux_android: aarch64-linux-android24-clang
+      AR_aarch64_linux_android: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17（Gradle 缓存随附）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: 安装 Rust (stable) + Android 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+
+      - name: 解析 NDK 并注入构建环境
+        run: |
+          set -euo pipefail
+          NDK="$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -n1)"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "NDK_HOME=$NDK"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "NDK: $NDK"
+
+      - name: 构建 APK（arm64 release，未签名）
+        working-directory: crates/gscp-app/gen/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleArm64Release
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gscp-android-arm64
+          if-no-files-found: error
+          path: crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/*.apk

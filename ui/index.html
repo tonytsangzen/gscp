@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GSCP</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+
+    <!-- 顶部导航 -->
+    <div class="tab-bar" id="tab-bar">
+      <button type="button" class="tab-btn selected" id="tab-connect">连接</button>
+      <button type="button" class="tab-btn" id="tab-settings">设置</button>
+    </div>
+
+    <!-- ══ 连接页 ══ -->
+    <div id="view-connect">
+
+      <!-- Network Settings Card -->
+      <div class="card">
+        <div class="card-title">网络设置</div>
+
+        <div class="form-row">
+          <label>模式</label>
+          <div class="mode-switch" id="connection-mode">
+            <label class="mode-chip">
+              <input type="radio" name="connection-mode" id="mode-wifi" value="wifi" checked>
+              <span>WiFi</span>
+            </label>
+            <label class="mode-chip">
+              <input type="radio" name="connection-mode" id="mode-usb" value="usb">
+              <span>有线</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="wifi-settings">
+          <div class="form-row">
+            <label for="ssid">SSID</label>
+            <div class="ssid-row">
+              <input type="text" id="ssid" placeholder="Wi-Fi 名称" autocomplete="off">
+              <button type="button" id="ssid-dropdown-btn" class="dropdown-btn" title="已保存的网络">▼</button>
+              <div class="ssid-dropdown" id="ssid-dropdown"></div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label for="password">密码</label>
+            <div class="password-row">
+              <input type="password" id="password" placeholder="Wi-Fi 密码" autocomplete="off">
+              <button type="button" id="toggle-password" class="toggle-btn">显示</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label for="ip-address">IP 地址</label>
+            <input type="text" id="ip-address" placeholder="自动获取" autocomplete="off">
+          </div>
+
+          <div class="divider"></div>
+
+          <label class="keepalive-row">
+            <input type="checkbox" id="keepalive" checked>
+            <span>Wi-Fi 保活（防止眼镜自动断开）</span>
+          </label>
+        </div>
+
+        <div id="usb-mode-hint" class="mode-hint hidden">
+          通过 USB 连接眼镜后，点击“启动”会自动通过 ADB 建立连接。
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="button-row" id="button-row">
+        <button type="button" id="btn-start" class="btn btn-primary">启用</button>
+        <button type="button" id="btn-preview" class="btn btn-outline">预览</button>
+        <button type="button" id="btn-stop" class="btn btn-danger">停用</button>
+      </div>
+
+      <!-- Log Output Card -->
+      <div class="card log-card">
+        <div class="card-title">
+          日志输出
+          <span id="log-status" class="log-status">（等待操作）</span>
+        </div>
+        <textarea id="log-output" readonly rows="10" wrap="off"></textarea>
+      </div>
+
+    </div>
+
+    <!-- ══ 设置页 ══ -->
+    <div id="view-settings" class="hidden">
+
+      <div class="card">
+        <div class="card-title">视频流配置</div>
+
+        <div class="stream-grid">
+          <label class="stream-chip">
+            <span class="stream-name">Overlay</span>
+            <input type="checkbox" id="stream-overlay" checked>
+          </label>
+
+          <label class="stream-chip">
+            <span class="stream-name">Camera</span>
+            <input type="checkbox" id="stream-camera" checked>
+          </label>
+
+          <label class="stream-chip">
+            <span class="stream-name">Audio</span>
+            <input type="checkbox" id="stream-audio" checked>
+          </label>
+        </div>
+      </div>
+
+      <!-- 渲染效果设置（预览中实时生效） -->
+      <div class="card">
+        <div class="card-title">渲染效果</div>
+
+        <div class="effects-grid">
+          <div class="effect-row">
+            <label for="fx-overlay-alpha">叠加透明度</label>
+            <input type="range" id="fx-overlay-alpha" min="0" max="1" step="0.01" value="0.65">
+            <span class="effect-value" id="fx-overlay-alpha-value">0.65</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-overlay-brightness">叠加亮度</label>
+            <input type="range" id="fx-overlay-brightness" min="0.2" max="3" step="0.05" value="1.4">
+            <span class="effect-value" id="fx-overlay-brightness-value">1.40</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-overlay-scale">叠加缩放</label>
+            <input type="range" id="fx-overlay-scale" min="0.3" max="3" step="0.05" value="1.2">
+            <span class="effect-value" id="fx-overlay-scale-value">1.20</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-base-brightness">底图亮度</label>
+            <input type="range" id="fx-base-brightness" min="0.2" max="2" step="0.05" value="0.8">
+            <span class="effect-value" id="fx-base-brightness-value">0.80</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-dim-strength">背景压暗</label>
+            <input type="range" id="fx-dim-strength" min="0" max="1" step="0.05" value="0.6">
+            <span class="effect-value" id="fx-dim-strength-value">0.60</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-saturation-boost">饱和度</label>
+            <input type="range" id="fx-saturation-boost" min="0" max="3" step="0.05" value="1.45">
+            <span class="effect-value" id="fx-saturation-boost-value">1.45</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-black-key-low">抠像下限</label>
+            <input type="range" id="fx-black-key-low" min="0" max="1" step="0.01" value="0">
+            <span class="effect-value" id="fx-black-key-low-value">0.00</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-black-key-high">抠像上限</label>
+            <input type="range" id="fx-black-key-high" min="0" max="1" step="0.01" value="0">
+            <span class="effect-value" id="fx-black-key-high-value">0.00</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-feather-power">抠像羽化</label>
+            <input type="range" id="fx-feather-power" min="0.05" max="4" step="0.05" value="1.35">
+            <span class="effect-value" id="fx-feather-power-value">1.35</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-feather-radius">羽化外扩</label>
+            <input type="range" id="fx-feather-radius" min="0" max="64" step="1" value="0">
+            <span class="effect-value" id="fx-feather-radius-value">0</span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-base-rotate">底图旋转</label>
+            <select id="fx-base-rotate" class="effect-select">
+              <option value="0">0°</option>
+              <option value="90" selected>90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="effect-row">
+            <label for="fx-overlay-rotate">叠加旋转</label>
+            <select id="fx-overlay-rotate" class="effect-select">
+              <option value="0" selected>0°</option>
+              <option value="90">90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+            <span></span>
+          </div>
+        </div>
+        <div class="effects-hint">预览播放中调整实时生效；参数保存在应用数据目录 settings.yaml。</div>
+      </div>
+
+      <!-- Runtime Tools Card -->
+      <div class="card">
+        <div class="card-title">运行环境 <span id="tool-version"></span></div>
+        <div class="tool-row">
+          <span class="tool-status" id="tool-adb-status">检查 adb ...</span>
+          <button type="button" id="btn-install-adb" class="btn btn-outline tool-btn hidden">下载 platform-tools</button>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <script src="bridge.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

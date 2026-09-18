@@ -1,0 +1,31 @@
+[package]
+name = "gscp-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "gscp"
+
+[lib]
+name = "gscp_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "gscp"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gscp-core = { path = "../gscp-core" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+tauri = { version = "2", features = [] }
+
+# 桌面端播放器（Android 端预览由 Kotlin MediaCodec 实现，见 PLAN.md M5）
+[target.'cfg(not(target_os = "android"))'.dependencies]
+gscp-player = { path = "../gscp-player" }
