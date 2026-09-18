@@ -204,6 +204,41 @@ fn videotoolbox_decodes_ffmpeg_stream() {
     assert!(pixel_variance(&last_frame) > 100.0, "画面像素过于平坦");
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn mediafoundation_decodes_ffmpeg_stream() {
+    let Some(stream) = available() else {
+        eprintln!("ffmpeg 不可用，跳过");
+        return;
+    };
+    let data = std::fs::read(&stream).unwrap();
+    let packets = split_annexb_into_packets(&data);
+
+    let mut decoder = gscp_player::decode::mediafoundation::MediaFoundationDecoder::new()
+        .expect("Media Foundation 初始化失败");
+    let (count, last_frame) = decode_all(&mut decoder, &packets);
+    eprintln!("mediafoundation({}) decoded {count} frames", decoder.name());
+    assert!(count >= FRAME_COUNT - 2, "Media Foundation 帧数不足: {count}");
+    assert!(pixel_variance(&last_frame) > 100.0, "画面像素过于平坦");
+
+    // 与软件解码对比平均亮度：两端口径（BT.601 limited range）应一致
+    let mut software = SoftwareDecoder::new();
+    let (_, sw_last) = decode_all(&mut software, &packets);
+    let mean = |px: &[u8]| -> f64 {
+        let luma: Vec<f64> = px
+            .chunks_exact(4)
+            .map(|p| 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64)
+            .collect();
+        luma.iter().sum::<f64>() / luma.len() as f64
+    };
+    let (mf_mean, sw_mean) = (mean(&last_frame), mean(&sw_last));
+    eprintln!("mean luma: mf={mf_mean:.1} sw={sw_mean:.1}");
+    assert!(
+        (mf_mean - sw_mean).abs() < 8.0,
+        "MF 与软件解码平均亮度差过大: mf={mf_mean:.1} sw={sw_mean:.1}"
+    );
+}
+
 #[cfg(test)]
 mod units {
     use super::*;

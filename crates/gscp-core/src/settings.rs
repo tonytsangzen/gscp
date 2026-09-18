@@ -198,6 +198,7 @@ impl ResolvedConfig {
 pub enum DecoderBackend {
     Auto,
     VideoToolbox,
+    MediaFoundation,
     Software,
 }
 
@@ -205,6 +206,7 @@ impl DecoderBackend {
     pub fn parse(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
             "videotoolbox" => Self::VideoToolbox,
+            "mediafoundation" => Self::MediaFoundation,
             "software" => Self::Software,
             _ => Self::Auto,
         }
