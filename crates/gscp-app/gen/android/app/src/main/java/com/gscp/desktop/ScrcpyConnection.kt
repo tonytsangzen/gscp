@@ -19,7 +19,7 @@ import kotlin.random.Random
  *
  * 不包含 WiFi 配网流程（由桌面端完成）。
  */
-class ScrcpyConnection(private val context: Context) {
+class ScrcpyConnection(private val context: Context, private val audioEnabled: Boolean = true) {
     var connected = false
         private set
 
@@ -151,9 +151,12 @@ class ScrcpyConnection(private val context: Context) {
         }
     }
 
-    /** 服务器回连顺序：camera 视频、音频、control、overlay。 */
-    private val handleList: List<StreamHandler> =
+    /** 服务器回连顺序：camera 视频、音频（可选）、control、overlay。 */
+    private val handleList: List<StreamHandler> = if (audioEnabled) {
         listOf(videoHandler, audioHandler, controlHandler, overlayHandler)
+    } else {
+        listOf(videoHandler, controlHandler, overlayHandler, nullHandler)
+    }
 
     fun connectAsync(ip: String, port: Int, cb: EventCallback? = null) {
         if (cb != null) callback = cb
@@ -181,7 +184,7 @@ class ScrcpyConnection(private val context: Context) {
                     adb.push(context.assets.open("scrcpy-server"), "/data/local/tmp/scrcpy-server.jar")
                     adb.reverse("forward:localabstract:scrcpy_$id;tcp:27813")
                     val param = "log_level=info video_source=camera audio_source=output " +
-                        "max_size=1024 video=true audio=true overlay=true"
+                        "max_size=1024 video=true audio=$audioEnabled overlay=true"
                     adb.run(
                         "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / " +
                             "com.genymobile.scrcpy.Server 3.3.1 scid=$id $param"

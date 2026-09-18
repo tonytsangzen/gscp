@@ -366,6 +366,12 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         refreshMatrices()
     }
 
+    fun setTopRotation(rotation: Float, mirror: Boolean) {
+        topRotation = rotation
+        topMirror = mirror
+        refreshMatrices()
+    }
+
     fun setBottomAspectRatio(ratio: Float) {
         bottomAspectRatio = ratio
         refreshMatrices()

@@ -6,33 +6,45 @@ import android.graphics.Point
 import android.media.AudioFormat
 import android.os.Bundle
 import android.util.Patterns
+import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageButton
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.SeekBar
+import android.widget.Spinner
+import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 /**
  * Android 端入口：原生 scrcpy 连接 + 播放界面。
  *
  * 仅实现「scrcpy 连接、播放」——输入已在桌面端配好网的眼镜 IP，
  * 经 adb TCP 拉起 scrcpy-server 并播放 camera/overlay/音频三路。
- * 不包含 Wi-Fi 配网流程。
+ * 不包含 Wi-Fi 配网流程。播放时进入沉浸模式。
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
 
-    private lateinit var settingsPanel: android.view.View
+    private lateinit var settingsPanel: View
+    private lateinit var settingsButton: ImageButton
     private lateinit var playerPanel: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var progressBar: ProgressBar
     private lateinit var ipEdit: EditText
-    private lateinit var overlayScale: SeekBar
 
     private lateinit var mixer: SurfaceMixer
     private lateinit var audioPlayer: AudioPlayer
@@ -43,6 +55,14 @@ class MainActivity : AppCompatActivity() {
     private val platformLock = Object()
     private var playing = false
 
+    // 可配置参数（连接页右上角设置）
+    private var topScalePercent = 50
+    private var bottomRotationDeg = 90
+    private var bottomMirror = false
+    private var topRotationDeg = 0
+    private var topMirror = false
+    private var audioEnabled = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -51,12 +71,14 @@ class MainActivity : AppCompatActivity() {
         prefs = getSharedPreferences("gscp", MODE_PRIVATE)
 
         settingsPanel = findViewById(R.id.settings_panel)
+        settingsButton = findViewById(R.id.button_settings)
         playerPanel = findViewById(R.id.player_panel)
         surfaceView = findViewById(R.id.video_surface)
         progressBar = findViewById(R.id.progress_bar)
         ipEdit = findViewById(R.id.ip_address)
-        overlayScale = findViewById(R.id.overlay_scale)
         val connectButton = findViewById<Button>(R.id.button_connect)
+
+        loadSettings()
 
         // 画面区域：竖屏下 3:4，横屏下保持高度铺满
         val size = Point()
@@ -68,7 +90,7 @@ class MainActivity : AppCompatActivity() {
             size.y to size.y * 3 / 4
         }
         surfaceView.layoutParams = FrameLayout.LayoutParams(w, h).apply {
-            gravity = android.view.Gravity.CENTER
+            gravity = Gravity.CENTER
         }
 
         mixer = SurfaceMixer(this, w, h)
@@ -86,20 +108,101 @@ class MainActivity : AppCompatActivity() {
         })
 
         ipEdit.setText(prefs.getString("ip", ""))
-        overlayScale.progress = prefs.getInt("overlayScale", 50)
-        overlayScale.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
-                mixer.setTopScale(value)
-            }
-
-            override fun onStartTrackingTouch(bar: SeekBar) {}
-            override fun onStopTrackingTouch(bar: SeekBar) {
-                prefs.edit().putInt("overlayScale", bar.progress).apply()
-            }
-        })
-
+        settingsButton.setOnClickListener { openSettingsDialog() }
         connectButton.setOnClickListener { connect() }
     }
+
+    // ── 参数设置 ──────────────────────────────────────────────
+
+    private fun loadSettings() {
+        topScalePercent = prefs.getInt("topScalePercent", 50)
+        bottomRotationDeg = prefs.getInt("bottomRotationDeg", 90)
+        bottomMirror = prefs.getBoolean("bottomMirror", false)
+        topRotationDeg = prefs.getInt("topRotationDeg", 0)
+        topMirror = prefs.getBoolean("topMirror", false)
+        audioEnabled = prefs.getBoolean("audioEnabled", true)
+        applySettingsToMixer()
+    }
+
+    private fun applySettingsToMixer() {
+        mixer.setTopScale(topScalePercent)
+        mixer.setBottomRotation(bottomRotationDeg.toFloat(), bottomMirror)
+        mixer.setTopRotation(topRotationDeg.toFloat(), topMirror)
+    }
+
+    @SuppressLint("InflateParams")
+    private fun openSettingsDialog() {
+        val pad = (20 * resources.displayMetrics.density).toInt()
+        val halfPad = (6 * resources.displayMetrics.density).toInt()
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, halfPad, pad, halfPad)
+        }
+
+        fun label(text: String): TextView = TextView(this).apply {
+            this.text = text
+            textSize = 15f
+            setPadding(0, halfPad, 0, halfPad)
+        }
+
+        val rotationOptions = arrayOf("0°", "90°", "180°", "270°")
+        fun rotationSpinner(initialDeg: Int): Spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_item,
+                rotationOptions
+            ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+            setSelection(initialDeg / 90)
+        }
+
+        // overlay 缩放
+        container.addView(label("overlay 缩放"))
+        val scaleBar = SeekBar(this).apply { max = 100; progress = topScalePercent }
+        container.addView(scaleBar)
+
+        // 底图（camera）旋转/镜像
+        container.addView(label("底图旋转"))
+        val bottomSpin = rotationSpinner(bottomRotationDeg)
+        container.addView(bottomSpin)
+        val bottomMirrorBox = CheckBox(this).apply { text = "底图镜像"; isChecked = bottomMirror }
+        container.addView(bottomMirrorBox)
+
+        // overlay 旋转/镜像
+        container.addView(label("overlay 旋转"))
+        val topSpin = rotationSpinner(topRotationDeg)
+        container.addView(topSpin)
+        val topMirrorBox = CheckBox(this).apply { text = "overlay 镜像"; isChecked = topMirror }
+        container.addView(topMirrorBox)
+
+        // 音频（下次连接生效）
+        val audioBox = CheckBox(this).apply { text = "播放声音（下次连接生效）"; isChecked = audioEnabled }
+        container.addView(audioBox)
+
+        AlertDialog.Builder(this)
+            .setTitle("参数设置")
+            .setView(android.widget.ScrollView(this).apply { addView(container) })
+            .setPositiveButton("保存") { _, _ ->
+                topScalePercent = scaleBar.progress
+                bottomRotationDeg = bottomSpin.selectedItemPosition * 90
+                bottomMirror = bottomMirrorBox.isChecked
+                topRotationDeg = topSpin.selectedItemPosition * 90
+                topMirror = topMirrorBox.isChecked
+                audioEnabled = audioBox.isChecked
+                prefs.edit()
+                    .putInt("topScalePercent", topScalePercent)
+                    .putInt("bottomRotationDeg", bottomRotationDeg)
+                    .putBoolean("bottomMirror", bottomMirror)
+                    .putInt("topRotationDeg", topRotationDeg)
+                    .putBoolean("topMirror", topMirror)
+                    .putBoolean("audioEnabled", audioEnabled)
+                    .apply()
+                applySettingsToMixer()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    // ── 连接 / 播放 ──────────────────────────────────────────
 
     private fun connect() {
         val ip = ipEdit.text.toString().trim()
@@ -111,12 +214,14 @@ class MainActivity : AppCompatActivity() {
 
         videoDecoder = VideoDecoder()
         overlayDecoder = VideoDecoder()
-        connection = ScrcpyConnection(this)
+        connection = ScrcpyConnection(this, audioEnabled)
 
-        settingsPanel.visibility = android.view.View.GONE
-        playerPanel.visibility = android.view.View.VISIBLE
-        progressBar.visibility = android.view.View.VISIBLE
+        settingsPanel.visibility = View.GONE
+        settingsButton.visibility = View.GONE
+        playerPanel.visibility = View.VISIBLE
+        progressBar.visibility = View.VISIBLE
         playing = true
+        enterImmersive()
 
         connection!!.connectAsync(ip, 5555, callback)
     }
@@ -129,17 +234,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleStopped(withError: Boolean) {
         runOnUiThread {
-            progressBar.visibility = android.view.View.GONE
+            progressBar.visibility = View.GONE
             videoDecoder?.stop()
             videoDecoder = null
             overlayDecoder?.stop()
             overlayDecoder = null
             audioPlayer.stop()
             mixer.reset()
-            if (playing.not() || withError) {
-                playerPanel.visibility = android.view.View.GONE
-                settingsPanel.visibility = android.view.View.VISIBLE
-            }
+            playing = false
+            exitImmersive()
+            playerPanel.visibility = View.GONE
+            settingsPanel.visibility = View.VISIBLE
+            settingsButton.visibility = View.VISIBLE
             if (withError) {
                 Toast.makeText(this, "连接失败，请检查眼镜 IP 与网络", Toast.LENGTH_SHORT).show()
             }
@@ -149,15 +255,15 @@ class MainActivity : AppCompatActivity() {
     private val callback = object : ScrcpyConnection.EventCallback {
         override fun onConnect() {
             runOnUiThread {
-                progressBar.visibility = android.view.View.GONE
+                progressBar.visibility = View.GONE
             }
-            mixer.setTopScale(overlayScale.progress)
+            applySettingsToMixer()
         }
 
         override fun onVideoPrepare(codec: String, width: Int, height: Int) {
             synchronized(platformLock) {
                 mixer.setBottomAspectRatio(height.toFloat() / width)
-                mixer.setBottomRotation(90f, false)
+                mixer.setBottomRotation(bottomRotationDeg.toFloat(), bottomMirror)
                 videoDecoder?.start(width, height, mixer.getBottomSurface())
             }
         }
@@ -167,11 +273,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onAudioPrepare(codec: String, frameRate: Int, channel: Int) {
-            audioPlayer.start()
+            if (audioEnabled) audioPlayer.start()
         }
 
         override fun onAudioPackage(buffer: ByteArray, offset: Int, length: Int) {
-            audioPlayer.play(buffer, offset, length)
+            if (audioEnabled) audioPlayer.play(buffer, offset, length)
         }
 
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
@@ -192,6 +298,30 @@ class MainActivity : AppCompatActivity() {
         override fun onError() {
             playing = false
             handleStopped(withError = true)
+        }
+    }
+
+    // ── 沉浸模式 ─────────────────────────────────────────────
+
+    private fun enterImmersive() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun exitImmersive() {
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // 沉浸模式下从通知/对话框返回时重新隐藏系统栏
+        if (hasFocus && playing) {
+            enterImmersive()
         }
     }
 
