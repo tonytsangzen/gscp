@@ -125,7 +125,8 @@ fn prepare_sources(config: &ResolvedConfig) -> Result<Option<Arc<RemoteBootstrap
     if !config.bootstrap_remote {
         return Ok(None);
     }
-    let _adb = gscp_core::adb::ensure_adb_available()?;
+    let adb_path = gscp_core::adb::ensure_adb_available()?;
+    gscp_core::logbus::emit(&format!("[adb] 使用工具: {adb_path}"));
     let manager = RemoteBootstrapManager::new(config.clone());
     manager.spawn_initial_bootstrap();
     manager.spawn_guard_monitor();

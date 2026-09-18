@@ -149,11 +149,28 @@ impl AdbDevice {
     }
 
     pub fn connect(server_addr: &str, host: &str, port: u16) -> Result<()> {
+        let adb = find_adb();
         let mut server = new_server(server_addr)?;
         let device_addr = SocketAddrV4::new(host.parse().context("无效的 IP 地址")?, port);
-        server
-            .connect_device(device_addr)
-            .with_context(|| format!("adb connect 失败: {host}:{port}"))
+
+        // 设备不可达（IP 已变 / TCP 模式未开 / 眼镜休眠）时，
+        // adb server 的 connect 请求可能长时间无响应，卡死调用线程。
+        // 放到独立线程并加 10s 超时，失败信息直接给出用户可执行的处理。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(server.connect_device(device_addr));
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result.with_context(|| {
+                format!(
+                    "adb connect 失败: {host}:{port}（adb 二进制: {}）",
+                    adb.as_deref().unwrap_or("未找到")
+                )
+            }),
+            Err(_) => Err(anyhow::anyhow!(
+                "adb connect 超时（10s）：眼镜可能不在线（IP 已变或 TCP 模式未开启），请插线重新配网"
+            )),
+        }
     }
 
     fn device(&mut self) -> Result<ADBServerDevice> {
