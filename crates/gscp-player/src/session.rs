@@ -412,12 +412,12 @@ fn run_audio_source_session(
     let mut player = AudioPlayer::new().context("创建音频播放器失败")?;
     match codec {
         AudioCodec::Opus => {
-            if !AudioPlayer::supports_opus() {
-                anyhow::bail!(
-                    "当前平台不支持 Opus 音频，请使用 audio_codec=raw（管理端会自动回退）"
-                );
-            }
+            #[cfg(unix)]
             player.init_opus()?;
+            #[cfg(not(unix))]
+            anyhow::bail!(
+                "当前平台不支持 Opus 音频，请使用 audio_codec=raw（管理端会自动回退）"
+            );
         }
         AudioCodec::Raw => {}
         AudioCodec::Aac | AudioCodec::Flac => {
@@ -461,12 +461,17 @@ fn run_audio_source_session(
 
             match codec {
                 AudioCodec::Raw => player.push_raw_pcm(&packet),
+                #[cfg(unix)]
                 AudioCodec::Opus => {
                     if let Err(e) = player.push_opus(&packet) {
                         if source.debug {
                             logbus::emit(&format!("[{role}] Opus 解码失败: {e}"));
                         }
                     }
+                }
+                #[cfg(not(unix))]
+                AudioCodec::Opus => {
+                    // Windows 握手阶段已拒绝 Opus（supports_opus=false），不会到达
                 }
                 AudioCodec::Aac | AudioCodec::Flac => unreachable!(),
             }
