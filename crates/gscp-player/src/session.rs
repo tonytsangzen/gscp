@@ -192,11 +192,15 @@ fn run_video_source_session(
             Ok(wait) => wait,
             Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
             Err(err) if scrcpy::is_stall_error(&err) => {
-                logbus::emit(&format!(
-                    "[{role}] 数据静默 {}s，连接可能已中断，准备重连",
-                    stall_secs
-                ));
-                break;
+                if stall.is_some() {
+                    logbus::emit(&format!(
+                        "[{role}] camera 数据静默 {stall_secs}s，判定断联，准备重连"
+                    ));
+                    break;
+                }
+                // 未启用静默判定的流（overlay/audio）不应出现该错误，
+                // 属意外抖动：按错误处理走重连，但不判定断联。
+                return Err(err).context("读取 scrcpy frame meta 失败");
             }
             Err(err) => return Err(err).context("读取 scrcpy frame meta 失败"),
         };
@@ -206,11 +210,13 @@ fn run_video_source_session(
         let body_wait = match read_exact_timed(&mut stream, &mut packet) {
             Ok(wait) => wait,
             Err(err) if scrcpy::is_stall_error(&err) => {
-                logbus::emit(&format!(
-                    "[{role}] 包体读取静默 {}s，连接可能已中断，准备重连",
-                    stall_secs
-                ));
-                break;
+                if stall.is_some() {
+                    logbus::emit(&format!(
+                        "[{role}] camera 数据静默 {stall_secs}s，判定断联，准备重连"
+                    ));
+                    break;
+                }
+                return Err(err).context("读取 scrcpy packet body 失败");
             }
             Err(err) => return Err(err).context("读取 scrcpy packet body 失败"),
         };

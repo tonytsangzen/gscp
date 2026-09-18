@@ -395,13 +395,25 @@ pub fn is_stall_error(err: &std::io::Error) -> bool {
 /// 读线程会永久阻塞，画面从此卡死且不触发重连。
 pub fn enable_stream_mode(stream: &TcpStream, stall: Option<Duration>) -> Result<()> {
     stream.set_nodelay(true).context("设置 TCP_NODELAY 失败")?;
-    if let Some(stall) = stall {
-        stream
-            .set_read_timeout(Some(stall))
-            .context("设置 socket 读超时失败")?;
-        stream
-            .set_write_timeout(Some(stall))
-            .context("设置 socket 写超时失败")?;
+    match stall {
+        Some(t) => {
+            stream
+                .set_read_timeout(Some(t))
+                .context("设置 socket 读超时失败")?;
+            stream
+                .set_write_timeout(Some(t))
+                .context("设置 socket 写超时失败")?;
+        }
+        // overlay/audio 的静默（渲染停止、无声音）可持续任意久，
+        // 必须显式清除握手阶段遗留的读超时，否则正常静默会被误判为断联。
+        None => {
+            stream
+                .set_read_timeout(None)
+                .context("清除 socket 读超时失败")?;
+            stream
+                .set_write_timeout(None)
+                .context("清除 socket 写超时失败")?;
+        }
     }
     // keepalive 对所有流启用：静默的 overlay/audio 连接若出现半开
     // （路径失效而非数据静默），TCP 层约 35s 内暴露为读错误并重连。
