@@ -128,11 +128,20 @@ jobs:
       - name: 生成 tauri.settings.gradle（BuildTask 直调 cargo，需自行生成）
         run: ./scripts/gen-tauri-settings.sh
 
-      - name: 构建 APK（arm64 release，未签名）
+      - name: 构建 APK（arm64 release，正式签名，缺 keys/ 时回退 debug 签名）
         working-directory: crates/gscp-app/gen/android
         run: |
           chmod +x gradlew
           ./gradlew assembleArm64Release
+
+      - name: 验证 APK 为 release 正式签名
+        run: |
+          set -euo pipefail
+          APK=$(ls crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/*.apk | head -n1)
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          "$APKSIGNER" verify --print-certs "$APK"
+          "$APKSIGNER" verify "$APK"
+          echo "已验证 release 签名: $APK"
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4

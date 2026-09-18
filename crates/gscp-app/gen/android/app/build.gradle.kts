@@ -13,9 +13,40 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// release 签名：从工程上层目录查找 keys/（keystore 与密码文件随仓库分发）
+fun findUp(rel: String): File? {
+    var dir: File = projectDir
+    repeat(8) {
+        val candidate = File(dir, rel)
+        if (candidate.exists()) return candidate
+        dir = dir.parentFile ?: return null
+    }
+    return null
+}
+
+val keystoreFile = findUp("keys/gscp-release.keystore")
+val signingProps = Properties().apply {
+    val propFile = keystoreFile?.let { findUp("keys/gscp-release.properties") }
+    if (propFile != null) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+val hasReleaseSigning = keystoreFile != null && signingProps.getProperty("storePassword") != null
+
 android {
     compileSdk = 36
     namespace = "com.gscp.desktop"
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = keystoreFile
+                storePassword = signingProps.getProperty("storePassword")
+                keyAlias = signingProps.getProperty("keyAlias") ?: "gscp"
+                keyPassword = signingProps.getProperty("keyPassword")
+                    ?: signingProps.getProperty("storePassword")
+            }
+        }
+    }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.gscp.desktop"
@@ -43,6 +74,12 @@ android {
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toList().toTypedArray()
             )
+            // 有正式 keystore 用 release 签名；否则回退 debug 签名保证本地产物可直接安装
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
     kotlinOptions {
