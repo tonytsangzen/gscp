@@ -93,6 +93,16 @@ GSCP 不自带 adb，首次使用会自动从 Google 服务器下载（约 10 MB
 **Windows 双击安装包提示 SmartScreen？**
 点「仍要运行」即可——安装包未做代码签名。
 
+**macOS 提示「"gscp"已损坏，无法打开」？**
+应用未经 Apple 公证，macOS 会拦截带下载隔离属性的应用。终端执行一条命令
+（对已拖入「应用程序」的 GSCP）即可解除：
+
+```sh
+xattr -cr /Applications/gscp.app
+```
+
+之后再打开就不会再提示。
+
 **Android 提示"连接失败"？**
 确认桌面端配网已成功、手机与眼镜在同一 Wi-Fi、IP 输入正确；
 眼镜省电断开 Wi-Fi 时重新点亮眼镜再试。
