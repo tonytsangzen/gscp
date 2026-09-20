@@ -1,114 +1,115 @@
-# gscp
+# GSCP — 眼镜投屏伴侣
 
-合并 `mixplayer`（scrcpy 双路视频合成播放器）与 `GlassConnect`（眼镜连接管理器）
-的四端应用：**Android / macOS / Linux / Windows**。
+在电脑或手机上观看 AR 眼镜画面的工具：给眼镜配好 Wi-Fi，之后随时随地无线投屏——
+眼镜看到的（camera）+ 眼镜显示的（overlay）+ 声音，合成在一个窗口里实时观看。
 
-连接 RG- 系列安卓眼镜：一键 WiFi 配网/保活、USB/WiFi 双路（camera + overlay）
-+ 音频预览，GPU shader 合成渲染，效果参数实时可调。
+支持 **Windows / macOS / Linux / Android**。
 
-## 技术架构
+---
 
-- **UI**：系统 WebView（WKWebView / WebKitGTK / WebView2 / Android WebView），
-  容器为 Tauri 2；前端是零依赖 HTML/CSS/JS（`ui/`，无框架、无构建步骤）。
-- **核心**：`crates/gscp-core` —— ADB 访问、scrcpy 协议与会话守护、WiFi 配网、
-  配置持久化、工具链按需下载。同一 crate 供桌面与 Android (JNI) 复用。
-- **播放器**：`crates/gscp-player` —— wgpu（Metal/Vulkan/DX12）shader 合成、
-  平台系统解码器（macOS=VideoToolbox 硬解；其余平台 OpenH264 软解，H264）、
-  rodio 音频（raw PCM / Opus）。
-- **进程模型**：单二进制双模式
-  - `gscp` → 管理界面（Tauri）
-  - `gscp --player …` → 播放窗口（winit），管理端 spawn 自身。
+## 下载
 
-### 依赖策略（需求 1）
+到 [Releases](https://github.com/tonytsangzen/gscp/releases/latest) 页面，按平台下载：
 
-| 类型 | 处理 |
+| 平台 | 文件 |
 |---|---|
-| 通用能力 | WebView / H264 解码 / GPU / 音频设备 **依赖系统**，不打包 |
-| `adb` | **不打包**；首次需要时按平台下载 Google platform-tools 到应用数据目录 |
-| `scrcpy-server` | 91KB jar 内嵌（离线可用），支持按版本从 GitHub 下载 |
-| `wifi_daemon` | 9KB 内嵌（自研产物） |
-| Opus 解码 | unix 用系统 libopus；Windows 音频回退 raw PCM |
+| Windows | `gscp_<版本>_x64-setup.exe` |
+| macOS（Apple Silicon） | `gscp_<版本>_aarch64.dmg` 或 `.app.zip` |
+| Linux（Debian/Ubuntu） | `gscp_<版本>_amd64.deb` |
+| Linux（通用） | `gscp_<版本>_amd64.AppImage` |
+| Android（arm64） | `gscp_<版本>_aarch64.apk` |
 
-安装包体积：单二进制约 **7 MB**（release，含全部内嵌资产）。
+## 桌面端使用（Windows / macOS / Linux）
 
-## 界面结构
+### 第一次使用：给眼镜配网
 
-顶部 **连接 / 设置** 两个 Tab（记忆上次所在页）：
+眼镜要连上你家 Wi-Fi 才能无线投屏，配网只需做一次：
 
-- **连接页**：网络设置（WiFi/USB、SSID、保活）、启用/预览/停用、日志输出
-- **设置页**：视频流配置（Overlay/Camera/Audio）、渲染效果、运行环境（adb 状态与下载）
+1. 安装并打开 GSCP。
+2. 用 USB 线把眼镜连到电脑。
+3. 连接页保持「WiFi」模式，填入 **SSID**（Wi-Fi 名称）和 **密码**
+   （也可点 SSID 右侧 ▼ 选择之前保存过的网络）。
+4. 点 **「启用」**——程序会自动把 Wi-Fi 信息发给眼镜，眼镜联网后自动获取 IP。
+5. 点 **「预览」**——打开播放窗口开始观看。
 
-## 渲染效果（预览中实时生效）
+> 勾选「Wi-Fi 保活」可防止眼镜闲置后自动断开，建议保持开启。
 
-底图旋转/亮度/cover 裁剪，overlay 缩放/透明度/亮度/旋转/圆角背景压暗/
-5 点十字抗锯齿/边缘锐化/饱和度提升/加色混合，黑边抠像（luma 阈值 +
-羽化曲线 + 阈值外扩）。全部参数在设置页"渲染效果"区调节，写入
-`settings.yaml`，播放器监视文件热更新。
+### 日常使用：无线投屏
 
-## 构建与测试
+眼镜开机后会自动连上配好的 Wi-Fi（与电脑同一网络）：
 
-```bash
-# 全量测试（62 个：协议/配置单测 + VideoToolbox/OpenH264 真实码流
-# + mock scrcpy 会话 + 离屏 shader 数值验证）
-./scripts/test-all.sh
+1. 打开 GSCP，确认 IP 地址已自动填入（或手动输入眼镜 IP）。
+2. 点 **「启用」**，再点 **「预览」**。
 
-# 无眼镜端到端演示（mock 三路源）
-./scripts/demo.sh
+### 有线模式
 
-# macOS 打包（.app / .dmg）
-./scripts/package-macos.sh app
-```
+不想走 Wi-Fi 时，选「有线」模式，USB 直连眼镜后点「启用」→「预览」，
+延迟最低，适合调试。
 
-依赖：Rust 1.85+、Node（仅语法检查）、macOS 需要 Xcode CLT；
-Linux 需要 `libwebkit2gtk-4.1-dev`；Windows 需要 MSVC + WebView2。
-本机 ffmpeg 用于测试码流生成（可选）。
+### 结束观看
 
-## CI
+- 点 **「停用」** 断开连接；直接关窗也可。
+- macOS 可在 `~/Library/Application Support/gscp/`、
+  Windows 在 `%APPDATA%\gscp\` 找到配置与日志。
 
-`.github/workflows/ci.yml`，推送到 GitHub 即自动执行：
+## 播放窗口与画面调节
 
-| Job | Runner | 内容 | 产物 |
-|---|---|---|---|
-| desktop (macOS) | macos-latest | 测试 + 打包 | .dmg + .app.zip |
-| desktop (Linux) | ubuntu-latest | 测试 + 打包 | .deb + .AppImage |
-| desktop (Windows) | windows-latest | 测试 + 打包 | NSIS 安装器 .exe |
-| android | ubuntu-latest | arm64 构建 | 未签名 .apk |
+播放窗口同时显示两路画面：**底图**（眼镜 camera 实景）与 **overlay**
+（眼镜 UI 图层，叠加在实景上）。
 
-- 桌面矩阵在每个平台先跑 `cargo test --workspace`（安装 ffmpeg 使解码/会话集成测试完整执行），再 `npx @tauri-apps/cli@2 build` 打包。
-- Android 复用仓库内 `crates/gscp-app/gen/android`（已纳入版本控制，含定制的 BuildTask.kt——直接调 cargo，绕开 android-studio-script 的 Studio WS 依赖），需 JDK 17 + runner 预置 NDK（r25+，含 API 24 wrapper）。
-- 产物在 Actions 页面的 Artifacts 区下载；APK 未签名，发布前需自行签名。
+在「设置」页可调整（预览播放中实时生效，自动保存）：
 
-## 目录
+- 视频流配置：overlay / camera / 音频各自开关；
+- 渲染效果：叠加透明度 / 亮度 / 缩放 / 旋转、底图亮度 / 旋转、
+  背景压暗、饱和度、黑边抠像（下限 / 上限 / 羽化）；
+- 调乱了就点 **「恢复默认」**。
 
-```
-crates/gscp-core     平台无关核心库（可编译到 android 目标）
-crates/gscp-player   播放器（渲染/解码/音频/会话）
-crates/gscp-app      Tauri 桌面壳 + --player 分发
-ui/                  前端（bridge.js 适配 Tauri / Android JSI）
-assets/              内嵌 scrcpy-server、wifi_daemon
-scripts/             测试/打包/演示脚本
-docs/PLAN.md         合并计划与里程碑
-```
+## Android 端使用
 
-## 平台状态
+手机端只负责「连接 + 播放」，**配网请先用桌面端完成**。
 
-| 平台 | 状态 |
-|---|---|
-| macOS | ✅ 完整验证（VideoToolbox 硬解、双路合成、WiFi/USB、.app 打包） |
-| Windows | ✅ 代码就绪（OpenH264/soft、raw 音频）；需原生 CI 打包验证 |
-| Linux | ✅ 代码就绪；需原生环境（webkitgtk）打包验证 |
-| Android | ✅ 核心库 NDK 交叉编译通过，**arm64 APK 构建成功**（未签名）；Kotlin 视频预览壳见 PLAN.md M5 |
+1. 手机安装 `gscp_<版本>_aarch64.apk`（需允许安装未知来源应用）。
+2. 确认手机与眼镜连接的是**同一个 Wi-Fi**。
+3. 打开 GSCP，输入眼镜 IP（就是桌面端配网成功后显示的那个），点「连接」。
+4. 播放中：点连接页右上角 **⚙** 调整参数（overlay 缩放 / 透明度 /
+   亮度 / 饱和度 / 抠像 / 底图旋转等）；播放为全屏沉浸模式，
+   从屏幕边缘滑动可临时呼出系统栏，按返回键断开回到连接页。
 
-### Android 构建
+## 常见问题
 
-```bash
-export ANDROID_HOME=~/Library/Android/sdk
-export NDK_HOME=$ANDROID_HOME/ndk/<版本>
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-export PATH="$ANDROID_HOME/ndk/<版本>/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
-export CC_aarch64_linux_android=aarch64-linux-android24-clang
-export AR_aarch64_linux_android=llvm-ar
+**提示找不到 adb / 下载 platform-tools 失败？**
+GSCP 不自带 adb，首次使用会自动从 Google 服务器下载（约 10 MB）。
+网络不可访问 `dl.google.com` 时会失败，可在「设置」页点
+「下载 platform-tools」重试，或自行安装 adb 后重启 GSCP。
 
-cd crates/gscp-app/gen/android
-./gradlew assembleArm64Release   # 产出 app-arm64-release-unsigned.apk
-```
+**画面发灰、overlay 像蒙了一层半透明？**
+点设置页「恢复默认」。旧版本默认参数带了压暗和半透明叠加，
+新版本默认不改变画面，但已保存过的旧配置需要手动恢复一次。
+
+**延迟高？**
+优先使用有线模式；无线模式确认眼镜与电脑连的是同一个路由器、
+信号良好。若持续异常，把应用数据目录下的 `gscp.log` 发给开发者。
+
+**Windows 双击安装包提示 SmartScreen？**
+点「仍要运行」即可——安装包未做代码签名。
+
+**Android 提示"连接失败"？**
+确认桌面端配网已成功、手机与眼镜在同一 Wi-Fi、IP 输入正确；
+眼镜省电断开 Wi-Fi 时重新点亮眼镜再试。
+
+## License
+
+本项目代码以 [MIT License](LICENSE) 授权。
+
+其中捆绑/依赖的第三方组件各自遵循其原始许可，主要包括：
+
+| 组件 | 用途 | 许可 |
+|---|---|---|
+| scrcpy（scrcpy-server） | 眼镜端码流服务 | Apache-2.0 |
+| OpenH264（源码编译） | H.264 软件解码 | BSD-2-Clause |
+| libopus | 音频解码（Unix 系统库） | BSD-3-Clause |
+| libadb（Android 端 AAR） | adb 协议实现 | GPL-3.0 |
+| Tauri / wgpu / winit 等 Rust 生态 | 应用框架与渲染 | MIT OR Apache-2.0 |
+
+> 注意：Android 端因捆绑 GPL-3.0 的 libadb 库，该端应用按 GPL-3.0 授权分发；
+> 桌面端为 MIT。OpenH264 为源码编译产物（Cisco 官方二进制另有授权条款，本项目未使用）。
