@@ -285,17 +285,11 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         GLES20.glUniform1i(uBottomMirror, if (bottomMirror) 1 else 0)
         GLES20.glUniform1f(uBaseBrightness, baseBrightness)
 
-        // overlay 几何：内容旋转 90/270 时宽高比取倒数后 contain 铺放 × overlay_scale
+        // overlay 几何：与桌面端对齐 — 高度固定为画布高度 × overlayScale，宽度按比例伸展（可超出画布两侧）
         val contentAspect = if ((topRotationDeg / 90) % 2 == 1) 1f / topAspectRatio else topAspectRatio
         val canvasAspect = width.toFloat() / height
-        var rw: Float
-        var rh: Float
-        if (contentAspect / canvasAspect > 1f) {
-            rh = 1f; rw = canvasAspect / contentAspect
-        } else {
-            rw = 1f; rh = contentAspect / canvasAspect
-        }
-        rw *= overlayScale; rh *= overlayScale
+        val rw = contentAspect / canvasAspect * overlayScale
+        val rh = overlayScale
         GLES20.glUniform4f(uTopRect, 0.5f, 0.5f, rw / 2f, rh / 2f)
         GLES20.glUniform1i(uTopRotation, (topRotationDeg / 90) % 4)
         GLES20.glUniform1i(uTopMirror, if (topMirror) 1 else 0)
