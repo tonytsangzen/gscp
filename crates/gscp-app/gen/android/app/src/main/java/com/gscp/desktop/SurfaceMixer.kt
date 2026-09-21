@@ -109,6 +109,9 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         }
     }
 
+    // 等待 EGL/GL 初始化完成后再执行的挂起操作
+    private var pendingApplySettings: Runnable? = null
+
     init {
         handlerThread.start()
         handler = Handler(handlerThread.looper)
@@ -145,7 +148,23 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
             val pbSurface = EGL14.eglCreatePbufferSurface(eglDisplay, eglConfig, pbufferAttribs, 0)
             EGL14.eglMakeCurrent(eglDisplay, pbSurface, pbSurface, eglContext)
             initGl()
+
+            // EGL/GL 就绪后，执行被挂起的设置任务
+            pendingApplySettings?.let { handler.post(it) }
+            pendingApplySettings = null
+
             renderFrame()
+        }
+    }
+
+    /** 在 EGL/GL 初始化完成后安全地执行操作（挂起到 GL 线程）。 */
+    private fun runAfterGlReady(action: Runnable) {
+        handler.post {
+            if (::bottomViewMatrix.isInitialized) {
+                action.run()
+            } else {
+                pendingApplySettings = action
+            }
         }
     }
 
@@ -403,12 +422,12 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     fun setBottomRotation(rotation: Float, mirror: Boolean) {
         bottomRotation = rotation
         bottomMirror = mirror
-        refreshMatrices()
+        runAfterGlReady(Runnable { refreshMatrices() })
     }
 
     fun setBottomAspectRatio(ratio: Float) {
         bottomAspectRatio = ratio
-        refreshMatrices()
+        runAfterGlReady(Runnable { refreshMatrices() })
     }
 
     fun setTopRotation(rotationDeg: Int, mirror: Boolean) {

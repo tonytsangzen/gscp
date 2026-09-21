@@ -38,7 +38,7 @@ vec2 rotQuad(vec2 t, int q) {
     return t;
 }
 
-float boostSaturation(vec3 color, float gain) {
+vec3 boostSaturation(vec3 color, float gain) {
     float luma = dot(color, vec3(0.299, 0.587, 0.114));
     vec3 gray = vec3(luma);
     return clamp(gray + (color - gray) * gain, 0.0, 1.0);

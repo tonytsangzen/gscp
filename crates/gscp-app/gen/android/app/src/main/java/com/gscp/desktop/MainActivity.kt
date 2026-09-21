@@ -87,8 +87,6 @@ class MainActivity : AppCompatActivity() {
         ipEdit = findViewById(R.id.ip_address)
         val connectButton = findViewById<Button>(R.id.button_connect)
 
-        loadSettings()
-
         // 画面区域：竖屏下 3:4，横屏下保持高度铺满
         val size = Point()
         @Suppress("DEPRECATION")
@@ -104,6 +102,8 @@ class MainActivity : AppCompatActivity() {
 
         mixer = SurfaceMixer(this, w, h)
         audioPlayer = AudioPlayer(48000, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+
+        loadSettings()
 
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {}
