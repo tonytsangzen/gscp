@@ -90,6 +90,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private var uKeyHigh = 0
     private var uFeatherPower = 0
     private var uFeatherRadius = 0
+    private var uTopCropMargin = 0
     private var topViewTimestamp: Long = 0
     private var bottomViewTimestamp: Long = 0
 
@@ -224,6 +225,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         uKeyHigh = GLES20.glGetUniformLocation(program, "uKeyHigh")
         uFeatherPower = GLES20.glGetUniformLocation(program, "uFeatherPower")
         uFeatherRadius = GLES20.glGetUniformLocation(program, "uFeatherRadius")
+        uTopCropMargin = GLES20.glGetUniformLocation(program, "uTopCropMargin")
 
         val vertices = floatArrayOf(
             -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
@@ -285,11 +287,17 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         GLES20.glUniform1i(uBottomMirror, if (bottomMirror) 1 else 0)
         GLES20.glUniform1f(uBaseBrightness, baseBrightness)
 
-        // overlay 几何：与桌面端对齐 — 高度固定为画布高度 × overlayScale，宽度按比例伸展（可超出画布两侧）
+        // overlay 几何：contain 铺放 × overlay_scale（rect 不超出画布）
         val contentAspect = if ((topRotationDeg / 90) % 2 == 1) 1f / topAspectRatio else topAspectRatio
         val canvasAspect = width.toFloat() / height
-        val rw = contentAspect / canvasAspect * overlayScale
-        val rh = overlayScale
+        var rw: Float
+        var rh: Float
+        if (contentAspect / canvasAspect > 1f) {
+            rh = 1f; rw = canvasAspect / contentAspect
+        } else {
+            rw = 1f; rh = contentAspect / canvasAspect
+        }
+        rw *= overlayScale; rh *= overlayScale
         GLES20.glUniform4f(uTopRect, 0.5f, 0.5f, rw / 2f, rh / 2f)
         GLES20.glUniform1i(uTopRotation, (topRotationDeg / 90) % 4)
         GLES20.glUniform1i(uTopMirror, if (topMirror) 1 else 0)
@@ -303,6 +311,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         GLES20.glUniform1f(uKeyHigh, keyHigh)
         GLES20.glUniform1f(uFeatherPower, featherPower)
         GLES20.glUniform1f(uFeatherRadius, featherRadius)
+        GLES20.glUniform1f(uTopCropMargin, 0.2f) // 裁剪纹理边缘 20%（单侧），去除 filler 像素
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, bottomTexture)

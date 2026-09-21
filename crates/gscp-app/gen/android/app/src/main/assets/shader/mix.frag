@@ -31,6 +31,9 @@ uniform float uKeyHigh;
 uniform float uFeatherPower;
 uniform float uFeatherRadius;
 
+// 纹理边缘裁剪：采样点在 [cropMargin, 1-cropMargin] 范围内才有有效内容
+uniform float uTopCropMargin;
+
 vec2 rotQuad(vec2 t, int q) {
     if (q == 1) return vec2(1.0 - t.y, t.x);
     if (q == 2) return vec2(1.0 - t.x, 1.0 - t.y);
@@ -105,8 +108,15 @@ void main() {
             if (uTopMirror == 1) t.x = 1.0 - t.x;
             t = rotQuad(t, uTopRotation);
 
+            // 纹理边缘裁剪：采样点在 cropMargin~1-cropMargin 外 → alpha=0
+            float cropAlpha = 1.0;
+            if (t.x < uTopCropMargin || t.x > 1.0 - uTopCropMargin ||
+                t.y < uTopCropMargin || t.y > 1.0 - uTopCropMargin) {
+                cropAlpha = 0.0;
+            }
+
             vec4 overlayColor = sampleTopFiltered(t);
-            float alphaOut = blackKeyAlpha(overlayColor.rgb, overlayColor.a);
+            float alphaOut = blackKeyAlpha(overlayColor.rgb, overlayColor.a) * cropAlpha;
             float gain = uOverlayAlpha * uOverlayBrightness;
             vec3 enhanced = clamp(boostSaturation(overlayColor.rgb, uOverlaySaturation) * 1.12, 0.0, 1.0);
             vec3 overlayRGB = enhanced * alphaOut * gain;
