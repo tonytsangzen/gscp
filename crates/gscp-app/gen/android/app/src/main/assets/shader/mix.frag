@@ -100,7 +100,7 @@ void main() {
     if (uTopEnable == 1) {
         vec2 d = vTexCoord - uTopRect.xy;
         if (abs(d.x) <= uTopRect.z && abs(d.y) <= uTopRect.w) {
-            vec2 local = d / uTopRect.zw + 0.5;   // overlay rect 空间 0..1
+            vec2 local = d / (2.0 * uTopRect.zw) + 0.5;   // overlay rect 空间 0..1（uTopRect.zw 为半宽半高）
             vec2 t = local;
             if (uTopMirror == 1) t.x = 1.0 - t.x;
             t = rotQuad(t, uTopRotation);
