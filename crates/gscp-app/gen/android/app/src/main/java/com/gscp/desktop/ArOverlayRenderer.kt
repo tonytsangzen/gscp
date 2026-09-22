@@ -128,10 +128,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private val smoothR = FloatArray(16)
     private var smoothValid = false
 
-    /** 屏幕显示 = 分析帧绕视线轴顺时针旋转 90°（相机空间 Rz(-90)，实测校准）。 */
+    /** 屏幕显示 = 分析帧绕视线轴顺时针旋转 180°（相机空间 Rz(-180)，实测校准）。 */
     private val screenRotation = floatArrayOf(
+        -1f, 0f, 0f, 0f,
         0f, -1f, 0f, 0f,
-        1f, 0f, 0f, 0f,
         0f, 0f, 1f, 0f,
         0f, 0f, 0f, 1f,
     )
@@ -318,14 +318,14 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
-        // 画面顺时针旋转 90°：屏幕四角采样自旋转后的纹理位置
+        // 画面在原基础上再顺时针加转 90°（累计 180°）
         val verts = floatArrayOf(
-            -hw, hh, 1f, 0f,
-            -hw, -hh, 0f, 0f,
-            hw, -hh, 0f, 1f,
-            -hw, hh, 1f, 0f,
-            hw, -hh, 0f, 1f,
-            hw, hh, 1f, 1f,
+            -hw, hh, 0f, 1f,
+            -hw, -hh, 1f, 1f,
+            hw, -hh, 1f, 0f,
+            -hw, hh, 0f, 1f,
+            hw, -hh, 1f, 0f,
+            hw, hh, 0f, 0f,
         )
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(verts).position(0)
