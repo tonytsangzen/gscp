@@ -97,12 +97,13 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
     private val quadVertexBuffer: FloatBuffer = floatBufferOf(
         // x, y, u, v —— 单位平面（中心原点）
-        -0.5f, 0.5f, 0f, 0f,
-        -0.5f, -0.5f, 0f, 1f,
-        0.5f, -0.5f, 1f, 1f,
-        -0.5f, 0.5f, 0f, 0f,
-        0.5f, -0.5f, 1f, 1f,
-        0.5f, 0.5f, 1f, 0f,
+        // 内容逆时针旋转 90°
+        -0.5f, 0.5f, 0f, 1f,
+        -0.5f, -0.5f, 1f, 1f,
+        0.5f, -0.5f, 1f, 0f,
+        -0.5f, 0.5f, 0f, 1f,
+        0.5f, -0.5f, 1f, 0f,
+        0.5f, 0.5f, 0f, 0f,
     )
     private val fullscreenVertexBuffer: FloatBuffer = run {
         val b = ByteBuffer.allocateDirect(24 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -185,8 +186,9 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
         // 投影：FOV 以相机画面（旋转 90° 后的竖幅 720×1280）垂直方向为基准，
         // 相机完整视野全部可见（最大 FOV，不裁剪）。
-        val imgW = 720f
-        val imgH = 1280f
+        // 旋转 90° 后的显示尺寸 = 相机真实缓冲的宽高互换（等比例）
+        val imgW = cameraBufferHeight
+        val imgH = cameraBufferWidth
         val near = 5f
         val far = 1000f
         val fovY = Math.toRadians(50.0)
@@ -287,8 +289,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
     /** 背景：等比缩放居中（letterbox），画面顺时针旋转 90°，完整显示。 */
     private fun drawFullscreen(tex: Int) {
-        val imgW = 720f
-        val imgH = 1280f
+        val imgW = cameraBufferHeight
+        val imgH = cameraBufferWidth
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
