@@ -94,6 +94,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var markerUColor = 0
     private val markerBuffer: FloatBuffer = ByteBuffer
         .allocateDirect(120 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+
+    /** 检测结果可视化数据（正立空间归一化）：[5 点 x,y | bbox x,y,w,h]，null = 无。 */
+    @Volatile
+    var detection: FloatArray? = null
     private var viewportW = 1
     private var viewportH = 1
 
