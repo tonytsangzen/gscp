@@ -3,6 +3,7 @@ package com.gscp.desktop
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.RectF
 import android.os.Bundle
 import android.util.Patterns
@@ -22,19 +23,23 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.Size
+import org.opencv.objdetect.FaceDetectorYN
+import java.io.File
 import java.util.concurrent.Executors
+import kotlin.math.tan
 
 /**
  * AR 试验模式：仅拉取眼镜 overlay 流，手机摄像头拍摄现实画面，
- * MediaPipe Face Landmarker 追踪人脸，把 overlay 作为虚拟平面绘制在
- * 第一张稳定追踪人脸的正前方（平面法线与人脸法线重合，距离/大小可调）。
+ * YuNet（OpenCV FaceDetectorYN）检测人脸 + 5 点 DLT-PnP 解算头部位姿，
+ * 把 overlay 作为虚拟平面绘制在第一张稳定追踪人脸的正前方
+ * （平面法线与人脸法线重合，距离/大小可调）。
  *
- * 小脸优化：追踪锁定后分析区域自动裁剪放大到人脸附近（动态 ROI），
- * 位姿矩阵经仿射逆变换映射回全帧坐标；丢失后回到全帧重新捕获。
+ * 小脸优化：分析流 1280×720 + 动态 ROI 裁剪（锁定后分析区域放大到人脸附近，
+ * 位姿在正立显示坐标系下解算，直接可用于渲染）。
  */
 class ArActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
@@ -50,7 +55,7 @@ class ArActivity : AppCompatActivity() {
 
     private var connection: ScrcpyConnection? = null
     private var overlayDecoder: VideoDecoder? = null
-    private var landmarker: FaceLandmarker? = null
+    private var detector: FaceDetectorYN? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
 
     private var playing = false
@@ -60,7 +65,7 @@ class ArActivity : AppCompatActivity() {
     private var lastMatrixLogAt = 0L
     private val lock = Any()
 
-    // 动态 ROI（归一化 [0,1]）：小脸时裁剪放大分析区域
+    // 动态 ROI（正立显示空间归一化 [0,1]）：小脸时裁剪放大分析区域
     private val roiRect = RectF(0f, 0f, 1f, 1f)
     private var roiActive = false
     private var roiLostFrames = 0
@@ -74,6 +79,9 @@ class ArActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_ar)
         prefs = getSharedPreferences("gscp", MODE_PRIVATE)
+
+        // OpenCV 本地库（AAR 自带）
+        OpenCVLoader.initLocal()
 
         settingsPanel = findViewById(R.id.settings_panel)
         arPanel = findViewById(R.id.ar_panel)
@@ -186,151 +194,155 @@ class ArActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ── MediaPipe 人脸追踪（动态 ROI）─────────────────────────
+    // ── YuNet 人脸检测 + DLT-PnP 位姿（动态 ROI）─────────────
 
-    private fun ensureLandmarker(): FaceLandmarker {
-        landmarker?.let { return it }
-        val base = BaseOptions.builder()
-            .setModelAssetPath("face_landmarker.task")
-            .build()
-        val options = FaceLandmarker.FaceLandmarkerOptions.builder()
-            .setBaseOptions(base)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumFaces(3)
-            .setMinFaceDetectionConfidence(0.4f)
-            .setMinFacePresenceConfidence(0.4f)
-            .setMinTrackingConfidence(0.4f)
-            .setOutputFacialTransformationMatrixes(true)
-            .setResultListener { result, _ ->
-                val now = System.currentTimeMillis()
-                synchronized(lock) {
-                    val hasFace = result.faceLandmarks().isNotEmpty()
-                    if (hasFace) {
-                        roiLostFrames = 0
-                        if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
-                        lastFaceAtMillis = now
-                        // 稳定判定：连续追踪 ~0.5s 后锚定第一张人脸
-                        if (!faceLocked && now - firstFaceAtMillis >= 500) {
-                            faceLocked = true
-                            runOnUiThread { statusText.text = "已锁定人脸" }
-                        }
-                        if (faceLocked) {
-                            val matrix = result.facialTransformationMatrixes()
-                            if (matrix.isPresent) {
-                                val matrices = matrix.get()
-                                if (matrices.isNotEmpty()) {
-                                    renderer.faceMatrix = toFullScreenMatrix(matrices[0])
-                                }
-                            }
-                        }
-                        // 从首张人脸 landmark 更新 ROI（方形，含 3 倍人脸宽度余量）
-                        updateRoiFromFace(result.faceLandmarks()[0])
-                    } else {
-                        firstFaceAtMillis = 0L
-                        if (roiActive) {
-                            roiLostFrames++
-                            // ROI 内连续丢失：回到全帧重新捕获
-                            if (roiLostFrames > 12) {
-                                roiRect.set(0f, 0f, 1f, 1f)
-                                roiActive = false
-                                roiLostFrames = 0
-                            }
-                        }
-                        if (faceLocked && now - lastFaceAtMillis > 1000) {
-                            faceLocked = false
-                            renderer.faceMatrix = null
-                            runOnUiThread { statusText.text = "等待人脸…" }
-                        }
-                    }
-                }
+    private fun ensureModelFile(): String {
+        val f = File(filesDir, "face_detection_yunet_2023mar.onnx")
+        if (!f.exists()) {
+            assets.open("face_detection_yunet_2023mar.onnx").use { input ->
+                java.io.FileOutputStream(f).use { output -> input.copyTo(output) }
             }
-            .setErrorListener { err ->
-                runOnUiThread { statusText.text = "追踪错误: ${err.message}" }
-            }
-            .build()
-        return FaceLandmarker.createFromOptions(this, options).also { landmarker = it }
+        }
+        return f.absolutePath
+    }
+
+    private fun ensureDetector(w: Int, h: Int): FaceDetectorYN {
+        val existing = detector
+        if (existing != null) {
+            existing.setInputSize(Size(w.toDouble(), h.toDouble()))
+            return existing
+        }
+        val d = FaceDetectorYN.create(
+            ensureModelFile(), "", Size(w.toDouble(), h.toDouble()), 0.6f, 0.3f, 3,
+        )
+        detector = d
+        return d
     }
 
     private fun analyzeFrame(image: ImageProxy) {
-        val lm = try {
-            ensureLandmarker()
-        } catch (e: Exception) {
-            runOnUiThread { statusText.text = "初始化追踪失败: ${e.message}" }
-            image.close()
-            return
-        }
-        val timestamp = image.imageInfo.timestamp / 1_000_000
         try {
             val full = image.toBitmap()
-            val bmp: Bitmap = if (roiActive) {
-                val W = full.width.toFloat()
-                val H = full.height.toFloat()
-                val x = (roiRect.left * W).toInt().coerceIn(0, full.width - 2)
-                val y = (roiRect.top * H).toInt().coerceIn(0, full.height - 2)
-                val w = (roiRect.width() * W).toInt().coerceIn(16, full.width - x)
-                val h = (roiRect.height() * H).toInt().coerceIn(16, full.height - y)
-                Bitmap.createBitmap(full, x, y, w, h)
+            // 正立显示空间：传感器横向帧顺时针旋转 90°
+            val m = Matrix().apply { postRotate(90f) }
+            val upright = Bitmap.createBitmap(full, 0, 0, full.width, full.height, m, true)
+            if (upright !== full) full.recycle()
+            val W = upright.width
+            val H = upright.height
+
+            // 动态 ROI 裁剪（正立空间）
+            val bmp: Bitmap
+            var cropX = 0
+            var cropY = 0
+            if (roiActive) {
+                cropX = (roiRect.left * W).toInt().coerceIn(0, W - 2)
+                cropY = (roiRect.top * H).toInt().coerceIn(0, H - 2)
+                val cw = (roiRect.width() * W).toInt().coerceIn(16, W - cropX)
+                val ch = (roiRect.height() * H).toInt().coerceIn(16, H - cropY)
+                bmp = Bitmap.createBitmap(upright, cropX, cropY, cw, ch)
+                if (bmp !== upright) upright.recycle()
             } else {
-                full
+                bmp = upright
             }
-            lm.detectAsync(BitmapImageBuilder(bmp).build(), timestamp)
-            if (bmp !== full) bmp.recycle()
-            full.recycle()
-        } catch (_: Exception) {
+
+            val detector = ensureDetector(bmp.width, bmp.height)
+            val bgr = Mat()
+            Utils.bitmapToMat(bmp, bgr)
+            val faces = Mat()
+            detector.detect(bgr, faces)
+            if (bmp !== upright) bmp.recycle()
+            upright.recycle()
+
+            // 取置信度最高的人脸（行 = [x,y,w,h, 右眼,左眼,鼻尖,右嘴,左嘴, score]）
+            var best = -1
+            var bestScore = 0.0
+            for (r in 0 until faces.rows()) {
+                val score = faces.get(r, 14)[0]
+                if (score > bestScore) { bestScore = score; best = r }
+            }
+            val hasFace = best >= 0
+            synchronized(lock) {
+                if (hasFace) {
+                    roiLostFrames = 0
+                    val g = { c: Int -> faces.get(best, c)[0] }
+                    // 裁剪坐标 → 正立全帧坐标
+                    val bx = g(0) + cropX; val by = g(1) + cropY; val bw = g(2)
+                    val ptsPx = listOf(
+                        Pair(g(4) + cropX, g(5) + cropY),
+                        Pair(g(6) + cropX, g(7) + cropY),
+                        Pair(g(8) + cropX, g(9) + cropY),
+                        Pair(g(10) + cropX, g(11) + cropY),
+                        Pair(g(12) + cropX, g(13) + cropY),
+                    )
+
+                    val now = System.currentTimeMillis()
+                    if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
+                    lastFaceAtMillis = now
+                    if (!faceLocked && now - firstFaceAtMillis >= 500) {
+                        faceLocked = true
+                        runOnUiThread { statusText.text = "已锁定人脸" }
+                    }
+
+                    if (faceLocked) {
+                        // 针孔模型（正立空间）：FOV 垂直 50°
+                        val focal = (H / 2.0) / tan(Math.toRadians(25.0))
+                        val distance = (focal * 15.0 / bw).coerceIn(10.0, 300.0)
+                        val imgPts = ptsPx.map { (x, y) ->
+                            Pair((x - W / 2.0) / focal, (y - H / 2.0) / focal)
+                        }
+                        val matrix = FacePoseMath.solvePnp(FacePoseMath.MODEL_POINTS, imgPts)
+                        if (matrix != null) {
+                            renderer.faceMatrix = matrix
+                        }
+                        if (now - lastMatrixLogAt > 500) {
+                            lastMatrixLogAt = now
+                            val mm = renderer.faceMatrix
+                            if (mm != null) {
+                                android.util.Log.i(
+                                    "gscp-ar",
+                                    "face d=%.1fcm t=(%.1f,%.1f,%.1f)".format(
+                                        distance, mm[12], mm[13], mm[14],
+                                    ),
+                                )
+                            }
+                        }
+                    }
+
+                    // 更新 ROI（正立空间归一化，方形 3 倍人脸宽度）
+                    val faceWN = (bw / W).coerceAtLeast(0.02)
+                    val side = (faceWN * 3.0).coerceIn(0.15, 1.0)
+                    val cx = bx / W
+                    val cy = by / H
+                    val rx0 = (cx - side / 2).coerceIn(0.0, 1.0 - side)
+                    val ry0 = (cy - side / 2).coerceIn(0.0, 1.0 - side)
+                    roiRect.set(rx0.toFloat(), ry0.toFloat(), (rx0 + side).toFloat(), (ry0 + side).toFloat())
+                    roiActive = true
+                } else {
+                    firstFaceAtMillis = 0L
+                    if (roiActive) {
+                        roiLostFrames++
+                        if (roiLostFrames > 12) {
+                            roiRect.set(0f, 0f, 1f, 1f)
+                            roiActive = false
+                            roiLostFrames = 0
+                        }
+                    }
+                    if (faceLocked && now2() - lastFaceAtMillis > 1000) {
+                        faceLocked = false
+                        renderer.faceMatrix = null
+                        runOnUiThread { statusText.text = "等待人脸…" }
+                    }
+                }
+            }
+            faces.release()
+            bgr.release()
+        } catch (e: Exception) {
+            android.util.Log.w("gscp-ar", "analyze: ${e.message}")
         } finally {
             image.close()
         }
     }
 
-    /** 从首张人脸 landmark（当前输入空间）更新 ROI：方形、3 倍人脸宽度余量。 */
-    private fun updateRoiFromFace(landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>) {
-        if (landmarks.isEmpty()) return
-        var minX = 1f; var maxX = 0f
-        var minY = 1f; var maxY = 0f
-        for (p in landmarks) {
-            if (p.x() < minX) minX = p.x()
-            if (p.x() > maxX) maxX = p.x()
-            if (p.y() < minY) minY = p.y()
-            if (p.y() > maxY) maxY = p.y()
-        }
-        // 裁剪空间 → 全帧空间
-        val fx0 = roiRect.left + minX * roiRect.width()
-        val fx1 = roiRect.left + maxX * roiRect.width()
-        val fy0 = roiRect.top + minY * roiRect.height()
-        val fy1 = roiRect.top + maxY * roiRect.height()
-        val cx = (fx0 + fx1) / 2f
-        val cy = (fy0 + fy1) / 2f
-        val faceW = (fx1 - fx0).coerceAtLeast(0.02f)
-        val side = (faceW * 3f).coerceIn(0.15f, 1f)
-        val rx0 = (cx - side / 2).coerceIn(0f, 1f - side)
-        val ry0 = (cy - side / 2).coerceIn(0f, 1f - side)
-        roiRect.set(rx0, ry0, rx0 + side, ry0 + side)
-        roiActive = true
-    }
-
-    /** 裁剪空间的位姿矩阵 → 全帧空间（ROI 平移/缩放的仿射逆）。 */
-    private fun toFullScreenMatrix(mCrop: FloatArray): FloatArray {
-        val iw = 1f / roiRect.width()
-        val ih = 1f / roiRect.height()
-        // C⁻¹ = [rw,0,0,rx; 0,rh,0,ry; 0,0,1,0; 0,0,0,1]（列主序）
-        val cinv = floatArrayOf(
-            iw, 0f, 0f, 0f,
-            0f, ih, 0f, 0f,
-            0f, 0f, 1f, 0f,
-            roiRect.left, roiRect.top, 0f, 1f,
-        )
-        val out = FloatArray(16)
-        for (col in 0 until 4) {
-            for (row in 0 until 4) {
-                var sum = 0f
-                for (k in 0 until 4) {
-                    sum += cinv[k * 4 + row] * mCrop[col * 4 + k]
-                }
-                out[col * 4 + row] = sum
-            }
-        }
-        return out
-    }
+    private fun now2(): Long = System.currentTimeMillis()
 
     // ── scrcpy overlay-only 连接 / 测试模式 ───────────────────
 
@@ -396,7 +408,7 @@ class ArActivity : AppCompatActivity() {
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
             renderer.overlayAspect = width.toFloat() / height
             runOnUiThread {
-                statusText.text = "overlay ${'$'}{width}×${'$'}{height}，请正对手机摄像头"
+                statusText.text = "overlay ${width}×${height}，请正对手机摄像头"
                 overlayDecoder?.start(width, height, renderer.getOverlaySurface())
             }
         }
@@ -460,8 +472,7 @@ class ArActivity : AppCompatActivity() {
         playing = false
         connection?.disconnect()
         analysisExecutor.shutdown()
-        landmarker?.close()
-        landmarker = null
+        detector = null
         super.onDestroy()
     }
 }
