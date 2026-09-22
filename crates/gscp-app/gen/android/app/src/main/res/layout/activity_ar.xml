@@ -70,17 +70,12 @@
             android:visibility="gone" />
     </LinearLayout>
 
-    <!-- AR 画面：相机预览（底） + 透明 GL overlay 平面（顶） -->
+    <!-- AR 画面：单 GLSurfaceView（相机背景 + overlay 平面在同一 GL 内渲染） -->
     <FrameLayout
         android:id="@+id/ar_panel"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone">
-
-        <androidx.camera.view.PreviewView
-            android:id="@+id/ar_preview"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent" />
 
         <android.opengl.GLSurfaceView
             android:id="@+id/ar_gl_surface"

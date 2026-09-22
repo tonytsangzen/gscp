@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.os.Bundle
 import android.util.Patterns
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -18,7 +19,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -27,22 +27,24 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import java.util.concurrent.Executors
 
 /**
- * AR 试验模式：仅拉取眼镜 overlay 流，用手机前摄拍摄现实画面，
+ * AR 试验模式：仅拉取眼镜 overlay 流，手机摄像头拍摄现实画面，
  * MediaPipe Face Landmarker 追踪人脸，把 overlay 作为虚拟平面绘制在
  * 第一张稳定追踪人脸的正前方（平面法线与人脸法线重合，距离/大小可调）。
  *
- * 稳定判定：人脸需被连续追踪约 0.5 秒才锚定；丢失超过约 1 秒后隐藏平面。
+ * 相机画面与 overlay 平面在同一 GLSurfaceView 内渲染（单 Surface，无分层）。
+ * 稳定判定：人脸连续追踪约 0.5s 才锚定；丢失约 1s 后隐藏平面。
  */
 class ArActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
-    private lateinit var connectPanel: View
+
+    private lateinit var settingsPanel: View
     private lateinit var arPanel: View
     private lateinit var glSurface: android.opengl.GLSurfaceView
-    private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var progressView: View
     private lateinit var ipEdit: EditText
     private lateinit var renderer: ArOverlayRenderer
+    private var cameraSurface: Surface? = null
 
     private var connection: ScrcpyConnection? = null
     private var overlayDecoder: VideoDecoder? = null
@@ -54,14 +56,12 @@ class ArActivity : AppCompatActivity() {
     private var firstFaceAtMillis = 0L
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
+    private val lock = Any()
 
     // 可调参数
-    private var distancePercent = 40    // 20..120 → 归一化距离（×0.01）
-    private var sizePercent = 100       // 50..200 → 平面大小系数
-    private var flipNormal = false
-    private var frontCamera = true
-
-    private val lock = Any()
+    private var distanceCm = 40      // 平面目标深度（厘米，20..120）
+    private var sizePercent = 100    // 平面大小系数（50..200，基准宽 14cm）
+    private var audioEnabled = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,30 +69,32 @@ class ArActivity : AppCompatActivity() {
         setContentView(R.layout.activity_ar)
         prefs = getSharedPreferences("gscp", MODE_PRIVATE)
 
-        connectPanel = findViewById(R.id.settings_panel)
+        settingsPanel = findViewById(R.id.settings_panel)
         arPanel = findViewById(R.id.ar_panel)
         glSurface = findViewById(R.id.ar_gl_surface)
-        previewView = findViewById(R.id.ar_preview)
         statusText = findViewById(R.id.ar_status)
         progressView = findViewById(R.id.progress_bar)
         ipEdit = findViewById(R.id.ip_address)
         val connectButton = findViewById<Button>(R.id.button_connect)
 
-        distancePercent = prefs.getInt("arDistance", 40)
-        sizePercent = prefs.getInt("arSize", 100)
-        flipNormal = prefs.getBoolean("arFlipNormal", false)
-        frontCamera = prefs.getBoolean("arFrontCamera", true)
+        distanceCm = prefs.getInt("arDistanceCm", 40)
+        sizePercent = prefs.getInt("arSizePercent", 100)
 
         renderer = ArOverlayRenderer().apply {
-            planeDistance = distancePercent.toFloat() // 厘米
+            planeDistance = distanceCm.toFloat()
             planeScale = sizePercent / 100f
-            this.flipNormal = this@ArActivity.flipNormal
-            mirrorX = frontCamera
+        }
+        renderer.onCameraSurfaceReady = { surface ->
+            runOnUiThread {
+                cameraSurface = surface
+                if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    startCamera(surface)
+                }
+            }
         }
         glSurface.setEGLContextClientVersion(2)
-        glSurface.setEGLConfigChooser(8, 8, 8, 8, 0, 0) // 透明背景
-        glSurface.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
-        glSurface.setZOrderMediaOverlay(true)
         glSurface.setRenderer(renderer)
         glSurface.renderMode = android.opengl.GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
@@ -100,20 +102,15 @@ class ArActivity : AppCompatActivity() {
         connectButton.setOnClickListener { startAr() }
         findViewById<Button>(R.id.button_test).setOnClickListener { startTestTracking() }
         findViewById<Button>(R.id.button_exit).setOnClickListener { exitAr() }
-        findViewById<Button>(R.id.button_flip).setOnClickListener {
-            flipNormal = !flipNormal
-            renderer.flipNormal = flipNormal
-            prefs.edit().putBoolean("arFlipNormal", flipNormal).apply()
-        }
-        bindSeekBar(R.id.ar_distance, distancePercent, 20, 120) { v ->
-            distancePercent = v
-            renderer.planeDistance = v.toFloat() // 厘米
-            prefs.edit().putInt("arDistance", v).apply()
+        bindSeekBar(R.id.ar_distance, distanceCm, 20, 120) { v ->
+            distanceCm = v
+            renderer.planeDistance = v.toFloat()
+            prefs.edit().putInt("arDistanceCm", v).apply()
         }
         bindSeekBar(R.id.ar_size, sizePercent, 50, 200) { v ->
             sizePercent = v
             renderer.planeScale = v / 100f
-            prefs.edit().putInt("arSize", v).apply()
+            prefs.edit().putInt("arSizePercent", v).apply()
         }
 
         requestCameraPermission()
@@ -124,60 +121,49 @@ class ArActivity : AppCompatActivity() {
     private val cameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             statusText.text = if (granted) "相机就绪" else "未授予相机权限，无法追踪人脸"
+            val surface = cameraSurface
+            if (granted && surface != null) startCamera(surface)
         }
 
-    @SuppressLint("MissingPermission")
     private fun requestCameraPermission() {
-        val granted = checkSelfPermission(android.Manifest.permission.CAMERA) ==
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (granted) {
-            startCamera()
+        ) {
+            cameraSurface?.let { startCamera(it) }
         } else {
             cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun startCamera() {
+    private fun startCamera(surface: Surface) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
                 val provider = future.get()
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
+                val preview = Preview.Builder().build()
+                preview.setSurfaceProvider { request ->
+                    request.provideSurface(
+                        surface,
+                        ContextCompat.getMainExecutor(this),
+                    ) { }
                 }
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
                 provider.unbindAll()
-                try {
-                    bindCamera(provider, preview, analysis, frontCamera)
-                } catch (e: Exception) {
-                    // 部分机型前摄枚举异常：回退另一颗相机
-                    statusText.text = "切换相机重试…"
-                    bindCamera(provider, preview, analysis, !frontCamera)
-                }
+                provider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                    preview,
+                    analysis,
+                )
+                statusText.text = "等待人脸…"
             } catch (e: Exception) {
                 statusText.text = "相机启动失败: ${e.message}"
             }
         }, ContextCompat.getMainExecutor(this))
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun bindCamera(
-        provider: ProcessCameraProvider,
-        preview: Preview,
-        analysis: ImageAnalysis,
-        useFront: Boolean,
-    ) {
-        provider.bindToLifecycle(
-            this,
-            if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA
-            else CameraSelector.DEFAULT_BACK_CAMERA,
-            preview,
-            analysis,
-        )
     }
 
     // ── MediaPipe 人脸追踪 ────────────────────────────────────
@@ -198,8 +184,7 @@ class ArActivity : AppCompatActivity() {
             .setResultListener { result, _ ->
                 val now = System.currentTimeMillis()
                 synchronized(lock) {
-                    val hasFace = result.faceLandmarks().isNotEmpty()
-                    if (hasFace) {
+                    if (result.faceLandmarks().isNotEmpty()) {
                         if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
                         lastFaceAtMillis = now
                         // 稳定判定：连续追踪 ~0.5s 后锚定第一张人脸
@@ -213,17 +198,14 @@ class ArActivity : AppCompatActivity() {
                                 val matrices = matrix.get()
                                 if (matrices.isNotEmpty()) {
                                     renderer.faceMatrix = matrices[0]
-                                    // 诊断：周期性显示平移列与法线列，用于校准映射
-                                    val now2 = System.currentTimeMillis()
-                                    if (now2 - lastMatrixLogAt > 500) {
-                                        lastMatrixLogAt = now2
-                                        val m = matrices[0]
-                                        val n = "n=(%.2f,%.2f,%.2f)".format(m[8], m[9], m[10])
-                                        val t = "t=(%.2f,%.2f,%.2f)".format(m[12], m[13], m[14])
-                                        android.util.Log.i("gscp-ar", "face $n $t row3=(${m[3]},${m[7]},${m[11]},${m[15]})")
-                                        runOnUiThread {
-                                            statusText.text = "已锁定 $n $t"
-                                        }
+                                    val m = matrices[0]
+                                    if (now - lastMatrixLogAt > 500) {
+                                        lastMatrixLogAt = now
+                                        android.util.Log.i(
+                                            "gscp-ar",
+                                            "face n=(%.2f,%.2f,%.2f) t=(%.2f,%.2f,%.2f)"
+                                                .format(m[8], m[9], m[10], m[12], m[13], m[14]),
+                                        )
                                     }
                                 }
                             }
@@ -263,7 +245,7 @@ class ArActivity : AppCompatActivity() {
         }
     }
 
-    // ── scrcpy overlay-only 连接 ──────────────────────────────
+    // ── scrcpy overlay-only 连接 / 测试模式 ───────────────────
 
     private fun startAr() {
         val ip = ipEdit.text.toString().trim()
@@ -274,7 +256,7 @@ class ArActivity : AppCompatActivity() {
         prefs.edit().putString("ip", ip).apply()
 
         overlayDecoder = VideoDecoder()
-        connection = ScrcpyConnection(this, audioEnabled = false, overlayOnly = true)
+        connection = ScrcpyConnection(this, audioEnabled = audioEnabled, overlayOnly = true)
         connection!!.connectAsync(ip, 5555, callback)
         enterArScreen("连接眼镜中…")
     }
@@ -287,7 +269,7 @@ class ArActivity : AppCompatActivity() {
     }
 
     private fun enterArScreen(status: String) {
-        connectPanel.visibility = View.GONE
+        settingsPanel.visibility = View.GONE
         arPanel.visibility = View.VISIBLE
         progressView.visibility = View.VISIBLE
         statusText.text = status
@@ -297,24 +279,23 @@ class ArActivity : AppCompatActivity() {
     private fun exitAr() {
         playing = false
         connection?.disconnect()
-        handleStopped()
-        connectPanel.visibility = View.VISIBLE
-        arPanel.visibility = View.GONE
-    }
-
-    private fun handleStopped() {
         runOnUiThread {
             progressView.visibility = View.GONE
             overlayDecoder?.stop()
             overlayDecoder = null
             faceLocked = false
             renderer.faceMatrix = null
+            arPanel.visibility = View.GONE
+            settingsPanel.visibility = View.VISIBLE
         }
     }
 
     private val callback = object : ScrcpyConnection.EventCallback {
         override fun onConnect() {
-            runOnUiThread { statusText.text = "已连接，等待 overlay…"; progressView.visibility = View.GONE }
+            runOnUiThread {
+                progressView.visibility = View.GONE
+                statusText.text = "已连接，等待 overlay…"
+            }
         }
 
         override fun onVideoPrepare(codec: String, width: Int, height: Int) {}
@@ -338,7 +319,18 @@ class ArActivity : AppCompatActivity() {
         }
 
         override fun onDisconnect() {
-            if (playing) handleStopped()
+            if (playing) {
+                playing = false
+                runOnUiThread {
+                    overlayDecoder?.stop()
+                    overlayDecoder = null
+                    faceLocked = false
+                    renderer.faceMatrix = null
+                    arPanel.visibility = View.GONE
+                    settingsPanel.visibility = View.VISIBLE
+                    statusText.text = "连接已断开"
+                }
+            }
         }
 
         override fun onError() {

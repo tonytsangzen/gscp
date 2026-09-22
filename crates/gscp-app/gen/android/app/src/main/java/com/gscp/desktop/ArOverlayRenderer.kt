@@ -1,9 +1,12 @@
 package com.gscp.desktop
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.GLUtils
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -13,55 +16,55 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.tan
 
 /**
- * AR 试验渲染器：透明背景 GL 层，只画 overlay 虚拟平面。
+ * AR 试验渲染器（单 GLSurfaceView）：
+ * - 背景 = 手机相机实时画面（CameraX → SurfaceTexture → EXTERNAL_OES）；
+ * - 前景 = 眼镜 overlay 虚拟平面（MediaCodec → EXTERNAL_OES），锚定在
+ *   第一张稳定追踪人脸的正前方：位于「相机→人脸」方向、深度 = 距离滑条
+ *   （厘米）处，平面法线与人脸法线重合，固定物理宽度基准 14cm；
+ * - 无眼镜时可切半透明测试图层，验证追踪与锚定。
  *
- * 平面锚定在第一张稳定追踪的人脸正前方：
- * - 位置 = 人脸平移 + 人脸法线 × 距离；
- * - 朝向 = 人脸旋转（画面法线与人脸法线重合）；
- * - 人脸位姿来自 MediaPipe Face Landmarker 的 4×4 变换矩阵（列主序），
- *   覆盖 [0,1] 归一化图像空间，按相机竖屏画布映射到视锥。
- * - 投影按假设的相机垂直 FOV 近似（试验性，未做真实内参标定）。
- *
- * 稳定判定由 ArActivity 提供：连续追踪足够帧数才开始上报位姿，
- * 丢失后保留最后位姿一段时间再隐藏。
+ * MediaPipe Face Landmarker 的 4×4 变换矩阵为列主序仿射、单位厘米
+ * （实测人脸 ~60cm 时 t.z ≈ -63）。
  */
 class ArOverlayRenderer : GLSurfaceView.Renderer {
-    /** 最新人脸变换矩阵（列主序 4×4，覆盖 [-1,1] 归一化空间），null = 未锁定。 */
+    /** 最新人脸变换矩阵（列主序 4×4），null = 未锁定。 */
     @Volatile
     var faceMatrix: FloatArray? = null
 
-    /** 平面距离（归一化相机空间的系数，由距离滑条换算）。 */
+    /** 平面目标深度（厘米），距离滑条。 */
     @Volatile
-    var planeDistance = 0.35f
+    var planeDistance = 40f
 
-    /** 平面大小系数（1.0 = 基准，随距离近大远小）。 */
+    /** 平面大小系数（1.0 = 基准 14cm 宽）。 */
     @Volatile
     var planeScale = 1.0f
 
-    /** 法线方向翻转（试验参数：若平面跑到头后侧则打开）。 */
+    /** 法线方向翻转（试验参数）。 */
     @Volatile
     var flipNormal = false
-
-    /** 前摄预览默认镜像：X 轴取反补偿，使人脸锚定与显示画面一致。 */
-    @Volatile
-    var mirrorX = true
 
     /** overlay 画面宽高比（宽/高），由流 meta 更新。 */
     @Volatile
     var overlayAspect = 4f / 3f
 
-    /** 无眼镜测试模式：绘制内置半透明测试图层（不依赖 scrcpy 连接）。 */
+    /** 无眼镜测试模式：绘制内置半透明测试图层。 */
     @Volatile
     var useTestPattern = false
 
-    private var surfaceTexture: SurfaceTexture? = null
-    private var textureId = 0
-    private var program = 0
-    private var aPosition = 0
-    private var aTexCoord = 0
-    private var uTexture = 0
-    private var uMvp = 0
-    private var uAlpha = 0
+    /** 相机就绪回调（GL 线程初始化完成后触发）。 */
+    var onCameraSurfaceReady: (Surface) -> Unit = {}
+
+    private var overlaySurfaceTexture: SurfaceTexture? = null
+    private var overlayTextureId = 0
+    private var cameraSurfaceTexture: SurfaceTexture? = null
+    private var cameraTextureId = 0
+
+    private var oesProgram = 0
+    private var oesAPosition = 0
+    private var oesATexCoord = 0
+    private var oesUTexture = 0
+    private var oesUMvp = 0
+    private var oesUAlpha = 0
     private var testProgram = 0
     private var testTextureId = 0
     private var testAPosition = 0
@@ -72,14 +75,31 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var viewportW = 1
     private var viewportH = 1
 
-    private val vertexBuffer: FloatBuffer = floatBufferOf(
-        // x, y, u, v —— 平面单位四边形（中心原点，宽 1 高 1/ar，实际尺寸在 shader 里缩放）
+    @Volatile
+    private var cameraSurface: Surface? = null
+
+    private val quadVertexBuffer: FloatBuffer = floatBufferOf(
+        // x, y, u, v —— 单位平面（中心原点）
         -0.5f, 0.5f, 0f, 0f,
         -0.5f, -0.5f, 0f, 1f,
         0.5f, -0.5f, 1f, 1f,
         -0.5f, 0.5f, 0f, 0f,
         0.5f, -0.5f, 1f, 1f,
         0.5f, 0.5f, 1f, 0f,
+    )
+    private val fullscreenVertexBuffer: FloatBuffer = floatBufferOf(
+        -1f, -1f, 0f, 0f,
+        1f, -1f, 1f, 0f,
+        -1f, 1f, 0f, 1f,
+        -1f, 1f, 0f, 1f,
+        1f, -1f, 1f, 0f,
+        1f, 1f, 1f, 1f,
+    )
+    private val identity = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
     )
 
     private val mvp = FloatArray(16)
@@ -88,25 +108,31 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
     /** overlay 解码目标 Surface（MediaCodec 直渲染到我们的纹理）。 */
     fun getOverlaySurface(): Surface {
-        val st = surfaceTexture ?: throw IllegalStateException("GL 未初始化")
+        val st = overlaySurfaceTexture ?: throw IllegalStateException("GL 未初始化")
         return Surface(st)
     }
 
-    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0f, 0f, 0f, 0f)
-        GLES20.glEnable(GLES20.GL_BLEND)
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+    fun cameraSurfaceOrNull(): Surface? = cameraSurface
 
-        textureId = createOesTexture()
-        surfaceTexture = SurfaceTexture(textureId).apply {
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+
+        overlayTextureId = createOesTexture()
+        overlaySurfaceTexture = SurfaceTexture(overlayTextureId).apply {
             setDefaultBufferSize(1024, 768)
         }
-        program = buildProgram(OES_FRAGMENT)
-        aPosition = GLES20.glGetAttribLocation(program, "aPosition")
-        aTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord")
-        uTexture = GLES20.glGetUniformLocation(program, "uTexture")
-        uMvp = GLES20.glGetUniformLocation(program, "uMvp")
-        uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
+        cameraTextureId = createOesTexture()
+        cameraSurfaceTexture = SurfaceTexture(cameraTextureId).apply {
+            setDefaultBufferSize(1280, 720)
+        }
+        cameraSurface = Surface(cameraSurfaceTexture)
+
+        oesProgram = buildProgram(OES_FRAGMENT)
+        oesAPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
+        oesATexCoord = GLES20.glGetAttribLocation(oesProgram, "aTexCoord")
+        oesUTexture = GLES20.glGetUniformLocation(oesProgram, "uTexture")
+        oesUMvp = GLES20.glGetUniformLocation(oesProgram, "uMvp")
+        oesUAlpha = GLES20.glGetUniformLocation(oesProgram, "uAlpha")
 
         testProgram = buildProgram(TEST_FRAGMENT)
         testAPosition = GLES20.glGetAttribLocation(testProgram, "aPosition")
@@ -114,7 +140,9 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         testUTexture = GLES20.glGetUniformLocation(testProgram, "uTexture")
         testUMvp = GLES20.glGetUniformLocation(testProgram, "uMvp")
         testUAlpha = GLES20.glGetUniformLocation(testProgram, "uAlpha")
+
         testTextureId = createTestTexture()
+        onCameraSurfaceReady(cameraSurface!!)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -125,18 +153,22 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        surfaceTexture?.updateTexImageIfAvailable()
 
-        val faceRaw = faceMatrix ?: return
-        // MediaPipe 变换矩阵单位为厘米（canonical face → 相机空间），
-        // 直接作为模型矩阵使用；前摄预览默认镜像，X 轴取反补偿。
-        val face = faceRaw.copyOf()
-        if (mirrorX) {
-            face[0] = -face[0]; face[4] = -face[4]; face[8] = -face[8]
-            face[12] = -face[12]
+        // 背景：相机实时画面（铺满全屏）
+        try {
+            cameraSurfaceTexture?.updateTexImage()
+        } catch (_: Exception) {
         }
+        drawFullscreen(cameraTextureId)
+
+        // 前景：overlay 平面（未锁定人脸时不画）
+        val face = faceMatrix ?: return
+        try {
+            overlaySurfaceTexture?.updateTexImage()
+        } catch (_: Exception) {
+        }
+
         val useTest = useTestPattern
-        // 透视投影：假设垂直 FOV 50°（试验近似），单位厘米
         val fovY = Math.toRadians(50.0)
         val near = 5f
         val far = 1000f
@@ -150,9 +182,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         proj[0] = near / r; proj[5] = near / t; proj[10] = -(far + near) / (far - near)
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
 
-        // model：人脸朝向（旋转列）+ 平移沿「相机→人脸」方向缩放到目标深度。
-        // 即平面始终位于人脸方向的正前方（画面中与人脸同方位），距离 = 滑条深度，
-        // 任何人脸距离下都稳定可见；法线仍与人脸法线重合。
+        // 平面位于「相机→人脸」方向、深度 = planeDistance（厘米）处；
+        // 旋转列取人脸朝向（法线重合）；固定物理宽度基准 14cm。
         val faceDepth = kotlin.math.abs(face[14]).coerceAtLeast(1f)
         val k = planeDistance / faceDepth
         for (row in face.indices) {
@@ -161,7 +192,6 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         model[12] = face[12] * k
         model[13] = face[13] * k
         model[14] = face[14] * k
-        // 平面固定物理宽度（基准 14cm，近大远小），Y 再按宽高比
         val size = 14f * planeScale
         val ar = overlayAspect.coerceIn(0.5f, 3f)
         model[0] = face[0] * size
@@ -171,66 +201,60 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         model[5] = face[5] * size / ar
         model[6] = face[6] * size / ar
         model[3] = 0f; model[7] = 0f; model[15] = 1f
-        // 法线翻转：绕 Y 轴转 180°（平面背面朝向相机）
-        if (flipNormal) {
-            model[0] = -model[0]; model[1] = -model[1]; model[2] = -model[2]
-            model[8] = -model[8]; model[9] = -model[9]; model[10] = -model[10]
-        }
 
         multiply(proj, model, mvp)
-        drawQuad(useTest, alpha = 1f)
-    }
 
-    private fun drawQuad(useTest: Boolean, alpha: Float) {
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         if (useTest) {
             GLES20.glUseProgram(testProgram)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, testTextureId)
             GLES20.glUniform1i(testUTexture, 0)
             GLES20.glUniformMatrix4fv(testUMvp, 1, false, mvp, 0)
-            GLES20.glUniform1f(testUAlpha, alpha)
-            vertexBuffer.position(0)
-            GLES20.glEnableVertexAttribArray(testAPosition)
-            GLES20.glVertexAttribPointer(testAPosition, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
-            GLES20.glEnableVertexAttribArray(testATexCoord)
-            vertexBuffer.position(2)
-            GLES20.glVertexAttribPointer(testATexCoord, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
-            GLES20.glDisableVertexAttribArray(testAPosition)
-            GLES20.glDisableVertexAttribArray(testATexCoord)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-            return
+            GLES20.glUniform1f(testUAlpha, 1f)
+            drawQuad(testAPosition, testATexCoord)
+        } else {
+            GLES20.glUseProgram(oesProgram)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, overlayTextureId)
+            GLES20.glUniform1i(oesUTexture, 0)
+            GLES20.glUniformMatrix4fv(oesUMvp, 1, false, mvp, 0)
+            GLES20.glUniform1f(oesUAlpha, 1f)
+            drawQuad(oesAPosition, oesATexCoord)
         }
-        GLES20.glUseProgram(program)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-        GLES20.glUniform1i(uTexture, 0)
-        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
-        GLES20.glUniform1f(uAlpha, alpha)
+        GLES20.glDisable(GLES20.GL_BLEND)
+    }
 
-        vertexBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aPosition)
-        GLES20.glVertexAttribPointer(aPosition, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
-        GLES20.glEnableVertexAttribArray(aTexCoord)
-        vertexBuffer.position(2)
-        GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+    private fun drawFullscreen(tex: Int) {
+        GLES20.glUseProgram(oesProgram)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glUniform1i(oesUTexture, 0)
+        GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
+        GLES20.glUniform1f(oesUAlpha, 1f)
+        fullscreenVertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(oesAPosition)
+        GLES20.glVertexAttribPointer(oesAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
+        GLES20.glEnableVertexAttribArray(oesATexCoord)
+        fullscreenVertexBuffer.position(2)
+        GLES20.glVertexAttribPointer(oesATexCoord, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
-        GLES20.glDisableVertexAttribArray(aPosition)
-        GLES20.glDisableVertexAttribArray(aTexCoord)
+        GLES20.glDisableVertexAttribArray(oesAPosition)
+        GLES20.glDisableVertexAttribArray(oesATexCoord)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
 
-    /** 人脸矩阵覆盖 [-1,1] 归一化空间；竖屏画布按比例放大到视锥空间。 */
-    private fun multiply(a: FloatArray, b: FloatArray, out: FloatArray) {
-        for (col in 0 until 4) {
-            for (row in 0 until 4) {
-                var sum = 0f
-                for (k in 0 until 4) {
-                    sum += a[k * 4 + row] * b[col * 4 + k]
-                }
-                out[col * 4 + row] = sum
-            }
-        }
+    private fun drawQuad(aPos: Int, aUv: Int) {
+        quadVertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPos)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quadVertexBuffer)
+        GLES20.glEnableVertexAttribArray(aUv)
+        quadVertexBuffer.position(2)
+        GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 16, quadVertexBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+        GLES20.glDisableVertexAttribArray(aPos)
+        GLES20.glDisableVertexAttribArray(aUv)
     }
 
     private fun floatBufferOf(vararg values: Float): FloatBuffer =
@@ -248,6 +272,38 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        return textures[0]
+    }
+
+    /** 无眼镜测试图层：半透明青绿底 + 边框 + TOP 标记 + 准星（确认朝向与锚定）。 */
+    private fun createTestTexture(): Int {
+        val s = 512
+        val bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        c.drawColor(0x5930E0A0.toInt()) // 半透明青绿底
+        paint.color = 0xFFEFFF00.toInt()
+        paint.style = android.graphics.Paint.Style.STROKE
+        paint.strokeWidth = s * 0.02f
+        c.drawRect(s * 0.02f, s * 0.02f, s * 0.98f, s * 0.98f, paint)
+        paint.style = android.graphics.Paint.Style.FILL
+        paint.color = 0xFFFFFFFF.toInt()
+        paint.textSize = s * 0.12f
+        paint.textAlign = android.graphics.Paint.Align.CENTER
+        c.drawText("TOP", s * 0.5f, s * 0.16f, paint)
+        c.drawLine(s * 0.5f, s * 0.30f, s * 0.5f, s * 0.70f, paint)
+        c.drawLine(s * 0.30f, s * 0.5f, s * 0.70f, s * 0.5f, paint)
+        c.drawCircle(s * 0.5f, s * 0.5f, s * 0.06f, paint)
+
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        bmp.recycle()
         return textures[0]
     }
 
@@ -284,36 +340,16 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         return program
     }
 
-    /** 无眼镜测试图层：半透明青绿底 + 边框 + TOP 标记 + 准星（确认朝向与锚定）。 */
-    private fun createTestTexture(): Int {
-        val s = 512
-        val bmp = android.graphics.Bitmap.createBitmap(s, s, android.graphics.Bitmap.Config.ARGB_8888)
-        val c = android.graphics.Canvas(bmp)
-        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        c.drawColor(0x5930E0A0.toInt()) // 半透明青绿底
-        paint.color = 0xFFEFFF00.toInt()
-        paint.style = android.graphics.Paint.Style.STROKE
-        paint.strokeWidth = s * 0.02f
-        c.drawRect(s * 0.02f, s * 0.02f, s * 0.98f, s * 0.98f, paint)
-        paint.style = android.graphics.Paint.Style.FILL
-        paint.color = 0xFFFFFFFF.toInt()
-        paint.textSize = s * 0.12f
-        paint.textAlign = android.graphics.Paint.Align.CENTER
-        c.drawText("TOP", s * 0.5f, s * 0.16f, paint)
-        c.drawLine(s * 0.5f, s * 0.30f, s * 0.5f, s * 0.70f, paint)
-        c.drawLine(s * 0.30f, s * 0.5f, s * 0.70f, s * 0.5f, paint)
-        c.drawCircle(s * 0.5f, s * 0.5f, s * 0.06f, paint)
-
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[0])
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
-        bmp.recycle()
-        return textures[0]
+    private fun multiply(a: FloatArray, b: FloatArray, out: FloatArray) {
+        for (col in 0 until 4) {
+            for (row in 0 until 4) {
+                var sum = 0f
+                for (k in 0 until 4) {
+                    sum += a[k * 4 + row] * b[col * 4 + k]
+                }
+                out[col * 4 + row] = sum
+            }
+        }
     }
 }
 
@@ -339,11 +375,3 @@ private val TEST_FRAGMENT = """
         gl_FragColor = vec4(c.rgb, c.a * uAlpha);
     }
 """
-
-/** updateTexImage 的可用性辅助：无新帧时保持上一帧内容，不报错。 */
-fun SurfaceTexture.updateTexImageIfAvailable() {
-    try {
-        updateTexImage()
-    } catch (_: Exception) {
-    }
-}
