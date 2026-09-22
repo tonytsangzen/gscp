@@ -113,34 +113,39 @@ xattr -cr /Applications/gscp.app
 
 - Rust + Android 目标：`rustup target add aarch64-linux-android`
 - JDK 17、Android SDK（platform-tools / android-36 / build-tools）、Android NDK（r27+）
-- NDK 路径下的 llvm 工具链加入 PATH
 
-构建（仓库根目录执行）：
+一键构建（自动检测 SDK/NDK 路径与主机平台，Rust 预构建 → 生成配置 → Gradle 打包）：
+
+```sh
+scripts/build-android.sh              # 构建 arm64 release APK（正式签名）
+scripts/build-android.sh --install    # 构建并 adb 安装到已连接设备
+```
+
+产物：`crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk`（可直接安装）。
+
+手动构建（等价步骤，便于排查）：
 
 ```sh
 # 1. 环境变量（按本机 NDK 版本/路径调整）
-export ANDROID_HOME=$HOME/Library/Android/sdk          # Windows: %LOCALAPPDATA%/Android/Sdk
+export ANDROID_HOME=$HOME/Library/Android/sdk
 export NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358
-export PATH=$NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin:$PATH   # Windows: windows-x86_64
+export PATH=$NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin:$PATH
 export CC_aarch64_linux_android=aarch64-linux-android24-clang
 export AR_aarch64_linux_android=llvm-ar
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin/aarch64-linux-android24-clang
 
-# 2. Rust 库预构建（解包依赖源码并编译 cdylib）
+# 2. Rust 库预构建
 cargo build --release --package gscp-app --lib --target aarch64-linux-android
 
 # 3. 生成 tauri.settings.gradle（gitignored，首次/依赖变更后需要）
 ./scripts/gen-tauri-settings.sh
 
-# 4. Gradle 打包（arm64 release，自动用 keys/ 的正式密钥签名）
+# 4. Gradle 打包
 cd crates/gscp-app/gen/android
 ./gradlew assembleArm64Release
 ```
 
-产物：`crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/*.apk`
-（命名 `gscp_<版本>_aarch64.apk` 的会由 CI 重命名；本地产物名为 `app-arm64-release.apk`，可直接安装）。
-
-日常增量构建只需重复 2 和 4（Rust 代码变更后重跑 2；纯 Kotlin/资源变更只跑 4）。
+日常增量构建：Rust 代码变更后重跑 2 + 4；纯 Kotlin/资源变更只跑 4。
 版本号在三处：`Cargo.toml`、`crates/gscp-app/tauri.conf.json`、
 `crates/gscp-app/gen/android/app/tauri.properties`（versionName/versionCode）。
 
