@@ -121,9 +121,9 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private val model = FloatArray(16)
 
     // 位姿指数平滑状态（抑制 MediaPipe 每帧抖动）
-    // 系数：越小越稳（延迟越大）
-    private val SMOOTH_ALPHA_T = 0.45f
-    private val SMOOTH_ALPHA_R = 0.3f
+    // 系数：越小越稳（延迟越大）；小脸时位姿噪声大，取偏稳值
+    private val SMOOTH_ALPHA_T = 0.35f
+    private val SMOOTH_ALPHA_R = 0.22f
     private val smoothT = FloatArray(3)
     private val smoothR = FloatArray(16)
     private var smoothValid = false

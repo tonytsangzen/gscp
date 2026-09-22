@@ -158,6 +158,16 @@ class ArActivity : AppCompatActivity() {
                     ) { }
                 }
                 val analysis = ImageAnalysis.Builder()
+                    .setResolutionSelector(
+                        androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                            .setResolutionStrategy(
+                                androidx.camera.core.resolutionselector.ResolutionStrategy(
+                                    android.util.Size(1280, 720),
+                                    androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                                )
+                            )
+                            .build()
+                    )
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
@@ -186,9 +196,9 @@ class ArActivity : AppCompatActivity() {
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumFaces(3)
-            .setMinFaceDetectionConfidence(0.5f)
-            .setMinFacePresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
+            .setMinFaceDetectionConfidence(0.3f)
+            .setMinFacePresenceConfidence(0.3f)
+            .setMinTrackingConfidence(0.3f)
             .setOutputFacialTransformationMatrixes(true)
             .setResultListener { result, _ ->
                 val now = System.currentTimeMillis()
