@@ -175,7 +175,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         cameraSurface = Surface(cameraSurfaceTexture)
 
         oesProgram = buildProgram(OES_FRAGMENT)
-        bgProgram = buildProgram(BG_VERTEX, OES_FRAGMENT)
+        bgProgram = buildProgram(OES_FRAGMENT, BG_VERTEX)
         bgAPosition = GLES20.glGetAttribLocation(bgProgram, "aPosition")
         bgATexCoord = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
         bgUTexture = GLES20.glGetUniformLocation(bgProgram, "uTexture")
