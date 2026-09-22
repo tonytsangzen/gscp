@@ -53,6 +53,7 @@ class ArActivity : AppCompatActivity() {
     private var lastFaceAtMillis = 0L
     private var firstFaceAtMillis = 0L
     private var faceLocked = false
+    private var lastMatrixLogAt = 0L
 
     // 可调参数
     private var distancePercent = 40    // 20..120 → 归一化距离（×0.01）
@@ -89,11 +90,14 @@ class ArActivity : AppCompatActivity() {
         }
         glSurface.setEGLContextClientVersion(2)
         glSurface.setEGLConfigChooser(8, 8, 8, 8, 0, 0) // 透明背景
+        glSurface.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        glSurface.setZOrderMediaOverlay(true)
         glSurface.setRenderer(renderer)
         glSurface.renderMode = android.opengl.GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
         ipEdit.setText(prefs.getString("ip", ""))
         connectButton.setOnClickListener { startAr() }
+        findViewById<Button>(R.id.button_test).setOnClickListener { startTestTracking() }
         findViewById<Button>(R.id.button_exit).setOnClickListener { exitAr() }
         findViewById<Button>(R.id.button_flip).setOnClickListener {
             flipNormal = !flipNormal
@@ -208,6 +212,17 @@ class ArActivity : AppCompatActivity() {
                                 val matrices = matrix.get()
                                 if (matrices.isNotEmpty()) {
                                     renderer.faceMatrix = matrices[0]
+                                    // 诊断：周期性显示平移列与法线列，用于校准映射
+                                    val now2 = System.currentTimeMillis()
+                                    if (now2 - lastMatrixLogAt > 500) {
+                                        lastMatrixLogAt = now2
+                                        val m = matrices[0]
+                                        val n = "n=(%.2f,%.2f,%.2f)".format(m[8], m[9], m[10])
+                                        val t = "t=(%.2f,%.2f,%.2f)".format(m[12], m[13], m[14])
+                                        runOnUiThread {
+                                            statusText.text = "已锁定 $n $t"
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -256,15 +271,25 @@ class ArActivity : AppCompatActivity() {
         }
         prefs.edit().putString("ip", ip).apply()
 
-        connectPanel.visibility = View.GONE
-        arPanel.visibility = View.VISIBLE
-        progressView.visibility = View.VISIBLE
-        statusText.text = "连接眼镜中…"
-        playing = true
-
         overlayDecoder = VideoDecoder()
         connection = ScrcpyConnection(this, audioEnabled = false, overlayOnly = true)
         connection!!.connectAsync(ip, 5555, callback)
+        enterArScreen("连接眼镜中…")
+    }
+
+    /** 无眼镜：跳过连接，用半透明测试图层验证人脸追踪与锚定。 */
+    private fun startTestTracking() {
+        renderer.useTestPattern = true
+        renderer.overlayAspect = 4f / 3f
+        enterArScreen("测试模式：请正对手机摄像头")
+    }
+
+    private fun enterArScreen(status: String) {
+        connectPanel.visibility = View.GONE
+        arPanel.visibility = View.VISIBLE
+        progressView.visibility = View.VISIBLE
+        statusText.text = status
+        playing = true
     }
 
     private fun exitAr() {

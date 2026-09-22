@@ -25,6 +25,11 @@
 -dontwarn com.android.org.conscrypt.SSLParametersImpl
 -dontwarn org.apache.harmony.xnet.provider.jsse.SSLParametersImpl
 
+# MediaPipe tasks-vision：内部通过反射访问字段，R8 混淆会破坏其初始化
+# （症状：Field platform_ for x.x not found），整体 keep。
+-keep class com.google.mediapipe.** { *; }
+-dontwarn com.google.mediapipe.**
+
 # MediaPipe tasks-vision 打包了 auto-value 注解处理器（编译期组件），
 # 其引用的 javax.* 注解处理类不会在运行期用到，忽略缺失警告。
 -dontwarn javax.annotation.processing.AbstractProcessor

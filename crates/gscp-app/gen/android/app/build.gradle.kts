@@ -68,12 +68,10 @@ android {
             }
         }
         getByName("release") {
-            isMinifyEnabled = true
-            proguardFiles(
-                *fileTree(".") { include("**/*.pro") }
-                    .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
-                    .toList().toTypedArray()
-            )
+            // 关闭 R8：MediaPipe/libadb 依赖反射与调用栈回溯，混淆会破坏运行
+            // （Flogger "no caller found"、Field platform_ not found 等），
+            // 私有应用无混淆需求，代价仅为包体积。
+            isMinifyEnabled = false
             // 有正式 keystore 用 release 签名；否则回退 debug 签名保证本地产物可直接安装
             signingConfig = if (hasReleaseSigning) {
                 signingConfigs.getByName("release")

@@ -46,6 +46,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     @Volatile
     var overlayAspect = 4f / 3f
 
+    /** 无眼镜测试模式：绘制内置半透明测试图层（不依赖 scrcpy 连接）。 */
+    @Volatile
+    var useTestPattern = false
+
     private var surfaceTexture: SurfaceTexture? = null
     private var textureId = 0
     private var program = 0
@@ -54,6 +58,13 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var uTexture = 0
     private var uMvp = 0
     private var uAlpha = 0
+    private var testProgram = 0
+    private var testTextureId = 0
+    private var testAPosition = 0
+    private var testATexCoord = 0
+    private var testUTexture = 0
+    private var testUMvp = 0
+    private var testUAlpha = 0
     private var viewportW = 1
     private var viewportH = 1
 
@@ -86,12 +97,20 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         surfaceTexture = SurfaceTexture(textureId).apply {
             setDefaultBufferSize(1024, 768)
         }
-        program = buildProgram()
+        program = buildProgram(OES_FRAGMENT)
         aPosition = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord")
         uTexture = GLES20.glGetUniformLocation(program, "uTexture")
         uMvp = GLES20.glGetUniformLocation(program, "uMvp")
         uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
+
+        testProgram = buildProgram(TEST_FRAGMENT)
+        testAPosition = GLES20.glGetAttribLocation(testProgram, "aPosition")
+        testATexCoord = GLES20.glGetAttribLocation(testProgram, "aTexCoord")
+        testUTexture = GLES20.glGetUniformLocation(testProgram, "uTexture")
+        testUMvp = GLES20.glGetUniformLocation(testProgram, "uMvp")
+        testUAlpha = GLES20.glGetUniformLocation(testProgram, "uAlpha")
+        testTextureId = createTestTexture()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -106,7 +125,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
         val faceRaw = faceMatrix ?: return
         val face = normalizeToFrustum(faceRaw)
-
+        val useTest = useTestPattern
         // 透视投影：假设垂直 FOV 50°（试验近似）
         val fovY = Math.toRadians(50.0)
         val near = 0.05f
@@ -145,13 +164,35 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         model[3] = 0f; model[7] = 0f; model[15] = 1f
 
         multiply(proj, model, mvp)
+        drawQuad(useTest, alpha = 1f)
+    }
 
+    private fun drawQuad(useTest: Boolean, alpha: Float) {
+        if (useTest) {
+            GLES20.glUseProgram(testProgram)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, testTextureId)
+            GLES20.glUniform1i(testUTexture, 0)
+            GLES20.glUniformMatrix4fv(testUMvp, 1, false, mvp, 0)
+            GLES20.glUniform1f(testUAlpha, alpha)
+            vertexBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(testAPosition)
+            GLES20.glVertexAttribPointer(testAPosition, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+            GLES20.glEnableVertexAttribArray(testATexCoord)
+            vertexBuffer.position(2)
+            GLES20.glVertexAttribPointer(testATexCoord, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+            GLES20.glDisableVertexAttribArray(testAPosition)
+            GLES20.glDisableVertexAttribArray(testATexCoord)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            return
+        }
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
         GLES20.glUniform1i(uTexture, 0)
         GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
-        GLES20.glUniform1f(uAlpha, 1f)
+        GLES20.glUniform1f(uAlpha, alpha)
 
         vertexBuffer.position(0)
         GLES20.glEnableVertexAttribArray(aPosition)
@@ -206,7 +247,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         return textures[0]
     }
 
-    private fun buildProgram(): Int {
+    private fun buildProgram(fragmentSrc: String): Int {
         val vertex = """
             precision mediump float;
             attribute vec4 aPosition;
@@ -216,17 +257,6 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
             void main() {
                 gl_Position = uMvp * vec4(aPosition.xy, 0.0, 1.0);
                 vTexCoord = aTexCoord;
-            }
-        """.trimIndent()
-        val fragment = """
-            #extension GL_OES_EGL_image_external : require
-            precision mediump float;
-            uniform samplerExternalOES uTexture;
-            uniform float uAlpha;
-            varying vec2 vTexCoord;
-            void main() {
-                vec4 c = texture2D(uTexture, vTexCoord);
-                gl_FragColor = vec4(c.rgb, c.a * uAlpha);
             }
         """.trimIndent()
 
@@ -242,14 +272,69 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
             return shader
         }
         val vs = compile(GLES20.GL_VERTEX_SHADER, vertex)
-        val fs = compile(GLES20.GL_FRAGMENT_SHADER, fragment)
+        val fs = compile(GLES20.GL_FRAGMENT_SHADER, fragmentSrc.trimIndent())
         val program = GLES20.glCreateProgram()
         GLES20.glAttachShader(program, vs)
         GLES20.glAttachShader(program, fs)
         GLES20.glLinkProgram(program)
         return program
     }
+
+    /** 无眼镜测试图层：半透明青绿底 + 边框 + TOP 标记 + 准星（确认朝向与锚定）。 */
+    private fun createTestTexture(): Int {
+        val s = 512
+        val bmp = android.graphics.Bitmap.createBitmap(s, s, android.graphics.Bitmap.Config.ARGB_8888)
+        val c = android.graphics.Canvas(bmp)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        c.drawColor(0x5930E0A0.toInt()) // 半透明青绿底
+        paint.color = 0xFFEFFF00.toInt()
+        paint.style = android.graphics.Paint.Style.STROKE
+        paint.strokeWidth = s * 0.02f
+        c.drawRect(s * 0.02f, s * 0.02f, s * 0.98f, s * 0.98f, paint)
+        paint.style = android.graphics.Paint.Style.FILL
+        paint.color = 0xFFFFFFFF.toInt()
+        paint.textSize = s * 0.12f
+        paint.textAlign = android.graphics.Paint.Align.CENTER
+        c.drawText("TOP", s * 0.5f, s * 0.16f, paint)
+        c.drawLine(s * 0.5f, s * 0.30f, s * 0.5f, s * 0.70f, paint)
+        c.drawLine(s * 0.30f, s * 0.5f, s * 0.70f, s * 0.5f, paint)
+        c.drawCircle(s * 0.5f, s * 0.5f, s * 0.06f, paint)
+
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        bmp.recycle()
+        return textures[0]
+    }
 }
+
+private val OES_FRAGMENT = """
+    #extension GL_OES_EGL_image_external : require
+    precision mediump float;
+    uniform samplerExternalOES uTexture;
+    uniform float uAlpha;
+    varying vec2 vTexCoord;
+    void main() {
+        vec4 c = texture2D(uTexture, vTexCoord);
+        gl_FragColor = vec4(c.rgb, c.a * uAlpha);
+    }
+"""
+
+private val TEST_FRAGMENT = """
+    precision mediump float;
+    uniform sampler2D uTexture;
+    uniform float uAlpha;
+    varying vec2 vTexCoord;
+    void main() {
+        vec4 c = texture2D(uTexture, vTexCoord);
+        gl_FragColor = vec4(c.rgb, c.a * uAlpha);
+    }
+"""
 
 /** updateTexImage 的可用性辅助：无新帧时保持上一帧内容，不报错。 */
 fun SurfaceTexture.updateTexImageIfAvailable() {
