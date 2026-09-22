@@ -107,6 +107,43 @@ xattr -cr /Applications/gscp.app
 确认桌面端配网已成功、手机与眼镜在同一 Wi-Fi、IP 输入正确；
 眼镜省电断开 Wi-Fi 时重新点亮眼镜再试。
 
+## 从源码编译 Android 版本
+
+前置（一次性）：
+
+- Rust + Android 目标：`rustup target add aarch64-linux-android`
+- JDK 17、Android SDK（platform-tools / android-36 / build-tools）、Android NDK（r27+）
+- NDK 路径下的 llvm 工具链加入 PATH
+
+构建（仓库根目录执行）：
+
+```sh
+# 1. 环境变量（按本机 NDK 版本/路径调整）
+export ANDROID_HOME=$HOME/Library/Android/sdk          # Windows: %LOCALAPPDATA%/Android/Sdk
+export NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358
+export PATH=$NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin:$PATH   # Windows: windows-x86_64
+export CC_aarch64_linux_android=aarch64-linux-android24-clang
+export AR_aarch64_linux_android=llvm-ar
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_HOME/toolchains/llvm/prebuilt/darwin-arm64/bin/aarch64-linux-android24-clang
+
+# 2. Rust 库预构建（解包依赖源码并编译 cdylib）
+cargo build --release --package gscp-app --lib --target aarch64-linux-android
+
+# 3. 生成 tauri.settings.gradle（gitignored，首次/依赖变更后需要）
+./scripts/gen-tauri-settings.sh
+
+# 4. Gradle 打包（arm64 release，自动用 keys/ 的正式密钥签名）
+cd crates/gscp-app/gen/android
+./gradlew assembleArm64Release
+```
+
+产物：`crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/*.apk`
+（命名 `gscp_<版本>_aarch64.apk` 的会由 CI 重命名；本地产物名为 `app-arm64-release.apk`，可直接安装）。
+
+日常增量构建只需重复 2 和 4（Rust 代码变更后重跑 2；纯 Kotlin/资源变更只跑 4）。
+版本号在三处：`Cargo.toml`、`crates/gscp-app/tauri.conf.json`、
+`crates/gscp-app/gen/android/app/tauri.properties`（versionName/versionCode）。
+
 ## License
 
 本项目代码以 [MIT License](LICENSE) 授权。
