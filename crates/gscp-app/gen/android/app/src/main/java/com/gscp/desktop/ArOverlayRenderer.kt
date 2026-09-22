@@ -319,34 +319,33 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
-        // 每顶点：屏幕 uv（0..1 over letterbox rect）→ 传感器 uv = (1 - v, u)
-        val scr = floatArrayOf(0f, 0f, 1f, 0f, 1f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
-        val pos = floatArrayOf(-hw, hh, -hw, -hh, hw, -hh, -hw, hh, hw, -hh, hw, hh)
-        val verts = FloatArray(24)
-        for (i in 0 until 6) {
-            verts[i * 4] = pos[i * 2]
-            verts[i * 4 + 1] = pos[i * 2 + 1]
-            verts[i * 4 + 2] = 1f - scr[i * 2 + 1]
-            verts[i * 4 + 3] = scr[i * 2]
-        }
+        // 画面顺时针旋转 90°：屏幕四角采样自旋转后的纹理位置
+        // （已验证可用的渲染路径：oesProgram + 手动 CW UV，无 stMat）
+        val verts = floatArrayOf(
+            -hw, hh, 1f, 0f,
+            -hw, -hh, 0f, 0f,
+            hw, -hh, 0f, 1f,
+            -hw, hh, 1f, 0f,
+            hw, -hh, 0f, 1f,
+            hw, hh, 1f, 1f,
+        )
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(verts).position(0)
-        GLES20.glUseProgram(bgProgram)
+        GLES20.glUseProgram(oesProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
-        GLES20.glUniform1i(bgUTexture, 0)
-        GLES20.glUniformMatrix4fv(bgUMvp, 1, false, identity, 0)
-        GLES20.glUniformMatrix4fv(bgUSTMat, 1, false, stMat, 0)
-        GLES20.glUniform1f(bgUAlpha, 1f)
+        GLES20.glUniform1i(oesUTexture, 0)
+        GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
+        GLES20.glUniform1f(oesUAlpha, 1f)
         fullscreenVertexBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(bgAPosition)
-        GLES20.glVertexAttribPointer(bgAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
-        GLES20.glEnableVertexAttribArray(bgATexCoord)
+        GLES20.glEnableVertexAttribArray(oesAPosition)
+        GLES20.glVertexAttribPointer(oesAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
+        GLES20.glEnableVertexAttribArray(oesATexCoord)
         fullscreenVertexBuffer.position(2)
-        GLES20.glVertexAttribPointer(bgATexCoord, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
+        GLES20.glVertexAttribPointer(oesATexCoord, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
-        GLES20.glDisableVertexAttribArray(bgAPosition)
-        GLES20.glDisableVertexAttribArray(bgATexCoord)
+        GLES20.glDisableVertexAttribArray(oesAPosition)
+        GLES20.glDisableVertexAttribArray(oesATexCoord)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
 
