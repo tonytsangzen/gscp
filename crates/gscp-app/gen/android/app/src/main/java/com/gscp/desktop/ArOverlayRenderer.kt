@@ -51,6 +51,14 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     @Volatile
     var useTestPattern = false
 
+    /** 输出旋转象限（0..3，相机传感器与竖屏显示的旋转差）。 */
+    @Volatile
+    var outputRotationQuadrant = 1
+
+    /** 前摄：输出画面水平镜像（与传感器方向相反才符合直觉）。 */
+    @Volatile
+    var outputMirror = true
+
     /** 相机就绪回调（GL 线程初始化完成后触发）。 */
     var onCameraSurfaceReady: (Surface) -> Unit = {}
 
@@ -181,6 +189,28 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         }
         proj[0] = near / r; proj[5] = near / t; proj[10] = -(far + near) / (far - near)
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
+        // 输出旋转/镜像与背景一致（proj 绕视线轴旋转 + 水平镜像），
+        // 保证 overlay 平面与背景画面方向统一、锚定不错位。
+        run {
+            val q = outputRotationQuadrant % 4
+            if (q != 0) {
+                val a = -(q * 90f).toDouble()
+                val c = kotlin.math.cos(Math.toRadians(a)).toFloat()
+                val s = kotlin.math.sin(Math.toRadians(a)).toFloat()
+                val rz = floatArrayOf(
+                    c, s, 0f, 0f,
+                    -s, c, 0f, 0f,
+                    0f, 0f, 1f, 0f,
+                    0f, 0f, 0f, 1f,
+                )
+                val tmp = proj.copyOf()
+                multiply(rz, tmp, proj)
+            }
+            if (outputMirror) {
+                proj[0] = -proj[0]
+                proj[8] = -proj[8]
+            }
+        }
 
         // 平面位于「相机→人脸」方向、深度 = planeDistance（厘米）处；
         // 旋转列取人脸朝向（法线重合）；固定物理宽度基准 14cm。
@@ -233,7 +263,29 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glUniform1i(oesUTexture, 0)
         GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
         GLES20.glUniform1f(oesUAlpha, 1f)
-        fullscreenVertexBuffer.position(0)
+        // 背景 UV 按输出旋转象限 + 前摄镜像变换（与 overlay 投影旋转一致）
+        val q = outputRotationQuadrant % 4
+        val mirror = outputMirror
+        val pos = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f, 1f)
+        val baseUv = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f, 1f)
+        val out = FloatArray(24)
+        for (i in 0 until 6) {
+            var u = baseUv[i * 4 + 2]
+            var v = baseUv[i * 4 + 3]
+            if (mirror) u = 1f - u
+            val rotated: FloatArray = when (q) {
+                1 -> floatArrayOf(v, 1f - u)
+                2 -> floatArrayOf(1f - u, 1f - v)
+                3 -> floatArrayOf(1f - v, u)
+                else -> floatArrayOf(u, v)
+            }
+            out[i * 4] = pos[i * 2]
+            out[i * 4 + 1] = pos[i * 2 + 1]
+            out[i * 4 + 2] = rotated[0]
+            out[i * 4 + 3] = rotated[1]
+        }
+        fullscreenVertexBuffer.clear()
+        fullscreenVertexBuffer.put(out).position(0)
         GLES20.glEnableVertexAttribArray(oesAPosition)
         GLES20.glVertexAttribPointer(oesAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
         GLES20.glEnableVertexAttribArray(oesATexCoord)
