@@ -84,9 +84,10 @@ class ArActivity : AppCompatActivity() {
         frontCamera = prefs.getBoolean("arFrontCamera", true)
 
         renderer = ArOverlayRenderer().apply {
-            planeDistance = distancePercent / 100f
+            planeDistance = distancePercent.toFloat() // 厘米
             planeScale = sizePercent / 100f
             this.flipNormal = this@ArActivity.flipNormal
+            mirrorX = frontCamera
         }
         glSurface.setEGLContextClientVersion(2)
         glSurface.setEGLConfigChooser(8, 8, 8, 8, 0, 0) // 透明背景
@@ -106,7 +107,7 @@ class ArActivity : AppCompatActivity() {
         }
         bindSeekBar(R.id.ar_distance, distancePercent, 20, 120) { v ->
             distancePercent = v
-            renderer.planeDistance = v / 100f
+            renderer.planeDistance = v.toFloat() // 厘米
             prefs.edit().putInt("arDistance", v).apply()
         }
         bindSeekBar(R.id.ar_size, sizePercent, 50, 200) { v ->
@@ -219,6 +220,7 @@ class ArActivity : AppCompatActivity() {
                                         val m = matrices[0]
                                         val n = "n=(%.2f,%.2f,%.2f)".format(m[8], m[9], m[10])
                                         val t = "t=(%.2f,%.2f,%.2f)".format(m[12], m[13], m[14])
+                                        android.util.Log.i("gscp-ar", "face $n $t row3=(${m[3]},${m[7]},${m[11]},${m[15]})")
                                         runOnUiThread {
                                             statusText.text = "已锁定 $n $t"
                                         }

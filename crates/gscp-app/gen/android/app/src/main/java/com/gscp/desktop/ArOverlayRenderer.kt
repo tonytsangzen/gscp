@@ -42,6 +42,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     @Volatile
     var flipNormal = false
 
+    /** 前摄预览默认镜像：X 轴取反补偿，使人脸锚定与显示画面一致。 */
+    @Volatile
+    var mirrorX = true
+
     /** overlay 画面宽高比（宽/高），由流 meta 更新。 */
     @Volatile
     var overlayAspect = 4f / 3f
@@ -124,12 +128,18 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         surfaceTexture?.updateTexImageIfAvailable()
 
         val faceRaw = faceMatrix ?: return
-        val face = normalizeToFrustum(faceRaw)
+        // MediaPipe 变换矩阵单位为厘米（canonical face → 相机空间），
+        // 直接作为模型矩阵使用；前摄预览默认镜像，X 轴取反补偿。
+        val face = faceRaw.copyOf()
+        if (mirrorX) {
+            face[0] = -face[0]; face[4] = -face[4]; face[8] = -face[8]
+            face[12] = -face[12]
+        }
         val useTest = useTestPattern
-        // 透视投影：假设垂直 FOV 50°（试验近似）
+        // 透视投影：假设垂直 FOV 50°（试验近似），单位厘米
         val fovY = Math.toRadians(50.0)
-        val near = 0.05f
-        val far = 20f
+        val near = 5f
+        val far = 1000f
         val aspect = viewportW.toFloat() / viewportH.toFloat()
         val t = (tan(fovY / 2) * near).toFloat()
         val r = t * aspect
@@ -140,20 +150,19 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         proj[0] = near / r; proj[5] = near / t; proj[10] = -(far + near) / (far - near)
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
 
-        // model：直接使用人脸变换（列主序），再沿人脸法线推出去 distance，
-        // 平面尺寸 = distance × scale（近大远小，符合空间中固定物理宽度的观感）。
-        val nrm = floatArrayOf(face[8], face[9], face[10])
-        val sign = if (flipNormal) -1f else 1f
-        val d = planeDistance * sign
+        // model：人脸朝向（旋转列）+ 平移沿「相机→人脸」方向缩放到目标深度。
+        // 即平面始终位于人脸方向的正前方（画面中与人脸同方位），距离 = 滑条深度，
+        // 任何人脸距离下都稳定可见；法线仍与人脸法线重合。
+        val faceDepth = kotlin.math.abs(face[14]).coerceAtLeast(1f)
+        val k = planeDistance / faceDepth
         for (row in face.indices) {
             model[row] = face[row]
         }
-        // 平移列（第 4 列，列主序索引 12..14）沿法线偏移
-        model[12] = face[12] + nrm[0] * d
-        model[13] = face[13] + nrm[1] * d
-        model[14] = face[14] + nrm[2] * d
-        // 缩放列（第 1/2 列）按 distance×scale 定平面大小，Y 再按宽高比
-        val size = planeDistance * planeScale
+        model[12] = face[12] * k
+        model[13] = face[13] * k
+        model[14] = face[14] * k
+        // 平面固定物理宽度（基准 14cm，近大远小），Y 再按宽高比
+        val size = 14f * planeScale
         val ar = overlayAspect.coerceIn(0.5f, 3f)
         model[0] = face[0] * size
         model[1] = face[1] * size
@@ -162,6 +171,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         model[5] = face[5] * size / ar
         model[6] = face[6] * size / ar
         model[3] = 0f; model[7] = 0f; model[15] = 1f
+        // 法线翻转：绕 Y 轴转 180°（平面背面朝向相机）
+        if (flipNormal) {
+            model[0] = -model[0]; model[1] = -model[1]; model[2] = -model[2]
+            model[8] = -model[8]; model[9] = -model[9]; model[10] = -model[10]
+        }
 
         multiply(proj, model, mvp)
         drawQuad(useTest, alpha = 1f)
@@ -207,16 +221,6 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     }
 
     /** 人脸矩阵覆盖 [-1,1] 归一化空间；竖屏画布按比例放大到视锥空间。 */
-    private fun normalizeToFrustum(face: FloatArray): FloatArray {
-        // MediaPipe 变换矩阵平移在 [-1,1] 归一化坐标；把 X/Y 放大到近似米级
-        // （试验近似：×2.2），旋转列保持不变。
-        val out = face.copyOf()
-        val s = 2.2f
-        out[12] = face[12] * s
-        out[13] = face[13] * s
-        return out
-    }
-
     private fun multiply(a: FloatArray, b: FloatArray, out: FloatArray) {
         for (col in 0 until 4) {
             for (row in 0 until 4) {
