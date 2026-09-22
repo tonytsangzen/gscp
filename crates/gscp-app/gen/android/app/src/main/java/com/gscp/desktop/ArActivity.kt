@@ -30,6 +30,8 @@ import org.opencv.core.Size
 import org.opencv.objdetect.FaceDetectorYN
 import java.io.File
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.tan
 
 /**
@@ -63,6 +65,7 @@ class ArActivity : AppCompatActivity() {
     private var firstFaceAtMillis = 0L
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
+    private var detectCount = 0
     private val lock = Any()
 
     // 动态 ROI（正立显示空间归一化 [0,1]）：小脸时裁剪放大分析区域
@@ -247,8 +250,20 @@ class ArActivity : AppCompatActivity() {
             val detector = ensureDetector(bmp.width, bmp.height)
             val bgr = Mat()
             Utils.bitmapToMat(bmp, bgr)
+            // FaceDetectorYN 要求 BGR 3 通道；bitmapToMat 产出 RGBA 4 通道
+            org.opencv.imgproc.Imgproc.cvtColor(
+                bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
+            )
             val faces = Mat()
             detector.detect(bgr, faces)
+            detectCount++
+            if (detectCount % 30 == 1) {
+                android.util.Log.i(
+                    "gscp-ar",
+                    "detect#" + detectCount + " " + bmp.width + "x" + bmp.height +
+                        " faces=" + faces.rows() + " roi=" + roiActive,
+                )
+            }
             if (bmp !== upright) bmp.recycle()
             upright.recycle()
 
@@ -265,7 +280,8 @@ class ArActivity : AppCompatActivity() {
                     roiLostFrames = 0
                     val g = { c: Int -> faces.get(best, c)[0] }
                     // 裁剪坐标 → 正立全帧坐标
-                    val bx = g(0) + cropX; val by = g(1) + cropY; val bw = g(2)
+                    val bx = g(0) + cropX; val by = g(1) + cropY
+                    val bw = g(2); val bh = g(3)
                     val ptsPx = listOf(
                         Pair(g(4) + cropX, g(5) + cropY),
                         Pair(g(6) + cropX, g(7) + cropY),
@@ -283,27 +299,82 @@ class ArActivity : AppCompatActivity() {
                     }
 
                     if (faceLocked) {
-                        // 针孔模型（正立空间）：FOV 垂直 50°
+                        // 针孔模型（正立空间）：垂直 FOV 50°
                         val focal = (H / 2.0) / tan(Math.toRadians(25.0))
                         val distance = (focal * 15.0 / bw).coerceIn(10.0, 300.0)
-                        val imgPts = ptsPx.map { (x, y) ->
-                            Pair((x - W / 2.0) / focal, (y - H / 2.0) / focal)
+
+                        // 位置：脸中心（bbox 中心）在深度 distance 的视线上
+                        val cxN = (bx + bw / 2.0) / W
+                        val cyN = (by + bh / 2.0) / H
+                        val halfHcm = distance * tan(Math.toRadians(25.0))
+                        val halfWcm = halfHcm * W / H
+                        val tx = (cxN - 0.5) * 2 * halfWcm
+                        val ty = (0.5 - cyN) * 2 * halfHcm
+                        val tz = -distance
+
+                        // 朝向（5 点几何启发式）：
+                        // roll = 眼线角度；yaw = 鼻尖水平偏移；pitch = 鼻尖垂直偏移
+                        val (rex, rey) = ptsPx[0]
+                        val (lex, ley) = ptsPx[1]
+                        val (nx, ny) = ptsPx[2]
+                        val eyeMidX = (rex + lex) / 2.0
+                        val eyeMidY = (rey + ley) / 2.0
+                        val facePxW = maxOf(abs(lex - rex), 1.0)
+                        val roll = atan2(ley - rey, lex - rex)
+                        val yaw = kotlin.math.asin(
+                            ((nx - eyeMidX) / facePxW * 1.8).coerceIn(-1.0, 1.0),
+                        )
+                        val pitch = kotlin.math.asin(
+                            (((ny - eyeMidY) / facePxW) * 1.5).coerceIn(-1.0, 1.0),
+                        )
+
+                        // GL 旋转矩阵 R = Ry(yaw)·Rx(pitch)·Rz(roll)（列主序）
+                        val cy2 = kotlin.math.cos(yaw); val sy2 = kotlin.math.sin(yaw)
+                        val cp = kotlin.math.cos(pitch); val sp = kotlin.math.sin(pitch)
+                        val cr = kotlin.math.cos(roll); val sr = kotlin.math.sin(roll)
+                        val ry = floatArrayOf(
+                            cy2.toFloat(), 0f, -sy2.toFloat(), 0f,
+                            0f, 1f, 0f, 0f,
+                            sy2.toFloat(), 0f, cy2.toFloat(), 0f,
+                            0f, 0f, 0f, 1f,
+                        )
+                        val rx = floatArrayOf(
+                            1f, 0f, 0f, 0f,
+                            0f, cp.toFloat(), sp.toFloat(), 0f,
+                            0f, -sp.toFloat(), cp.toFloat(), 0f,
+                            0f, 0f, 0f, 1f,
+                        )
+                        val rz = floatArrayOf(
+                            cr.toFloat(), sr.toFloat(), 0f, 0f,
+                            -sr.toFloat(), cr.toFloat(), 0f, 0f,
+                            0f, 0f, 1f, 0f,
+                            0f, 0f, 0f, 1f,
+                        )
+                        fun mul3(a: FloatArray, b: FloatArray): FloatArray {
+                            val o = FloatArray(16)
+                            for (col in 0 until 4) for (row in 0 until 4) {
+                                var sum = 0f
+                                for (k in 0 until 4) sum += a[k * 4 + row] * b[col * 4 + k]
+                                o[col * 4 + row] = sum
+                            }
+                            return o
                         }
-                        val matrix = FacePoseMath.solvePnp(FacePoseMath.MODEL_POINTS, imgPts)
-                        if (matrix != null) {
-                            renderer.faceMatrix = matrix
-                        }
+                        val rot = mul3(ry, mul3(rx, rz))
+                        val matrix = FloatArray(16)
+                        for (i in 0 until 16) matrix[i] = rot[i]
+                        matrix[12] = tx.toFloat()
+                        matrix[13] = ty.toFloat()
+                        matrix[14] = tz.toFloat()
+                        renderer.faceMatrix = matrix
+
                         if (now - lastMatrixLogAt > 500) {
                             lastMatrixLogAt = now
-                            val mm = renderer.faceMatrix
-                            if (mm != null) {
-                                android.util.Log.i(
-                                    "gscp-ar",
-                                    "face d=%.1fcm t=(%.1f,%.1f,%.1f)".format(
-                                        distance, mm[12], mm[13], mm[14],
-                                    ),
-                                )
-                            }
+                            android.util.Log.i(
+                                "gscp-ar",
+                                "face d=%.0fcm t=(%.1f,%.1f,%.1f) ypr=(%.2f,%.2f,%.2f)".format(
+                                    distance, tx, ty, tz, yaw, pitch, roll,
+                                ),
+                            )
                         }
                     }
 
@@ -336,7 +407,7 @@ class ArActivity : AppCompatActivity() {
             faces.release()
             bgr.release()
         } catch (e: Exception) {
-            android.util.Log.w("gscp-ar", "analyze: ${e.message}")
+            android.util.Log.w("gscp-ar", "analyze failed", e)
         } finally {
             image.close()
         }
