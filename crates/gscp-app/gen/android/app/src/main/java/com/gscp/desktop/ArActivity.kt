@@ -4,10 +4,8 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.graphics.RectF
 import android.os.Bundle
 import android.util.Patterns
-import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -20,7 +18,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import org.opencv.android.OpenCVLoader
@@ -40,8 +37,8 @@ import kotlin.math.tan
  * 把 overlay 作为虚拟平面绘制在第一张稳定追踪人脸的正前方
  * （平面法线与人脸法线重合，距离/大小可调）。
  *
- * 小脸优化：分析流 1280×720 + 动态 ROI 裁剪（锁定后分析区域放大到人脸附近，
- * 位姿在正立显示坐标系下解算，直接可用于渲染）。
+ * 模型输入 = 屏幕显示：同一张分析 Bitmap（旋转到正立显示方向）既渲染背景
+ * 又喂给 YuNet，锚定与画面像素级一致。
  */
 class ArActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
@@ -53,7 +50,6 @@ class ArActivity : AppCompatActivity() {
     private lateinit var progressView: View
     private lateinit var ipEdit: EditText
     private lateinit var renderer: ArOverlayRenderer
-    private var cameraSurface: Surface? = null
 
     private var connection: ScrcpyConnection? = null
     private var overlayDecoder: VideoDecoder? = null
@@ -67,11 +63,6 @@ class ArActivity : AppCompatActivity() {
     private var lastMatrixLogAt = 0L
     private var detectCount = 0
     private val lock = Any()
-
-    // 动态 ROI（正立显示空间归一化 [0,1]）：小脸时裁剪放大分析区域
-    private val roiRect = RectF(0f, 0f, 1f, 1f)
-    private var roiActive = false
-    private var roiLostFrames = 0
 
     // 可调参数
     private var distanceCm = 40      // 平面目标深度（厘米，20..120）
@@ -101,16 +92,6 @@ class ArActivity : AppCompatActivity() {
             planeDistance = distanceCm.toFloat()
             planeScale = sizePercent / 100f
         }
-        renderer.onCameraSurfaceReady = { surface ->
-            runOnUiThread {
-                cameraSurface = surface
-                if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-                ) {
-                    startCamera(surface)
-                }
-            }
-        }
         glSurface.setEGLContextClientVersion(2)
         glSurface.setRenderer(renderer)
         glSurface.renderMode = android.opengl.GLSurfaceView.RENDERMODE_CONTINUOUSLY
@@ -138,43 +119,31 @@ class ArActivity : AppCompatActivity() {
     private val cameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             statusText.text = if (granted) "相机就绪" else "未授予相机权限，无法追踪人脸"
-            val surface = cameraSurface
-            if (granted && surface != null) startCamera(surface)
+            if (granted) startCamera()
         }
 
     private fun requestCameraPermission() {
         if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
-            cameraSurface?.let { startCamera(it) }
+            startCamera()
         } else {
             cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startCamera(surface: Surface) {
+    private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
                 val provider = future.get()
-                val preview = Preview.Builder().build()
-                preview.setSurfaceProvider { request ->
-                    renderer.setCameraResolution(
-                        request.resolution.width,
-                        request.resolution.height,
-                    )
-                    request.provideSurface(
-                        surface,
-                        ContextCompat.getMainExecutor(this),
-                    ) { }
-                }
+                // 仅 ImageAnalysis：分析帧同时用于 YuNet 与背景渲染（数据一致）
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(
                         androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
                             .setResolutionStrategy(
                                 androidx.camera.core.resolutionselector.ResolutionStrategy(
-                                    android.util.Size(1280, 720),
+                                    android.util.Size(720, 1280),
                                     androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                                 )
                             )
@@ -187,7 +156,6 @@ class ArActivity : AppCompatActivity() {
                 provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_FRONT_CAMERA,
-                    preview,
                     analysis,
                 )
                 statusText.text = "等待人脸…"
@@ -197,13 +165,15 @@ class ArActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ── YuNet 人脸检测 + DLT-PnP 位姿（动态 ROI）─────────────
+    // ── YuNet 人脸检测 + DLT-PnP 位姿 ─────────────────────────
 
     private fun ensureModelFile(): String {
         val f = File(filesDir, "face_detection_yunet_2023mar.onnx")
         if (!f.exists()) {
             assets.open("face_detection_yunet_2023mar.onnx").use { input ->
-                java.io.FileOutputStream(f).use { output -> input.copyTo(output) }
+                val out = java.io.FileOutputStream(f)
+                input.copyTo(out)
+                out.close()
             }
         }
         return f.absolutePath
@@ -225,31 +195,19 @@ class ArActivity : AppCompatActivity() {
     private fun analyzeFrame(image: ImageProxy) {
         try {
             val full = image.toBitmap()
-            // 正立显示空间：传感器横向帧顺时针旋转 90°
+            // 正立显示空间：传感器横向帧顺时针旋转 90°（与屏幕显示方向一致）
             val m = Matrix().apply { postRotate(90f) }
             val upright = Bitmap.createBitmap(full, 0, 0, full.width, full.height, m, true)
             if (upright !== full) full.recycle()
             val W = upright.width
             val H = upright.height
 
-            // 动态 ROI 裁剪（正立空间）
-            val bmp: Bitmap
-            var cropX = 0
-            var cropY = 0
-            if (roiActive) {
-                cropX = (roiRect.left * W).toInt().coerceIn(0, W - 2)
-                cropY = (roiRect.top * H).toInt().coerceIn(0, H - 2)
-                val cw = (roiRect.width() * W).toInt().coerceIn(16, W - cropX)
-                val ch = (roiRect.height() * H).toInt().coerceIn(16, H - cropY)
-                bmp = Bitmap.createBitmap(upright, cropX, cropY, cw, ch)
-                if (bmp !== upright) upright.recycle()
-            } else {
-                bmp = upright
-            }
+            // 同一 Bitmap：先渲染背景（GL 线程上传），再喂 YuNet（数据一致）
+            renderer.latestFrame = upright
 
-            val detector = ensureDetector(bmp.width, bmp.height)
+            val detector = ensureDetector(upright.width, upright.height)
             val bgr = Mat()
-            Utils.bitmapToMat(bmp, bgr)
+            Utils.bitmapToMat(upright, bgr)
             // FaceDetectorYN 要求 BGR 3 通道；bitmapToMat 产出 RGBA 4 通道
             org.opencv.imgproc.Imgproc.cvtColor(
                 bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
@@ -260,12 +218,10 @@ class ArActivity : AppCompatActivity() {
             if (detectCount % 30 == 1) {
                 android.util.Log.i(
                     "gscp-ar",
-                    "detect#" + detectCount + " " + bmp.width + "x" + bmp.height +
-                        " faces=" + faces.rows() + " roi=" + roiActive,
+                    "detect#" + detectCount + " " + upright.width + "x" + upright.height +
+                        " faces=" + faces.rows(),
                 )
             }
-            if (bmp !== upright) bmp.recycle()
-            upright.recycle()
 
             // 取置信度最高的人脸（行 = [x,y,w,h, 右眼,左眼,鼻尖,右嘴,左嘴, score]）
             var best = -1
@@ -276,23 +232,22 @@ class ArActivity : AppCompatActivity() {
             }
             val hasFace = best >= 0
             synchronized(lock) {
+                val now = System.currentTimeMillis()
                 if (hasFace) {
-                    roiLostFrames = 0
                     val g = { c: Int -> faces.get(best, c)[0] }
-                    // 裁剪坐标 → 正立全帧坐标
-                    val bx = g(0) + cropX; val by = g(1) + cropY
+                    val bx = g(0); val by = g(1)
                     val bw = g(2); val bh = g(3)
                     val ptsPx = listOf(
-                        Pair(g(4) + cropX, g(5) + cropY),
-                        Pair(g(6) + cropX, g(7) + cropY),
-                        Pair(g(8) + cropX, g(9) + cropY),
-                        Pair(g(10) + cropX, g(11) + cropY),
-                        Pair(g(12) + cropX, g(13) + cropY),
+                        Pair(g(4), g(5)),
+                        Pair(g(6), g(7)),
+                        Pair(g(8), g(9)),
+                        Pair(g(10), g(11)),
+                        Pair(g(12), g(13)),
                     )
 
-                    val now = System.currentTimeMillis()
                     if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
                     lastFaceAtMillis = now
+                    // 稳定判定：连续追踪 ~0.5s 后锚定第一张人脸
                     if (!faceLocked && now - firstFaceAtMillis >= 500) {
                         faceLocked = true
                         runOnUiThread { statusText.text = "已锁定人脸" }
@@ -306,12 +261,6 @@ class ArActivity : AppCompatActivity() {
                         // 位置：脸中心（bbox 中心）在深度 distance 的视线上
                         val cxN = (bx + bw / 2.0) / W
                         val cyN = (by + bh / 2.0) / H
-                        val halfHcm = distance * tan(Math.toRadians(25.0))
-                        val halfWcm = halfHcm * W / H
-                        val tx = (cxN - 0.5) * 2 * halfWcm
-                        val ty = (0.5 - cyN) * 2 * halfHcm
-                        val tz = -distance
-
                         // 朝向（5 点几何启发式）：
                         // roll = 眼线角度；yaw = 鼻尖水平偏移；pitch = 鼻尖垂直偏移
                         val (rex, rey) = ptsPx[0]
@@ -320,7 +269,7 @@ class ArActivity : AppCompatActivity() {
                         val eyeMidX = (rex + lex) / 2.0
                         val eyeMidY = (rey + ley) / 2.0
                         val facePxW = maxOf(abs(lex - rex), 1.0)
-                        val roll = atan2(ley - rey, lex - rex)
+                        val roll = kotlin.math.atan2(ley - rey, lex - rex)
                         val yaw = kotlin.math.asin(
                             ((nx - eyeMidX) / facePxW * 1.8).coerceIn(-1.0, 1.0),
                         )
@@ -332,72 +281,60 @@ class ArActivity : AppCompatActivity() {
                         val cy2 = kotlin.math.cos(yaw); val sy2 = kotlin.math.sin(yaw)
                         val cp = kotlin.math.cos(pitch); val sp = kotlin.math.sin(pitch)
                         val cr = kotlin.math.cos(roll); val sr = kotlin.math.sin(roll)
-                        val ry = floatArrayOf(
+                        val rym = floatArrayOf(
                             cy2.toFloat(), 0f, -sy2.toFloat(), 0f,
                             0f, 1f, 0f, 0f,
                             sy2.toFloat(), 0f, cy2.toFloat(), 0f,
                             0f, 0f, 0f, 1f,
                         )
-                        val rx = floatArrayOf(
+                        val rxm = floatArrayOf(
                             1f, 0f, 0f, 0f,
                             0f, cp.toFloat(), sp.toFloat(), 0f,
                             0f, -sp.toFloat(), cp.toFloat(), 0f,
                             0f, 0f, 0f, 1f,
                         )
-                        val rz = floatArrayOf(
+                        val rzm = floatArrayOf(
                             cr.toFloat(), sr.toFloat(), 0f, 0f,
                             -sr.toFloat(), cr.toFloat(), 0f, 0f,
                             0f, 0f, 1f, 0f,
                             0f, 0f, 0f, 1f,
                         )
-                        fun mul3(a: FloatArray, b: FloatArray): FloatArray {
-                            val o = FloatArray(16)
-                            for (col in 0 until 4) for (row in 0 until 4) {
-                                var sum = 0f
-                                for (k in 0 until 4) sum += a[k * 4 + row] * b[col * 4 + k]
-                                o[col * 4 + row] = sum
-                            }
-                            return o
-                        }
-                        val rot = mul3(ry, mul3(rx, rz))
                         val matrix = FloatArray(16)
-                        for (i in 0 until 16) matrix[i] = rot[i]
-                        matrix[12] = tx.toFloat()
-                        matrix[13] = ty.toFloat()
-                        matrix[14] = tz.toFloat()
+                        // rot = Ry·Rx·Rz
+                        for (col in 0 until 4) {
+                            for (row in 0 until 4) {
+                                var sum = 0f
+                                for (k in 0 until 4) {
+                                    var sum2 = 0f
+                                    for (kk in 0 until 4) {
+                                        sum2 += rym[kk * 4 + row] * rxm[col * 4 + kk]
+                                    }
+                                    sum += sum2 * rzm[col * 4 + k]
+                                }
+                                matrix[col * 4 + row] = sum
+                            }
+                        }
+                        // 位置：脸中心（厘米，深度 distance 的视线上）
+                        val halfHcm2 = distance * tan(Math.toRadians(25.0)).toFloat()
+                        val halfWcm2 = halfHcm2 * W / H
+                        matrix[12] = ((cxN - 0.5) * 2 * halfWcm2).toFloat()
+                        matrix[13] = ((0.5 - cyN) * 2 * halfHcm2).toFloat()
+                        matrix[14] = (-distance).toFloat()
                         renderer.faceMatrix = matrix
 
                         if (now - lastMatrixLogAt > 500) {
                             lastMatrixLogAt = now
                             android.util.Log.i(
                                 "gscp-ar",
-                                "face d=%.0fcm t=(%.1f,%.1f,%.1f) ypr=(%.2f,%.2f,%.2f)".format(
-                                    distance, tx, ty, tz, yaw, pitch, roll,
+                                "face d=%.0fcm t=(%.1f,%.1f,%.1f)".format(
+                                    distance, matrix[12], matrix[13], matrix[14],
                                 ),
                             )
                         }
                     }
-
-                    // 更新 ROI（正立空间归一化，方形 3 倍人脸宽度）
-                    val faceWN = (bw / W).coerceAtLeast(0.02)
-                    val side = (faceWN * 3.0).coerceIn(0.15, 1.0)
-                    val cx = bx / W
-                    val cy = by / H
-                    val rx0 = (cx - side / 2).coerceIn(0.0, 1.0 - side)
-                    val ry0 = (cy - side / 2).coerceIn(0.0, 1.0 - side)
-                    roiRect.set(rx0.toFloat(), ry0.toFloat(), (rx0 + side).toFloat(), (ry0 + side).toFloat())
-                    roiActive = true
                 } else {
                     firstFaceAtMillis = 0L
-                    if (roiActive) {
-                        roiLostFrames++
-                        if (roiLostFrames > 12) {
-                            roiRect.set(0f, 0f, 1f, 1f)
-                            roiActive = false
-                            roiLostFrames = 0
-                        }
-                    }
-                    if (faceLocked && now2() - lastFaceAtMillis > 1000) {
+                    if (faceLocked && now - lastFaceAtMillis > 1000) {
                         faceLocked = false
                         renderer.faceMatrix = null
                         runOnUiThread { statusText.text = "等待人脸…" }
@@ -412,8 +349,6 @@ class ArActivity : AppCompatActivity() {
             image.close()
         }
     }
-
-    private fun now2(): Long = System.currentTimeMillis()
 
     // ── scrcpy overlay-only 连接 / 测试模式 ───────────────────
 
