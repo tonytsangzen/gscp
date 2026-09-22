@@ -199,10 +199,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         proj[0] = near / r; proj[5] = near / t; proj[10] = -(far + near) / (far - near)
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
 
-        // overlay 与背景同向旋转 90°（相机空间绕 Z 轴），再等比缩放到居中区域
+        // overlay 与背景同向旋转（相机空间额外 +90°，共 180°）
         val rz = floatArrayOf(
-            0f, 1f, 0f, 0f,
             -1f, 0f, 0f, 0f,
+            0f, -1f, 0f, 0f,
             0f, 0f, 1f, 0f,
             0f, 0f, 0f, 1f,
         )
@@ -284,20 +284,21 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glDisable(GLES20.GL_BLEND)
     }
 
-    /** 背景：等比缩放居中（letterbox），完整显示相机画面。 */
+    /** 背景：等比缩放居中（letterbox），画面逆时针旋转 90°，完整显示。 */
     private fun drawFullscreen(tex: Int) {
         val imgW = 720f
         val imgH = 1280f
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
+        // 画面逆时针旋转 90°：屏幕四角采样自旋转后的纹理位置
         val verts = floatArrayOf(
-            -hw, hh, 0f, 0f,
-            -hw, -hh, 0f, 1f,
-            hw, -hh, 1f, 1f,
-            -hw, hh, 0f, 0f,
-            hw, -hh, 1f, 1f,
-            hw, hh, 1f, 0f,
+            -hw, hh, 0f, 1f,
+            -hw, -hh, 1f, 1f,
+            hw, -hh, 1f, 0f,
+            -hw, hh, 0f, 1f,
+            hw, -hh, 1f, 0f,
+            hw, hh, 0f, 0f,
         )
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(verts).position(0)
