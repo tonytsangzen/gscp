@@ -77,6 +77,14 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var cameraTextureId = 0
 
     private var oesProgram = 0
+    private var bgProgram = 0
+    private var bgAPosition = 0
+    private var bgATexCoord = 0
+    private var bgUTexture = 0
+    private var bgUMvp = 0
+    private var bgUSTMat = 0
+    private var bgUAlpha = 0
+    private val stMat = FloatArray(16)
     private var oesAPosition = 0
     private var oesATexCoord = 0
     private var oesUTexture = 0
@@ -167,6 +175,12 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         cameraSurface = Surface(cameraSurfaceTexture)
 
         oesProgram = buildProgram(OES_FRAGMENT)
+        bgProgram = buildProgram(BG_VERTEX, OES_FRAGMENT)
+        bgAPosition = GLES20.glGetAttribLocation(bgProgram, "aPosition")
+        bgATexCoord = GLES20.glGetAttribLocation(bgProgram, "aTexCoord")
+        bgUTexture = GLES20.glGetUniformLocation(bgProgram, "uTexture")
+        bgUMvp = GLES20.glGetUniformLocation(bgProgram, "uMvp")
+        bgUSTMat = GLES20.glGetUniformLocation(bgProgram, "uSTMat")
         oesAPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
         oesATexCoord = GLES20.glGetAttribLocation(oesProgram, "aTexCoord")
         oesUTexture = GLES20.glGetUniformLocation(oesProgram, "uTexture")
@@ -388,32 +402,35 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
-        // 画面在原基础上再顺时针加转 90°（累计 180°）
+        // 画面顺时针旋转 90°：屏幕四角采样自旋转后的纹理位置
         val verts = floatArrayOf(
-            -hw, hh, 0f, 1f,
-            -hw, -hh, 1f, 1f,
-            hw, -hh, 1f, 0f,
-            -hw, hh, 0f, 1f,
-            hw, -hh, 1f, 0f,
-            hw, hh, 0f, 0f,
+            -hw, hh, 1f, 0f,
+            -hw, -hh, 0f, 0f,
+            hw, -hh, 0f, 1f,
+            -hw, hh, 1f, 0f,
+            hw, -hh, 0f, 1f,
+            hw, hh, 1f, 1f,
         )
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(verts).position(0)
-        GLES20.glUseProgram(oesProgram)
+        // SurfaceTexture 变换矩阵：包含相机到显示的旋转/翻转（与模型输入一致）
+        cameraSurfaceTexture?.getTransformMatrix(stMat)
+        GLES20.glUseProgram(bgProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
-        GLES20.glUniform1i(oesUTexture, 0)
-        GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
-        GLES20.glUniform1f(oesUAlpha, 1f)
+        GLES20.glUniform1i(bgUTexture, 0)
+        GLES20.glUniformMatrix4fv(bgUMvp, 1, false, identity, 0)
+        GLES20.glUniformMatrix4fv(bgUSTMat, 1, false, stMat, 0)
+        GLES20.glUniform1f(bgUAlpha, 1f)
         fullscreenVertexBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(oesAPosition)
-        GLES20.glVertexAttribPointer(oesAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
-        GLES20.glEnableVertexAttribArray(oesATexCoord)
+        GLES20.glEnableVertexAttribArray(bgAPosition)
+        GLES20.glVertexAttribPointer(bgAPosition, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
+        GLES20.glEnableVertexAttribArray(bgATexCoord)
         fullscreenVertexBuffer.position(2)
-        GLES20.glVertexAttribPointer(oesATexCoord, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
+        GLES20.glVertexAttribPointer(bgATexCoord, 2, GLES20.GL_FLOAT, false, 16, fullscreenVertexBuffer)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
-        GLES20.glDisableVertexAttribArray(oesAPosition)
-        GLES20.glDisableVertexAttribArray(oesATexCoord)
+        GLES20.glDisableVertexAttribArray(bgAPosition)
+        GLES20.glDisableVertexAttribArray(bgATexCoord)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
 
@@ -467,18 +484,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         return textures[0]
     }
 
-    private fun buildProgram(fragmentSrc: String): Int {
-        val vertex = """
-            precision mediump float;
-            attribute vec4 aPosition;
-            attribute vec2 aTexCoord;
-            uniform mat4 uMvp;
-            varying vec2 vTexCoord;
-            void main() {
-                gl_Position = uMvp * vec4(aPosition.xy, 0.0, 1.0);
-                vTexCoord = aTexCoord;
-            }
-        """.trimIndent()
+    private fun buildProgram(fragmentSrc: String, vertexSrc: String = DEFAULT_VERTEX): Int {
+        val vertex = vertexSrc.trimIndent()
 
         fun compile(type: Int, src: String): Int {
             val shader = GLES20.glCreateShader(type)
@@ -548,6 +555,31 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         }
     }
 }
+
+private val DEFAULT_VERTEX = """
+    precision mediump float;
+    attribute vec4 aPosition;
+    attribute vec2 aTexCoord;
+    uniform mat4 uMvp;
+    varying vec2 vTexCoord;
+    void main() {
+        gl_Position = uMvp * vec4(aPosition.xy, 0.0, 1.0);
+        vTexCoord = aTexCoord;
+    }
+"""
+
+private val BG_VERTEX = """
+    precision mediump float;
+    attribute vec4 aPosition;
+    attribute vec2 aTexCoord;
+    uniform mat4 uMvp;
+    uniform mat4 uSTMat;
+    varying vec2 vTexCoord;
+    void main() {
+        gl_Position = uMvp * vec4(aPosition.xy, 0.0, 1.0);
+        vTexCoord = (uSTMat * vec4(aTexCoord, 0.0, 1.0)).xy;
+    }
+"""
 
 private val OES_FRAGMENT = """
     #extension GL_OES_EGL_image_external : require
