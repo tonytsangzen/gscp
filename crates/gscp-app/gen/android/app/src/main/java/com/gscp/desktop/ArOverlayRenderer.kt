@@ -17,15 +17,14 @@ import kotlin.math.tan
 
 /**
  * AR 试验渲染器（单 GLSurfaceView）：
- * - 背景 = 相机分析帧 Bitmap 上传（与喂给 YuNet 的数据完全一致，像素级对齐），
- *   等比缩放居中显示（不裁剪，最大 FOV，黑边补底）；
+ * - 背景 = 手机相机实时画面，等比缩放居中显示（不裁剪，最大 FOV，黑边补底）；
  * - 前景 = 眼镜 overlay 虚拟平面（MediaCodec → EXTERNAL_OES），锚定在
  *   第一张稳定追踪人脸的正前方：位于「相机→人脸」方向、深度 = 距离滑条
  *   （厘米）处，平面法线与人脸法线重合，固定物理宽度基准 14cm；
  * - 无眼镜时可切半透明测试图层，验证追踪与锚定。
  *
- * 人脸位姿矩阵（YuNet 5 点 + DLT-PnP 或外部设置）为列主序仿射、单位厘米，
- * 坐标系与背景 Bitmap 的正立显示空间一致。
+ * MediaPipe Face Landmarker 的 4×4 变换矩阵为列主序仿射、单位厘米
+ * （实测人脸 ~60cm 时 t.z ≈ -63）。
  */
 class ArOverlayRenderer : GLSurfaceView.Renderer {
     /** 最新人脸变换矩阵（列主序 4×4），null = 未锁定。 */
@@ -52,12 +51,29 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     @Volatile
     var flipNormal = false
 
-    /** 相机背景帧（分析线程写入，GL 线程读取上传）。 */
+    /** 相机就绪回调（GL 线程初始化完成后触发）。 */
+    var onCameraSurfaceReady: (Surface) -> Unit = {}
+
+    /** 相机实际缓冲尺寸（由 CameraX SurfaceRequest 提供，等比缩放依据）。 */
     @Volatile
-    var latestFrame: Bitmap? = null
+    var cameraBufferWidth = 1280f
+
+    @Volatile
+    var cameraBufferHeight = 720f
+
+    fun setCameraResolution(w: Int, h: Int) {
+        cameraBufferWidth = w.coerceAtLeast(1).toFloat()
+        cameraBufferHeight = h.coerceAtLeast(1).toFloat()
+        // 缓冲尺寸改为相机真实分辨率（等比例），CameraX 后续帧按此尺寸交付
+        try {
+            cameraSurfaceTexture?.setDefaultBufferSize(w, h)
+        } catch (_: Exception) {
+        }
+    }
 
     private var overlaySurfaceTexture: SurfaceTexture? = null
     private var overlayTextureId = 0
+    private var cameraSurfaceTexture: SurfaceTexture? = null
     private var cameraTextureId = 0
 
     private var oesProgram = 0
@@ -75,6 +91,9 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var testUAlpha = 0
     private var viewportW = 1
     private var viewportH = 1
+
+    @Volatile
+    private var cameraSurface: Surface? = null
 
     private val quadVertexBuffer: FloatBuffer = floatBufferOf(
         // x, y, u, v —— 单位平面（中心原点）
@@ -101,11 +120,29 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private val proj = FloatArray(16)
     private val model = FloatArray(16)
 
+    // 位姿指数平滑状态（抑制 MediaPipe 每帧抖动）
+    // 系数：越小越稳（延迟越大）
+    private val SMOOTH_ALPHA_T = 0.45f
+    private val SMOOTH_ALPHA_R = 0.3f
+    private val smoothT = FloatArray(3)
+    private val smoothR = FloatArray(16)
+    private var smoothValid = false
+
+    /** 屏幕显示 = 分析帧绕视线轴顺时针旋转 90°（相机空间 Rz(-90)，实测校准）。 */
+    private val screenRotation = floatArrayOf(
+        0f, -1f, 0f, 0f,
+        1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    )
+
     /** overlay 解码目标 Surface（MediaCodec 直渲染到我们的纹理）。 */
     fun getOverlaySurface(): Surface {
         val st = overlaySurfaceTexture ?: throw IllegalStateException("GL 未初始化")
         return Surface(st)
     }
+
+    fun cameraSurfaceOrNull(): Surface? = cameraSurface
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -114,7 +151,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         overlaySurfaceTexture = SurfaceTexture(overlayTextureId).apply {
             setDefaultBufferSize(1024, 768)
         }
-        cameraTextureId = createTex2dTexture()
+        cameraTextureId = createOesTexture()
+        cameraSurfaceTexture = SurfaceTexture(cameraTextureId).apply {
+            setDefaultBufferSize(1280, 720)
+        }
+        cameraSurface = Surface(cameraSurfaceTexture)
 
         oesProgram = buildProgram(OES_FRAGMENT)
         oesAPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
@@ -131,7 +172,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         testUAlpha = GLES20.glGetUniformLocation(testProgram, "uAlpha")
 
         testTextureId = createTestTexture()
-        android.util.Log.i("gscp-ar", "renderer ready build=20260922.4")
+        android.util.Log.i("gscp-ar", "renderer ready build=20260922.3 viewport=${viewportW}x$viewportH")
+        onCameraSurfaceReady(cameraSurface!!)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -143,24 +185,34 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        // 背景：相机分析帧（与模型输入同一 Bitmap，等比缩放居中，不裁剪）
-        val frame = latestFrame
-        if (frame != null && !frame.isRecycled) {
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cameraTextureId)
-            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, frame, 0)
-            drawFullscreen(cameraTextureId, frame.width.toFloat(), frame.height.toFloat())
+        // 背景：相机实时画面，等比缩放居中显示（不裁剪，最大 FOV，黑边补底）
+        try {
+            cameraSurfaceTexture?.updateTexImage()
+        } catch (_: Exception) {
         }
+        drawFullscreen(cameraTextureId)
 
-        // 前景：overlay 平面（未锁定人脸时不画）
-        val face = faceMatrix ?: return
+        // 前景：overlay 平面（未锁定人脸时不画）。
+        // 人脸矩阵在分析帧坐标系（未旋转），先旋转到屏幕显示方向。
+        val faceRaw = faceMatrix
+        if (faceRaw == null) {
+            smoothValid = false
+            return
+        }
+        val faceRot = FloatArray(16)
+        multiply(screenRotation, faceRaw, faceRot)
+        val face = FloatArray(16)
+        smoothFace(faceRot, face)
         try {
             overlaySurfaceTexture?.updateTexImage()
         } catch (_: Exception) {
         }
 
-        // 投影：FOV 以背景画面垂直方向为基准，完整视野可见（最大 FOV）
-        val imgW = frame?.width?.toFloat() ?: 720f
-        val imgH = frame?.height?.toFloat() ?: 1280f
+        // 投影：FOV 以相机画面（旋转 90° 后的竖幅 720×1280）垂直方向为基准，
+        // 相机完整视野全部可见（最大 FOV，不裁剪）。
+        // 旋转 90° 后的显示尺寸 = 相机真实缓冲的宽高互换（等比例）
+        val imgW = cameraBufferHeight
+        val imgH = cameraBufferWidth
         val near = 5f
         val far = 1000f
         val fovY = Math.toRadians(50.0)
@@ -172,6 +224,17 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         }
         proj[0] = near / r; proj[5] = near / t; proj[10] = -(far + near) / (far - near)
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
+
+        // overlay 与背景同向旋转（背景顺时针 90° = 相机空间 Rz(+90)），
+        // 加上背景基准累计为 Rz(180)：绕视线轴转 180°。
+        val rz = floatArrayOf(
+            -1f, 0f, 0f, 0f,
+            0f, -1f, 0f, 0f,
+            0f, 0f, 1f, 0f,
+            0f, 0f, 0f, 1f,
+        )
+        val tmp = proj.copyOf()
+        multiply(rz, tmp, proj)
 
         // 平面位于「相机→人脸」方向、深度 = planeDistance（厘米）处；
         // 旋转列取人脸朝向（法线重合）；固定物理宽度基准 14cm。
@@ -198,7 +261,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         }
 
         multiply(proj, model, mvp)
-        // letterbox 缩放：背景画面 NDC 映射到屏幕居中区域
+        // letterbox 缩放：相机画面 NDC 映射到屏幕居中区域
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val ndcX = imgW * fit / viewportW
         val ndcY = imgH * fit / viewportH
@@ -248,24 +311,27 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glDisable(GLES20.GL_BLEND)
     }
 
-    /** 背景：等比缩放居中（letterbox），完整显示 Bitmap。 */
-    private fun drawFullscreen(tex: Int, imgW: Float, imgH: Float) {
+    /** 背景：等比缩放居中（letterbox），画面顺时针旋转 90°，完整显示。 */
+    private fun drawFullscreen(tex: Int) {
+        val imgW = cameraBufferHeight
+        val imgH = cameraBufferWidth
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val hw = imgW * fit / viewportW
         val hh = imgH * fit / viewportH
+        // 画面顺时针旋转 90°：屏幕四角采样自旋转后的纹理位置
         val verts = floatArrayOf(
-            -hw, hh, 0f, 0f,
-            -hw, -hh, 0f, 1f,
-            hw, -hh, 1f, 1f,
-            -hw, hh, 0f, 0f,
-            hw, -hh, 1f, 1f,
-            hw, hh, 1f, 0f,
+            -hw, hh, 1f, 0f,
+            -hw, -hh, 0f, 0f,
+            hw, -hh, 0f, 1f,
+            -hw, hh, 1f, 0f,
+            hw, -hh, 0f, 1f,
+            hw, hh, 1f, 1f,
         )
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(verts).position(0)
         GLES20.glUseProgram(oesProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
         GLES20.glUniform1i(oesUTexture, 0)
         GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
         GLES20.glUniform1f(oesUAlpha, 1f)
@@ -278,7 +344,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
         GLES20.glDisableVertexAttribArray(oesAPosition)
         GLES20.glDisableVertexAttribArray(oesATexCoord)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
 
     private fun floatBufferOf(vararg values: Float): FloatBuffer =
@@ -296,17 +362,6 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        return textures[0]
-    }
-
-    private fun createTex2dTexture(): Int {
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[0])
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         return textures[0]
     }
 
@@ -373,6 +428,42 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glAttachShader(program, fs)
         GLES20.glLinkProgram(program)
         return program
+    }
+
+    /**
+     * 位姿指数平滑：平移线性插值，旋转列线性插值后 Gram-Schmidt 正交化。
+     * 人脸丢失（smoothValid 复位）后下一帧直接贴合，避免回跳。
+     */
+    private fun smoothFace(faceRot: FloatArray, out: FloatArray) {
+        if (!smoothValid) {
+            for (i in 0..2) smoothT[i] = faceRot[12 + i]
+            for (i in 0..15) smoothR[i] = faceRot[i]
+            smoothValid = true
+        } else {
+            for (i in 0..2) smoothT[i] += (faceRot[12 + i] - smoothT[i]) * SMOOTH_ALPHA_T
+            for (i in 0..15) smoothR[i] += (faceRot[i] - smoothR[i]) * SMOOTH_ALPHA_R
+        }
+        for (i in 0..15) out[i] = smoothR[i]
+        out[12] = smoothT[0]; out[13] = smoothT[1]; out[14] = smoothT[2]
+        // Gram-Schmidt 正交化旋转列，防止插值漂移导致剪切
+        normalizeCol(out, 0)
+        // 列 1 减去其在列 0 上的投影
+        var d = out[0] * out[4] + out[1] * out[5] + out[2] * out[6]
+        for (i in 0..2) out[4 + i] -= d * out[i]
+        normalizeCol(out, 1)
+        // 列 2 = 列 0 × 列 1
+        out[8] = out[1] * out[6] - out[2] * out[5]
+        out[9] = out[2] * out[4] - out[0] * out[6]
+        out[10] = out[0] * out[5] - out[1] * out[4]
+        out[3] = 0f; out[7] = 0f; out[11] = 0f; out[15] = 1f
+    }
+
+    private fun normalizeCol(m: FloatArray, col: Int) {
+        val b = col * 4
+        val len = kotlin.math.sqrt(m[b] * m[b] + m[b + 1] * m[b + 1] + m[b + 2] * m[b + 2])
+        if (len > 1e-6f) {
+            m[b] /= len; m[b + 1] /= len; m[b + 2] /= len
+        }
     }
 
     private fun multiply(a: FloatArray, b: FloatArray, out: FloatArray) {
