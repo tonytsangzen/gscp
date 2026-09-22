@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- 连接设置 -->
+    <LinearLayout
+        android:id="@+id/settings_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:text="AR 试验模式"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:layout_gravity="center_horizontal"
+            android:gravity="center"
+            android:text="仅拉取 overlay 画面，用手机摄像头追踪人脸，\n把 overlay 绘制在人脸正前方（试验性）"
+            android:textColor="#99FFFFFF"
+            android:textSize="13sp" />
+
+        <EditText
+            android:id="@+id/ip_address"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:hint="眼镜 IP 地址"
+            android:imeOptions="actionDone"
+            android:inputType="text"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#66FFFFFF" />
+
+        <Button
+            android:id="@+id/button_connect"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="连接" />
+
+        <ProgressBar
+            android:id="@+id/progress_bar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="24dp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- AR 画面：相机预览（底） + 透明 GL overlay 平面（顶） -->
+    <FrameLayout
+        android:id="@+id/ar_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+
+        <androidx.camera.view.PreviewView
+            android:id="@+id/ar_preview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <android.opengl.GLSurfaceView
+            android:id="@+id/ar_gl_surface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <TextView
+            android:id="@+id/ar_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|center_horizontal"
+            android:layout_marginTop="32dp"
+            android:background="#66000000"
+            android:padding="8dp"
+            android:text="等待人脸…"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#99000000"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="距离"
+                android:textColor="#CCFFFFFF"
+                android:textSize="12sp" />
+
+            <SeekBar
+                android:id="@+id/ar_distance"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="120" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="大小"
+                android:textColor="#CCFFFFFF"
+                android:textSize="12sp" />
+
+            <SeekBar
+                android:id="@+id/ar_size"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="200" />
+
+            <Button
+                android:id="@+id/button_flip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:text="法线翻转" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- 退出按钮（始终可见） -->
+    <Button
+        android:id="@+id/button_exit"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:text="退出" />
+</FrameLayout>

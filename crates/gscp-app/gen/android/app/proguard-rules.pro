@@ -24,3 +24,17 @@
 # 新平台上不会走到这些分支，忽略缺失警告即可。
 -dontwarn com.android.org.conscrypt.SSLParametersImpl
 -dontwarn org.apache.harmony.xnet.provider.jsse.SSLParametersImpl
+
+# MediaPipe tasks-vision 打包了 auto-value 注解处理器（编译期组件），
+# 其引用的 javax.* 注解处理类不会在运行期用到，忽略缺失警告。
+-dontwarn javax.annotation.processing.AbstractProcessor
+-dontwarn javax.annotation.processing.SupportedAnnotationTypes
+-dontwarn javax.lang.model.SourceVersion
+-dontwarn javax.lang.model.element.Element
+-dontwarn javax.lang.model.element.ElementKind
+-dontwarn javax.lang.model.element.Modifier
+-dontwarn javax.lang.model.type.TypeMirror
+-dontwarn javax.lang.model.type.TypeVisitor
+-dontwarn javax.lang.model.util.SimpleTypeVisitor8
+-dontwarn autovalue.shaded.com.squareup.javapoet.**
+-dontwarn com.google.auto.value.extension.**

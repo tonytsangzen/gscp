@@ -119,6 +119,9 @@ class MainActivity : AppCompatActivity() {
         ipEdit.setText(prefs.getString("ip", ""))
         settingsButton.setOnClickListener { openSettingsDialog() }
         connectButton.setOnClickListener { connect() }
+        findViewById<Button>(R.id.button_ar).setOnClickListener {
+            startActivity(android.content.Intent(this, ArActivity::class.java))
+        }
     }
 
     // ── 参数设置 ──────────────────────────────────────────────

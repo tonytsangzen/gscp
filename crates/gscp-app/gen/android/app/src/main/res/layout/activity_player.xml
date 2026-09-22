@@ -52,6 +52,17 @@
             android:layout_marginTop="16dp"
             android:text="连接" />
 
+        <Button
+            android:id="@+id/button_ar"
+            style="?attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:text="AR 试验模式（仅 overlay）"
+            android:textColor="#99FFFFFF"
+            android:textSize="12sp" />
+
         <ProgressBar
             android:id="@+id/progress_bar"
             android:layout_width="wrap_content"
