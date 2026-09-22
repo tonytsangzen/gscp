@@ -25,7 +25,14 @@ import android.graphics.Bitmap
 import android.graphics.Matrix
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
+import org.opencv.calib3d.Calib3d
+import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfDouble
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.MatOfPoint3f
+import org.opencv.core.Point
+import org.opencv.core.Point3
 import org.opencv.core.Size
 import org.opencv.objdetect.FaceDetectorYN
 import java.io.File
@@ -68,9 +75,42 @@ class ArActivity : AppCompatActivity() {
     private var detectCount = 0
     private val lock = Any()
 
-    // 可调参数
-    private var distanceCm = 40      // 平面目标深度（厘米，20..120）
-    private var sizePercent = 100    // 平面大小系数（50..200，基准宽 14cm）
+    // 可调参数已全部移除（大小改为按眼距自动推算、深度固定）。
+    /** 检测工作尺寸：分析帧缩放到此长边后喂给 YuNet（面积≈该值²，大幅提速）。 */
+    private val detectMaxDim = 640
+
+    /** overlay 宽度 = 实测眼距 × 此倍数（约 2.2~2.4 时覆盖整个脸部宽度）。 */
+    private val OVERLAY_EYE_MULT = 2.2f
+
+    // 人脸防抖：一阶低通（EMA）。alpha 越小越稳（但滞后越大）、越大越跟手。
+    // 首帧锚定或丢脸后重置，避免从头带旧值造成明显滞后。
+    private val SMOOTH_ALPHA = 0.3f
+
+    /** EPNP 姿态 EMA 系数（更小 = 更平滑；0.06 强防抖）。 */
+    private val POSE_SMOOTH_ALPHA = 0.06f
+
+    /** 瞳距（cm），金字塔/3 瞳距球半径的统一基准。 */
+    private val IPD_CM = 6.2
+    private var filterInit = false
+    private var sCx = 0.5
+    private var sCy = 0.5
+    private var sDist = 100.0
+    private var sRoll = 0.0
+    private var sSize = 14.0
+
+    /** EPNP 解算输出的 EMA 平滑状态（位置 + 9 维姿态基）。 */
+    private var poseInit = false
+    private var sPx = 0f
+    private var sPy = 0f
+    private var sPz = 0f
+    private val sB = FloatArray(9)
+    private var lastPoseMode = "heur"
+    private var epnpFail = 0
+
+    // 朝向符号校正（固定默认：图像 y 向下而 GL 渲染 y 向上，roll 需翻号）。
+    private var invertYaw = false
+    private var invertPitch = false
+    private var invertRoll = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -89,13 +129,7 @@ class ArActivity : AppCompatActivity() {
         ipEdit = findViewById(R.id.ip_address)
         val connectButton = findViewById<Button>(R.id.button_connect)
 
-        distanceCm = prefs.getInt("arDistanceCm", 40)
-        sizePercent = prefs.getInt("arSizePercent", 100)
-
-        renderer = ArOverlayRenderer().apply {
-            planeDistance = distanceCm.toFloat()
-            planeScale = sizePercent / 100f
-        }
+        renderer = ArOverlayRenderer()
         renderer.onCameraSurfaceReady = { surface ->
             runOnUiThread {
                 cameraSurface = surface
@@ -112,18 +146,7 @@ class ArActivity : AppCompatActivity() {
 
         ipEdit.setText(prefs.getString("ip", ""))
         connectButton.setOnClickListener { startAr() }
-        findViewById<Button>(R.id.button_test).setOnClickListener { startTestTracking() }
         findViewById<Button>(R.id.button_exit).setOnClickListener { exitAr() }
-        bindSeekBar(R.id.ar_distance, distanceCm, 20, 120) { v ->
-            distanceCm = v
-            renderer.planeDistance = v.toFloat()
-            prefs.edit().putInt("arDistanceCm", v).apply()
-        }
-        bindSeekBar(R.id.ar_size, sizePercent, 50, 200) { v ->
-            sizePercent = v
-            renderer.planeScale = v / 100f
-            prefs.edit().putInt("arSizePercent", v).apply()
-        }
 
         requestCameraPermission()
     }
@@ -169,8 +192,8 @@ class ArActivity : AppCompatActivity() {
                         androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
                             .setResolutionStrategy(
                                 androidx.camera.core.resolutionselector.ResolutionStrategy(
-                                    android.util.Size(720, 1280),
-                                    androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                                    android.util.Size(480, 960),
+                                    androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
                                 )
                             )
                             .build()
@@ -227,16 +250,26 @@ class ArActivity : AppCompatActivity() {
     private fun analyzeFrame(image: ImageProxy) {
         try {
             val full = image.toBitmap()
-            // 旋转到正立显示方向（与背景渲染的旋转严格一致）
-            val m = Matrix().apply { postRotate(90f) }
-            val upright = Bitmap.createBitmap(full, 0, 0, full.width, full.height, m, true)
-            if (upright !== full) full.recycle()
-            val W = upright.width
-            val H = upright.height
+            // 一次矩阵变换同时完成「旋转到正立 + 缩放到检测工作尺寸」：
+            // 避免先整帧旋转拷贝、再整帧 bitmapToMat/cvtColor，检测输入面积降至
+            // ≈ detectMaxDim²，YuNet 与像素拷贝耗时随之大幅下降 → 跟踪更跟手。
+            // 坐标仍在同一帧空间内归一，焦点/距离均用同尺寸 H，缩放不改变位姿数值。
+            val sx = full.width
+            val sy = full.height
+            val scale = (detectMaxDim / maxOf(sx, sy).toFloat()).coerceIn(0.0f, 1f)
+            val m = Matrix()
+            val deg = image.imageInfo.rotationDegrees.toFloat()
+            if (deg != 0f) m.postRotate(deg)
+            m.postScale(scale, scale)
+            val work = Bitmap.createBitmap(full, 0, 0, sx, sy, m, true)
+            if (work !== full) full.recycle()
+            val W = work.width
+            val H = work.height
 
             val detector = ensureDetector(W, H)
             val bgr = Mat()
-            Utils.bitmapToMat(upright, bgr)
+            Utils.bitmapToMat(work, bgr)
+            work.recycle()
             // FaceDetectorYN 要求 BGR 3 通道；bitmapToMat 产出 RGBA 4 通道
             org.opencv.imgproc.Imgproc.cvtColor(
                 bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
@@ -278,108 +311,199 @@ class ArActivity : AppCompatActivity() {
                     // 稳定判定：连续追踪 ~0.5s 后锚定第一张人脸
                     if (!faceLocked && now - firstFaceAtMillis >= 500) {
                         faceLocked = true
+                        filterInit = false  // 锚定时重置滤波，避免带着旧值造成滞后
                         runOnUiThread { statusText.text = "已锁定人脸" }
                     }
 
                     if (faceLocked) {
                         // 针孔模型（正立空间）：垂直 FOV 50°
                         val focal = (H / 2.0) / tan(Math.toRadians(25.0))
-                        val distance = (focal * 15.0 / bw).coerceIn(10.0, 300.0)
+                        val rawDistance = (focal * 15.0 / bw).coerceIn(10.0, 300.0)
 
                         // 位置：脸中心（bbox 中心）在深度 distance 的视线上
                         val cxN = (bx + bw / 2.0) / W
                         val cyN = (by + bh / 2.0) / H
-                        val halfHcm = distance * tan(Math.toRadians(25.0))
-                        val halfWcm = halfHcm * W / H
 
-                        // 朝向（5 点几何启发式）：
-                        // roll = 眼线角度；yaw = 鼻尖水平偏移；pitch = 鼻尖垂直偏移
+                        // 朝向（5 点几何启发式）：roll=眼线角度；yaw/pitch=鼻尖偏移
                         val (rex, rey) = ptsPx[0]
                         val (lex, ley) = ptsPx[1]
                         val (nx, ny) = ptsPx[2]
                         val eyeMidX = (rex + lex) / 2.0
                         val eyeMidY = (rey + ley) / 2.0
                         val facePxW = maxOf(abs(lex - rex), 1.0)
-                        val roll = atan2(ley - rey, lex - rex)
-                        val yaw = kotlin.math.asin(
+                        val kR = if (invertRoll) -1.0 else 1.0
+                        val kY = if (invertYaw) -1.0 else 1.0
+                        val kP = if (invertPitch) -1.0 else 1.0
+                        val roll = kR * atan2(ley - rey, lex - rex)
+                        val yaw = kY * kotlin.math.asin(
                             ((nx - eyeMidX) / facePxW * 1.8).coerceIn(-1.0, 1.0),
                         )
-                        val pitch = kotlin.math.asin(
+                        val pitch = kP * kotlin.math.asin(
                             (((ny - eyeMidY) / facePxW) * 1.5).coerceIn(-1.0, 1.0),
                         )
+                        val eyePx =
+                            kotlin.math.hypot((lex - rex), (ley - rey)).coerceAtLeast(1.0)
+                        val rawSize = 15.0 * eyePx / bw * OVERLAY_EYE_MULT
 
-                        // GL 旋转矩阵 R = Ry(yaw)·Rx(pitch)·Rz(roll)（列主序）
-                        val cy2 = kotlin.math.cos(yaw); val sy2 = kotlin.math.sin(yaw)
-                        val cp = kotlin.math.cos(pitch); val sp = kotlin.math.sin(pitch)
-                        val cr = kotlin.math.cos(roll); val sr = kotlin.math.sin(roll)
-                        val rym = floatArrayOf(
-                            cy2.toFloat(), 0f, -sy2.toFloat(), 0f,
-                            0f, 1f, 0f, 0f,
-                            sy2.toFloat(), 0f, cy2.toFloat(), 0f,
-                            0f, 0f, 0f, 1f,
+                        // —— 一阶低通（EMA）防抖：对位置/深度/roll/尺寸做滤波，
+                        //    防止逐帧检测抖动使 overlay 跳变。首帧时初始化状态。
+                        if (!filterInit) {
+                            sCx = cxN; sCy = cyN; sDist = rawDistance
+                            sRoll = roll; sSize = rawSize
+                            filterInit = true
+                        } else {
+                            val a = SMOOTH_ALPHA
+                            sCx += (cxN - sCx) * a
+                            sCy += (cyN - sCy) * a
+                            sDist += (rawDistance - sDist) * a
+                            sRoll += (roll - sRoll) * a
+                            sSize += (rawSize - sSize) * a
+                        }
+
+                        // 用 5 点（眼/鼻/嘴）重建金字塔底面平面姿态：优先把 overlay 平面画到与该底面
+                        // 平行、距底面 3 瞳距的位置；解算失败才回退到平行画面的 roll 贴纸。
+                        val mouthR = ptsPx[3]; val mouthL = ptsPx[4]
+                        val pose = solveOverlayPose(
+                            rex, rey, lex, ley, nx, ny,
+                            mouthR.first, mouthR.second, mouthL.first, mouthL.second,
+                            focal, W, H,
                         )
-                        val rxm = floatArrayOf(
-                            1f, 0f, 0f, 0f,
-                            0f, cp.toFloat(), sp.toFloat(), 0f,
-                            0f, -sp.toFloat(), cp.toFloat(), 0f,
-                            0f, 0f, 0f, 1f,
-                        )
-                        val rzm = floatArrayOf(
-                            cr.toFloat(), sr.toFloat(), 0f, 0f,
-                            -sr.toFloat(), cr.toFloat(), 0f, 0f,
-                            0f, 0f, 1f, 0f,
-                            0f, 0f, 0f, 1f,
-                        )
-                        val matrix = FloatArray(16)
-                        // rot = Ry·Rx·Rz
-                        for (col in 0 until 4) {
-                            for (row in 0 until 4) {
-                                var sum = 0f
-                                for (k in 0 until 4) {
-                                    var sum2 = 0f
-                                    for (kk in 0 until 4) {
-                                        sum2 += rym[kk * 4 + row] * rxm[col * 4 + kk]
-                                    }
-                                    sum += sum2 * rzm[col * 4 + k]
-                                }
-                                matrix[col * 4 + row] = sum
+                        // 统一姿态候选：epnp 与『连续失败后的启发式回退』都先算候选 basis+pos，
+                        // 再走同一个低通出口——避免回退分支把未平滑的原始 yaw/pitch/sRoll
+                        // 直接写进渲染器（低通泄漏 → 未稳定时高频抖动）。
+                        var candBasis = FloatArray(9)
+                        var cpx = 0f; var cpy = 0f; var cpz = 0f
+                        var hardUpdate = true
+                        if (pose != null) {
+                            epnpFail = 0
+                            lastPoseMode = "epnp"
+                            candBasis = pose.first
+                            cpx = pose.second[0]; cpy = pose.second[1]; cpz = pose.second[2]
+                        } else {
+                            epnpFail++
+                            if (epnpFail >= 5) {
+                                lastPoseMode = "heur"
+                                // 连续失败才回退启发式（避免 epnp/启发式来回切换造成跳变）
+                                val cy2 = kotlin.math.cos(yaw); val sy2 = kotlin.math.sin(yaw)
+                                val cp = kotlin.math.cos(pitch); val sp = kotlin.math.sin(pitch)
+                                val cr = kotlin.math.cos(sRoll); val sr = kotlin.math.sin(sRoll)
+                                val rym = floatArrayOf(
+                                    cy2.toFloat(), 0f, -sy2.toFloat(), 0f,
+                                    0f, 1f, 0f, 0f,
+                                    sy2.toFloat(), 0f, cy2.toFloat(), 0f,
+                                    0f, 0f, 0f, 1f,
+                                )
+                                val rxm = floatArrayOf(
+                                    1f, 0f, 0f, 0f,
+                                    0f, cp.toFloat(), sp.toFloat(), 0f,
+                                    0f, -sp.toFloat(), cp.toFloat(), 0f,
+                                    0f, 0f, 0f, 1f,
+                                )
+                                val rzm = floatArrayOf(
+                                    cr.toFloat(), sr.toFloat(), 0f, 0f,
+                                    -sr.toFloat(), cr.toFloat(), 0f, 0f,
+                                    0f, 0f, 1f, 0f,
+                                    0f, 0f, 0f, 1f,
+                                )
+                                val tb = FloatArray(16)
+                                val rot = FloatArray(16)
+                                multiplyCm(rxm, rzm, tb)
+                                multiplyCm(rym, tb, rot)
+                                val nx = rot[8]; val ny = rot[9]; val nz = rot[10]
+                                candBasis = floatArrayOf(
+                                    rot[0], rot[1], rot[2],
+                                    rot[4], rot[5], rot[6],
+                                    nx, ny, nz,
+                                )
+                                // 圆心 = 滤波后的面中心（cm）；位置 = 圆心 + 3 瞳距×法线
+                                val halfHcm2 = (sDist * tan(Math.toRadians(25.0))).toFloat()
+                                val halfWcm2 = halfHcm2 * W / H
+                                val ox = ((sCx - 0.5) * 2 * halfWcm2).toFloat()
+                                val oy = ((0.5 - sCy) * 2 * halfHcm2).toFloat()
+                                val oz = (-sDist).toFloat()
+                                val d3 = (3.0 * IPD_CM).toFloat()
+                                cpx = ox + nx * d3
+                                cpy = oy + ny * d3
+                                cpz = oz + nz * d3
+                            } else {
+                                // 偶发失败（<5 帧）：保持上一帧已平滑状态，不更新、不作跳变
+                                hardUpdate = false
                             }
                         }
-                        // 位置：脸中心（厘米，深度 distance 的视线上）
-                        val halfHcm2 = (distance * tan(Math.toRadians(25.0))).toFloat()
-                        val halfWcm2 = halfHcm2 * W / H
-                        matrix[12] = ((cxN - 0.5) * 2 * halfWcm2).toFloat()
-                        matrix[13] = ((0.5 - cyN) * 2 * halfHcm2).toFloat()
-                        matrix[14] = (-distance).toFloat()
-                        renderer.faceMatrix = matrix
+
+                        if (hardUpdate) {
+                            // 唯一低通出口：epnp 与启发式候选都经同一 EMA 滤波
+                            if (!poseInit) {
+                                sPx = cpx; sPy = cpy; sPz = cpz
+                                System.arraycopy(candBasis, 0, sB, 0, 9)
+                                poseInit = true
+                            } else {
+                                val a = POSE_SMOOTH_ALPHA
+                                sPx += (cpx - sPx) * a
+                                sPy += (cpy - sPy) * a
+                                sPz += (cpz - sPz) * a
+                                for (i in 0..8) sB[i] += (candBasis[i] - sB[i]) * a
+                            }
+                            // 归一化右/上/法线并保证法线朝相机（EMA 后恢复单位长度/朝向）
+                            val rl = kotlin.math.sqrt(
+                                (sB[0]*sB[0]+sB[1]*sB[1]+sB[2]*sB[2]).toDouble(),
+                            ).toFloat().coerceAtLeast(1e-6f)
+                            sB[0]/=rl; sB[1]/=rl; sB[2]/=rl
+                            val ul = kotlin.math.sqrt(
+                                (sB[3]*sB[3]+sB[4]*sB[4]+sB[5]*sB[5]).toDouble(),
+                            ).toFloat().coerceAtLeast(1e-6f)
+                            sB[3]/=ul; sB[4]/=ul; sB[5]/=ul
+                            val nl = kotlin.math.sqrt(
+                                (sB[6]*sB[6]+sB[7]*sB[7]+sB[8]*sB[8]).toDouble(),
+                            ).toFloat().coerceAtLeast(1e-6f)
+                            sB[6]/=nl; sB[7]/=nl; sB[8]/=nl
+                            if (sB[8] < 0f) { sB[6] = -sB[6]; sB[7] = -sB[7]; sB[8] = -sB[8] }
+                            // 安全钳位：位置限制在画面内保证可见
+                            val halfW = (sPz * tan(Math.toRadians(25.0)) * 0.9f).toFloat()
+                                .coerceAtLeast(6f)
+                            sPx = sPx.coerceIn(-halfW, halfW)
+                            sPy = sPy.coerceIn(-halfW * (H / W.toFloat()), halfW * (H / W.toFloat()))
+                            sPz = sPz.coerceIn(-150f, -10f)
+                            renderer.faceBasis = sB.copyOf()   // 复制：避免撕裂读 → 抖动
+                            val tm = FloatArray(16)
+                            tm[12] = sPx; tm[13] = sPy; tm[14] = sPz; tm[15] = 1f
+                            renderer.faceMatrix = tm
+                            renderer.faceRoll = 0f
+                        }
+
+                        // overlay 大小：固定物理宽度（眼镜常规 ~14cm），由 3D 投影自然缩放，
+                        // 不再用投影眼距驱动（侧脸时眼距缩小会让尺寸/距离跳变）。
+                        renderer.overlayWidthCm = 14f
 
                         if (now - lastMatrixLogAt > 500) {
                             lastMatrixLogAt = now
-                            android.util.Log.i(
-                                "gscp-ar",
-                                "face d=%.0fcm t=(%.1f,%.1f,%.1f) ypr=(%.2f,%.2f,%.2f)".format(
-                                    distance, matrix[12], matrix[13], matrix[14], yaw, pitch, roll,
-                                ),
+                            val t = renderer.faceMatrix
+                            val b = renderer.faceBasis
+                            val nx = b?.get(6) ?: 0f
+                            val ny = b?.get(7) ?: 0f
+                            val nz = b?.get(8) ?: 0f
+                            val p = ptsPx
+                            val msg = (
+                                "face %s d=%.0fcm t=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f) " +
+                                    "pts=re(%.0f,%.0f)le(%.0f,%.0f)no(%.0f,%.0f)rm(%.0f,%.0f)lm(%.0f,%.0f)"
+                                ).format(
+                                lastPoseMode, sDist,
+                                t?.get(12) ?: 0f, t?.get(13) ?: 0f, t?.get(14) ?: 0f,
+                                nx, ny, nz,
+                                p[0].first, p[0].second, p[1].first, p[1].second,
+                                p[2].first, p[2].second, p[3].first, p[3].second,
+                                p[4].first, p[4].second,
                             )
+                            android.util.Log.i("gscp-ar", msg)
                         }
                     }
-
-                    // 检测结果可视化（正立空间归一化）
-                    val det = FloatArray(14)
-                    for (i in 0 until 5) {
-                        det[i * 2] = (ptsPx[i].first / W).toFloat()
-                        det[i * 2 + 1] = (ptsPx[i].second / H).toFloat()
-                    }
-                    det[10] = (bx / W).toFloat()
-                    det[11] = (by / H).toFloat()
-                    det[12] = (bw / W).toFloat()
-                    det[13] = (bh / H).toFloat()
-                    renderer.detection = det
-                } else {
-                    renderer.detection = null
+                    } else {
+                    renderer.faceMatrix = null
                     firstFaceAtMillis = 0L
                     if (faceLocked && now - lastFaceAtMillis > 1000) {
                         faceLocked = false
+                        filterInit = false  // 丢脸后重置滤波，重新追踪时不滞后
+                        poseInit = false
                         renderer.faceMatrix = null
                         runOnUiThread { statusText.text = "等待人脸…" }
                     }
@@ -410,12 +534,7 @@ class ArActivity : AppCompatActivity() {
         enterArScreen("连接眼镜中…")
     }
 
-    /** 无眼镜：跳过连接，用半透明测试图层验证人脸追踪与锚定。 */
-    private fun startTestTracking() {
-        renderer.useTestPattern = true
-        renderer.overlayAspect = 4f / 3f
-        enterArScreen("测试模式：请正对手机摄像头")
-    }
+    /* 无眼镜测试模式已移除（含参考半透明平面）。 */
 
     private fun enterArScreen(status: String) {
         settingsPanel.visibility = View.GONE
@@ -456,15 +575,29 @@ class ArActivity : AppCompatActivity() {
         override fun onAudioPackage(buffer: ByteArray, offset: Int, length: Int) {}
 
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
-            renderer.overlayAspect = width.toFloat() / height
+            // 叠加区域固定为正方形 480×480：宽高比用 1.0，避免发生拉伸。
+            renderer.overlayAspect = 1f
             runOnUiThread {
                 statusText.text = "overlay ${width}×${height}，请正对手机摄像头"
-                overlayDecoder?.start(width, height, renderer.getOverlaySurface())
+                try {
+                    val surf = renderer.getOverlaySurfaceOrNull()
+                    if (surf != null) {
+                        overlayDecoder?.start(width, height, surf)
+                    } else {
+                        android.util.Log.w("gscp-ar", "overlay GL 未就绪，跳过解码（避免崩溃）")
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("gscp-ar", "overlay prepare 失败", e)
+                }
             }
         }
 
         override fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int) {
-            overlayDecoder?.decode(buffer, offset, length)
+            try {
+                overlayDecoder?.decode(buffer, offset, length)
+            } catch (e: Exception) {
+                android.util.Log.w("gscp-ar", "overlay 解码中断", e)
+            }
         }
 
         override fun onDisconnect() {
@@ -494,18 +627,114 @@ class ArActivity : AppCompatActivity() {
 
     // ── 通用 ─────────────────────────────────────────────────
 
-    private fun bindSeekBar(id: Int, initial: Int, min: Int, max: Int, onChange: (Int) -> Unit) {
-        val bar = findViewById<SeekBar>(id)
-        bar.max = max
-        bar.progress = initial.coerceIn(min, max)
-        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(b: SeekBar, value: Int, fromUser: Boolean) {
-                onChange(value.coerceIn(min, max))
+    /**
+     * 用 5 点重建金字塔底面平面姿态（投影法）：
+     * - 周围 4 点（眼/嘴）作为底面投影、中间点（鼻尖）作为顶点投影，顶点高度 = 0.5 瞳距；
+     * - solvePnP 解出底面平面在相机系的姿态；
+     * - 返回 [右,上,法线]（渲染器世界系、单位向量，法线朝向相机，9 个 float）
+     *   与 overlay 平面中心（cm）——取「底面沿法线前移 3 个瞳距」；
+     * - 失败返回 null（调用方回退到平行画面 roll 贴纸）。
+     */
+    private fun solveOverlayPose(
+        rex: Double, rey: Double, lex: Double, ley: Double,
+        nx: Double, ny: Double, rmx: Double, rmy: Double,
+        lmx: Double, lmy: Double, focalPx: Double, w: Int, h: Int,
+    ): Pair<FloatArray, FloatArray>? {
+        val ipd = IPD_CM         // 瞳距（cm）
+        val half = ipd / 2.0
+        val noseH = ipd / 2.0    // 顶点（鼻尖）高度 = 0.5 瞳距（用户指定固定值）
+        val noseY = ipd * 0.5    // 鼻尖在眼线下 0.5 瞳距（真实地标比例标定）
+        val mouthHalf = ipd * 0.44
+        val mouthY = -ipd * 0.95 // 嘴角到眼线垂直 = 0.95 瞳距（真实地标比例标定）
+        val obj = MatOfPoint3f(
+            Point3(half, 0.0, 0.0),             // 右眼
+            Point3(-half, 0.0, 0.0),            // 左眼
+            Point3(0.0, -noseY, noseH),          // 鼻尖 = 顶点（眼线下、朝相机 +z）
+            Point3(mouthHalf, mouthY, 0.0),      // 右嘴角
+            Point3(-mouthHalf, mouthY, 0.0),     // 左嘴角
+        )
+        val img = MatOfPoint2f(
+            Point(rex, rey), Point(lex, ley), Point(nx, ny),
+            Point(rmx, rmy), Point(lmx, lmy),
+        )
+        val cam = Mat(3, 3, CvType.CV_64FC1)
+        cam.put(0, 0, focalPx, 0.0, w / 2.0)
+        cam.put(1, 0, 0.0, focalPx, h / 2.0)
+        cam.put(2, 0, 0.0, 0.0, 1.0)
+        val dist = MatOfDouble(0.0, 0.0, 0.0, 0.0, 0.0)
+        val rvec = Mat()
+        val tvec = Mat()
+        val ok = try {
+            // EPNP：支持 4+ 点、无外部位姿初值（ITERATIVE 无初值时内部 DLT 需 ≥6 点，5 点会抛异常）
+            Calib3d.solvePnP(obj, img, cam, dist, rvec, tvec, false, Calib3d.SOLVEPNP_EPNP)
+        } catch (e: Throwable) {
+            android.util.Log.w("gscp-ar", "solvePnP 异常", e)
+            false
+        }
+        if (ok) {
+            try {
+                val rmat = Mat(3, 3, CvType.CV_64FC1)
+                Calib3d.Rodrigues(rvec, rmat)
+                // 抗「侧脸瞳距缩小被误读为距离变大」：
+                // 用竖向眼-嘴跨度定深（yaw 不改变竖向投影长度），
+                // depth = f·|mouthY·R[1][1]| / projV_px，再把横向分量按该深度等比修正。
+                val projV =
+                    kotlin.math.abs((rmy + lmy) / 2.0 - (rey + ley) / 2.0).coerceAtLeast(1.0)
+                val rvY = kotlin.math.abs(rmat.get(1, 1)[0]).coerceAtLeast(0.05)
+                val depth = focalPx * (ipd * 0.95) * rvY / projV
+                val tz = tvec.get(2, 0)[0]
+                val scale = if (tz > 1.0) depth / tz else 1.0
+                // renderer 世界系：x 同向、y 向上(z=-sp.z)、z 朝相机。先把 tvec 折好转到渲染器
+                val bx = tvec.get(0, 0)[0] * scale
+                val by = -tvec.get(1, 0)[0] * scale
+                val bz = -depth
+                // 旋转矩阵各轴（模型: x右,y上,z朝相机；统一按渲染器 T=(x,-y,-z) 变换）
+                var rx = rmat.get(0, 0)[0]; var ry = -rmat.get(1, 0)[0]; var rz = -rmat.get(2, 0)[0]
+                var ux = rmat.get(0, 1)[0]; var uy = -rmat.get(1, 1)[0]; var uz = -rmat.get(2, 1)[0]
+                var qx = rmat.get(0, 2)[0]; var qy = -rmat.get(1, 2)[0]; var qz = -rmat.get(2, 2)[0]
+                // 法线朝相机（+渲染器 z）
+                val ql = kotlin.math.sqrt(qx * qx + qy * qy + qz * qz).coerceAtLeast(1e-6)
+                qx /= ql; qy /= ql; qz /= ql
+                if (qz < 0) { qx = -qx; qy = -qy; qz = -qz }
+                // 归一化右/上
+                var rl = kotlin.math.sqrt(rx * rx + ry * ry + rz * rz).coerceAtLeast(1e-6)
+                rx /= rl; ry /= rl; rz /= rl
+                var ul = kotlin.math.sqrt(ux * ux + uy * uy + uz * uz).coerceAtLeast(1e-6)
+                ux /= ul; uy /= ul; uz /= ul
+                // overlay 中心 = 底面中心 + 3 瞳距 × 法线（朝相机）
+                val ox = bx + 3 * ipd * qx
+                val oy = by + 3 * ipd * qy
+                val oz = bz + 3 * ipd * qz
+                rmat.release()
+                rvec.release(); tvec.release(); cam.release(); dist.release()
+                obj.release(); img.release()
+                return Pair(
+                    floatArrayOf(rx.toFloat(), ry.toFloat(), rz.toFloat(),
+                                 ux.toFloat(), uy.toFloat(), uz.toFloat(),
+                                 qx.toFloat(), qy.toFloat(), qz.toFloat()),
+                    floatArrayOf(ox.toFloat(), oy.toFloat(), oz.toFloat()),
+                )
+            } catch (e: Throwable) {
+                android.util.Log.w("gscp-ar", "pose 构造异常", e)
             }
+        }
+        android.util.Log.w("gscp-ar", "solvePnP 返回 false，回退平面")
+        rvec.release(); tvec.release(); cam.release(); dist.release()
+        obj.release(); img.release()
+        return null
+    }
 
-            override fun onStartTrackingTouch(b: SeekBar) {}
-            override fun onStopTrackingTouch(b: SeekBar) {}
-        })
+    /** 列主序 4×4 矩阵乘法 out = a·b（与渲染器 multiply 同一约定）。 */
+    private fun multiplyCm(a: FloatArray, b: FloatArray, out: FloatArray) {
+        for (col in 0 until 4) {
+            for (row in 0 until 4) {
+                var sum = 0f
+                for (k in 0 until 4) {
+                    sum += a[k * 4 + row] * b[col * 4 + k]
+                }
+                out[col * 4 + row] = sum
+            }
+        }
     }
 
     @Deprecated("Deprecated in Java")

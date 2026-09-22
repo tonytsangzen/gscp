@@ -4,3 +4,7 @@
 /tauri
 .swp
 .cargo/
+
+.gradle-home/
+.pylibs/
+*.swp
