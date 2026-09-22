@@ -161,6 +161,10 @@ class ArActivity : AppCompatActivity() {
                 val provider = future.get()
                 val preview = Preview.Builder().build()
                 preview.setSurfaceProvider { request ->
+                    renderer.setCameraResolution(
+                        request.resolution.width,
+                        request.resolution.height,
+                    )
                     request.provideSurface(
                         surface,
                         ContextCompat.getMainExecutor(this),

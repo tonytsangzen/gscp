@@ -69,6 +69,18 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     /** 相机就绪回调（GL 线程初始化完成后触发）。 */
     var onCameraSurfaceReady: (Surface) -> Unit = {}
 
+    /** 相机实际缓冲尺寸（由 CameraX SurfaceRequest 提供，背景等比缩放依据）。 */
+    @Volatile
+    var cameraBufferWidth = 1280f
+
+    @Volatile
+    var cameraBufferHeight = 720f
+
+    fun setCameraResolution(w: Int, h: Int) {
+        cameraBufferWidth = w.coerceAtLeast(1).toFloat()
+        cameraBufferHeight = h.coerceAtLeast(1).toFloat()
+    }
+
     private var overlaySurfaceTexture: SurfaceTexture? = null
     private var overlayTextureId = 0
     private var cameraSurfaceTexture: SurfaceTexture? = null
@@ -157,6 +169,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         testUAlpha = GLES20.glGetUniformLocation(testProgram, "uAlpha")
 
         testTextureId = createTestTexture()
+        android.util.Log.i("gscp-ar", "renderer ready (build 20260922.2, ${viewportW}x$viewportH)")
         onCameraSurfaceReady(cameraSurface!!)
     }
 
@@ -268,9 +281,9 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     }
 
     private fun drawFullscreen(tex: Int) {
-        // 背景等比缩放（cover 裁剪）：旋转后图像尺寸 → 视口覆盖采样比例
-        val imgW = if (outputRotationQuadrant % 2 == 1) 720f else 1280f
-        val imgH = if (outputRotationQuadrant % 2 == 1) 1280f else 720f
+        // 背景等比缩放（cover 裁剪）：按相机实际缓冲尺寸（旋转后）→ 视口覆盖
+        val imgW = if (outputRotationQuadrant % 2 == 1) cameraBufferHeight else cameraBufferWidth
+        val imgH = if (outputRotationQuadrant % 2 == 1) cameraBufferWidth else cameraBufferHeight
         val cover = maxOf(viewportW / imgW, viewportH / imgH)
         cropFx = (viewportW / cover / imgW).coerceIn(0f, 1f)
         cropFy = (viewportH / cover / imgH).coerceIn(0f, 1f)
