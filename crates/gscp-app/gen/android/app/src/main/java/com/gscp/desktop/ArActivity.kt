@@ -289,6 +289,17 @@ class ArActivity : AppCompatActivity() {
                         Pair(g(10) + cropX, g(11) + cropY),
                         Pair(g(12) + cropX, g(13) + cropY),
                     )
+                    // 检测结果可视化（正立空间归一化）
+                    val det = FloatArray(14)
+                    for (i in 0 until 5) {
+                        det[i * 2] = (ptsPx[i].first / W).toFloat()
+                        det[i * 2 + 1] = (ptsPx[i].second / H).toFloat()
+                    }
+                    det[10] = (bx / W).toFloat()
+                    det[11] = (by / H).toFloat()
+                    det[12] = (bw / W).toFloat()
+                    det[13] = (bh / H).toFloat()
+                    renderer.detection = det
 
                     val now = System.currentTimeMillis()
                     if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
@@ -388,6 +399,7 @@ class ArActivity : AppCompatActivity() {
                     roiRect.set(rx0.toFloat(), ry0.toFloat(), (rx0 + side).toFloat(), (ry0 + side).toFloat())
                     roiActive = true
                 } else {
+                    renderer.detection = null
                     firstFaceAtMillis = 0L
                     if (roiActive) {
                         roiLostFrames++

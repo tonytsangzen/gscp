@@ -89,6 +89,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var testUTexture = 0
     private var testUMvp = 0
     private var testUAlpha = 0
+    private var markerProgram = 0
+    private var markerAPosition = 0
+    private var markerUColor = 0
+    private val markerBuffer: FloatBuffer = ByteBuffer
+        .allocateDirect(120 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
     private var viewportW = 1
     private var viewportH = 1
 
@@ -170,6 +175,12 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         testUTexture = GLES20.glGetUniformLocation(testProgram, "uTexture")
         testUMvp = GLES20.glGetUniformLocation(testProgram, "uMvp")
         testUAlpha = GLES20.glGetUniformLocation(testProgram, "uAlpha")
+
+        testTextureId = createTestTexture()
+
+        markerProgram = buildProgram(SOLID_FRAGMENT)
+        markerAPosition = GLES20.glGetAttribLocation(markerProgram, "aPosition")
+        markerUColor = GLES20.glGetUniformLocation(markerProgram, "uColor")
 
         testTextureId = createTestTexture()
         android.util.Log.i("gscp-ar", "renderer ready build=20260922.3 viewport=${viewportW}x$viewportH")
@@ -268,6 +279,56 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         mvp[0] *= ndcX; mvp[4] *= ndcX; mvp[8] *= ndcX; mvp[12] *= ndcX
         mvp[1] *= ndcY; mvp[5] *= ndcY; mvp[9] *= ndcY; mvp[13] *= ndcY
         drawOverlayQuad()
+
+        // 检测结果可视化：5 特征点（品红）+ 人脸框（绿）
+        detection?.let { d ->
+            if (d.size >= 14) drawMarkers(d, ndcX, ndcY)
+        }
+    }
+
+    /** 在背景区域内绘制 5 特征点与人脸框（输入为正立空间归一化坐标）。 */
+    private fun drawMarkers(d: FloatArray, ndcX: Float, ndcY: Float) {
+        GLES20.glUseProgram(markerProgram)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        val vb = markerBuffer
+        vb.clear()
+        fun quad(cx: Float, cy: Float, hw: Float, hh: Float) {
+            val x0 = cx - hw; val x1 = cx + hw
+            val y0 = cy - hh; val y1 = cy + hh
+            vb.put(x0).put(y1); vb.put(x0).put(y0); vb.put(x1).put(y0)
+            vb.put(x0).put(y1); vb.put(x1).put(y0); vb.put(x1).put(y1)
+        }
+        val pr = 0.012f
+        for (i in 0 until 5) {
+            val nx = (d[i * 2] - 0.5f) * 2f * ndcX
+            val ny = (0.5f - d[i * 2 + 1]) * 2f * ndcY
+            quad(nx, ny, pr * 0.5f / maxOf(ndcX, 0.001f), pr * 0.5f / maxOf(ndcY, 0.001f))
+        }
+        vb.position(0)
+        GLES20.glVertexAttribPointer(markerAPosition, 2, GLES20.GL_FLOAT, false, 0, vb)
+        GLES20.glEnableVertexAttribArray(markerAPosition)
+        GLES20.glUniform4f(markerUColor, 1f, 0.2f, 1f, 0.95f)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 30)
+        GLES20.glDisableVertexAttribArray(markerAPosition)
+        // 人脸框（4 条边）
+        vb.clear()
+        val bx0 = (d[10] - 0.5f) * 2f * ndcX
+        val by1 = (0.5f - d[11]) * 2f * ndcY
+        val bx1 = (d[10] + d[12] - 0.5f) * 2f * ndcX
+        val by0 = (0.5f - d[11] - d[13]) * 2f * ndcY
+        val th = 0.004f
+        quad((bx0 + bx1) / 2, by1, (bx1 - bx0) / 2, th)
+        quad((bx0 + bx1) / 2, by0, (bx1 - bx0) / 2, th)
+        quad(bx0, (by0 + by1) / 2, th, (by1 - by0) / 2)
+        quad(bx1, (by0 + by1) / 2, th, (by1 - by0) / 2)
+        vb.position(0)
+        GLES20.glVertexAttribPointer(markerAPosition, 2, GLES20.GL_FLOAT, false, 0, vb)
+        GLES20.glEnableVertexAttribArray(markerAPosition)
+        GLES20.glUniform4f(markerUColor, 0.2f, 1f, 0.3f, 0.9f)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 24)
+        GLES20.glDisableVertexAttribArray(markerAPosition)
+        GLES20.glDisable(GLES20.GL_BLEND)
     }
 
     private fun drawOverlayQuad() {
@@ -488,6 +549,14 @@ private val OES_FRAGMENT = """
     void main() {
         vec4 c = texture2D(uTexture, vTexCoord);
         gl_FragColor = vec4(c.rgb, c.a * uAlpha);
+    }
+"""
+
+private val SOLID_FRAGMENT = """
+    precision mediump float;
+    uniform vec4 uColor;
+    void main() {
+        gl_FragColor = uColor;
     }
 """
 
