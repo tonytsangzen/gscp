@@ -196,9 +196,9 @@ class ArActivity : AppCompatActivity() {
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumFaces(3)
-            .setMinFaceDetectionConfidence(0.3f)
-            .setMinFacePresenceConfidence(0.3f)
-            .setMinTrackingConfidence(0.3f)
+            .setMinFaceDetectionConfidence(0.5f)
+            .setMinFacePresenceConfidence(0.5f)
+            .setMinTrackingConfidence(0.5f)
             .setOutputFacialTransformationMatrixes(true)
             .setResultListener { result, _ ->
                 val now = System.currentTimeMillis()
