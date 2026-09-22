@@ -81,10 +81,14 @@ class ArActivity : AppCompatActivity() {
 
         distanceCm = prefs.getInt("arDistanceCm", 40)
         sizePercent = prefs.getInt("arSizePercent", 100)
+        rotationQuadrant = prefs.getInt("arRotationQuadrant", 1)
+        mirror = prefs.getBoolean("arMirror", true)
 
         renderer = ArOverlayRenderer().apply {
             planeDistance = distanceCm.toFloat()
             planeScale = sizePercent / 100f
+            outputRotationQuadrant = rotationQuadrant
+            outputMirror = mirror
         }
         renderer.onCameraSurfaceReady = { surface ->
             runOnUiThread {
@@ -107,11 +111,13 @@ class ArActivity : AppCompatActivity() {
         findViewById<Button>(R.id.button_rotate).setOnClickListener {
             rotationQuadrant = (rotationQuadrant + 1) % 4
             renderer.outputRotationQuadrant = rotationQuadrant
+            prefs.edit().putInt("arRotationQuadrant", rotationQuadrant).apply()
             statusText.text = "旋转=${rotationQuadrant * 90}° 镜像=${if (mirror) "开" else "关"}"
         }
         findViewById<Button>(R.id.button_mirror).setOnClickListener {
             mirror = !mirror
             renderer.outputMirror = mirror
+            prefs.edit().putBoolean("arMirror", mirror).apply()
             statusText.text = "旋转=${rotationQuadrant * 90}° 镜像=${if (mirror) "开" else "关"}"
         }
         bindSeekBar(R.id.ar_distance, distanceCm, 20, 120) { v ->

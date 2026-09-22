@@ -270,8 +270,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val baseUv = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f, 1f)
         val out = FloatArray(24)
         for (i in 0 until 6) {
-            var u = baseUv[i * 4 + 2]
-            var v = baseUv[i * 4 + 3]
+            var u = baseUv[i * 2]
+            var v = baseUv[i * 2 + 1]
             if (mirror) u = 1f - u
             val rotated: FloatArray = when (q) {
                 1 -> floatArrayOf(v, 1f - u)
