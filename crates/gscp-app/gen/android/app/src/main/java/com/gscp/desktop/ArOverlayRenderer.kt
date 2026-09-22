@@ -185,6 +185,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         markerProgram = buildProgram(SOLID_FRAGMENT)
         markerAPosition = GLES20.glGetAttribLocation(markerProgram, "aPosition")
         markerUColor = GLES20.glGetUniformLocation(markerProgram, "uColor")
+        // 标记顶点直接给 NDC 坐标：uMvp 恒为单位阵（默认 0 阵会导致全部被裁剪）
+        GLES20.glUseProgram(markerProgram)
+        GLES20.glUniformMatrix4fv(
+            GLES20.glGetUniformLocation(markerProgram, "uMvp"), 1, false, identity, 0,
+        )
 
         testTextureId = createTestTexture()
         android.util.Log.i("gscp-ar", "renderer ready build=20260922.3 viewport=${viewportW}x$viewportH")
@@ -307,7 +312,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         for (i in 0 until 5) {
             val nx = (d[i * 2] - 0.5f) * 2f * ndcX
             val ny = (0.5f - d[i * 2 + 1]) * 2f * ndcY
-            quad(nx, ny, pr * 0.5f / maxOf(ndcX, 0.001f), pr * 0.5f / maxOf(ndcY, 0.001f))
+            quad(nx, ny, 0.012f, 0.012f)
         }
         vb.position(0)
         GLES20.glVertexAttribPointer(markerAPosition, 2, GLES20.GL_FLOAT, false, 0, vb)
