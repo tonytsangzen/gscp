@@ -59,6 +59,13 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     @Volatile
     var outputMirror = true
 
+    // 背景等比缩放的采样比例（fx, fy ≤ 1 = 裁剪放大），overlay 投影同步补偿
+    @Volatile
+    var cropFx = 1f
+
+    @Volatile
+    var cropFy = 1f
+
     /** 相机就绪回调（GL 线程初始化完成后触发）。 */
     var onCameraSurfaceReady: (Surface) -> Unit = {}
 
@@ -210,6 +217,10 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
                 proj[0] = -proj[0]
                 proj[8] = -proj[8]
             }
+            // 等比裁剪补偿（作用在旋转后的显示轴上）：FOV 随裁剪同步收窄，
+            // overlay 平面与背景画面的位置/大小保持一致。
+            proj[0] *= cropFx
+            proj[5] *= cropFy
         }
 
         // 平面位于「相机→人脸」方向、深度 = planeDistance（厘米）处；
@@ -257,32 +268,40 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     }
 
     private fun drawFullscreen(tex: Int) {
+        // 背景等比缩放（cover 裁剪）：旋转后图像尺寸 → 视口覆盖采样比例
+        val imgW = if (outputRotationQuadrant % 2 == 1) 720f else 1280f
+        val imgH = if (outputRotationQuadrant % 2 == 1) 1280f else 720f
+        val cover = maxOf(viewportW / imgW, viewportH / imgH)
+        cropFx = (viewportW / cover / imgW).coerceIn(0f, 1f)
+        cropFy = (viewportH / cover / imgH).coerceIn(0f, 1f)
+
         GLES20.glUseProgram(oesProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
         GLES20.glUniform1i(oesUTexture, 0)
         GLES20.glUniformMatrix4fv(oesUMvp, 1, false, identity, 0)
         GLES20.glUniform1f(oesUAlpha, 1f)
-        // 背景 UV 按输出旋转象限 + 前摄镜像变换（与 overlay 投影旋转一致）
+        // 背景 UV 按输出旋转象限 + 前摄镜像 + 等比裁剪变换
         val q = outputRotationQuadrant % 4
         val mirror = outputMirror
         val pos = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f, 1f)
         val baseUv = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f, 1f)
         val out = FloatArray(24)
         for (i in 0 until 6) {
-            var u = baseUv[i * 2]
-            var v = baseUv[i * 2 + 1]
-            if (mirror) u = 1f - u
-            val rotated: FloatArray = when (q) {
-                1 -> floatArrayOf(v, 1f - u)
-                2 -> floatArrayOf(1f - u, 1f - v)
-                3 -> floatArrayOf(1f - v, u)
+            var u = baseUv[i * 2] - 0.5f
+            var v = baseUv[i * 2 + 1] - 0.5f
+            if (mirror) u = -u
+            // 逆旋转（象限 q 的显示旋转的逆），再按裁剪比例采样
+            val un: FloatArray = when (q) {
+                1 -> floatArrayOf(v, -u)
+                2 -> floatArrayOf(-u, -v)
+                3 -> floatArrayOf(-v, u)
                 else -> floatArrayOf(u, v)
             }
             out[i * 4] = pos[i * 2]
             out[i * 4 + 1] = pos[i * 2 + 1]
-            out[i * 4 + 2] = rotated[0]
-            out[i * 4 + 3] = rotated[1]
+            out[i * 4 + 2] = 0.5f + un[0] * cropFx
+            out[i * 4 + 3] = 0.5f + un[1] * cropFy
         }
         fullscreenVertexBuffer.clear()
         fullscreenVertexBuffer.put(out).position(0)
