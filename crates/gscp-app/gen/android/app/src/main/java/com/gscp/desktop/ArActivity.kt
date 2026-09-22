@@ -57,8 +57,7 @@ class ArActivity : AppCompatActivity() {
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
     private val lock = Any()
-    private var rotationQuadrant = 1
-    private var mirror = true
+    private var flipNormal = false
 
     // 可调参数
     private var distanceCm = 40      // 平面目标深度（厘米，20..120）
@@ -81,14 +80,10 @@ class ArActivity : AppCompatActivity() {
 
         distanceCm = prefs.getInt("arDistanceCm", 40)
         sizePercent = prefs.getInt("arSizePercent", 100)
-        rotationQuadrant = prefs.getInt("arRotationQuadrant", 1)
-        mirror = prefs.getBoolean("arMirror", true)
 
         renderer = ArOverlayRenderer().apply {
             planeDistance = distanceCm.toFloat()
             planeScale = sizePercent / 100f
-            outputRotationQuadrant = rotationQuadrant
-            outputMirror = mirror
         }
         renderer.onCameraSurfaceReady = { surface ->
             runOnUiThread {
@@ -108,17 +103,9 @@ class ArActivity : AppCompatActivity() {
         connectButton.setOnClickListener { startAr() }
         findViewById<Button>(R.id.button_test).setOnClickListener { startTestTracking() }
         findViewById<Button>(R.id.button_exit).setOnClickListener { exitAr() }
-        findViewById<Button>(R.id.button_rotate).setOnClickListener {
-            rotationQuadrant = (rotationQuadrant + 1) % 4
-            renderer.outputRotationQuadrant = rotationQuadrant
-            prefs.edit().putInt("arRotationQuadrant", rotationQuadrant).apply()
-            statusText.text = "旋转=${rotationQuadrant * 90}° 镜像=${if (mirror) "开" else "关"}"
-        }
-        findViewById<Button>(R.id.button_mirror).setOnClickListener {
-            mirror = !mirror
-            renderer.outputMirror = mirror
-            prefs.edit().putBoolean("arMirror", mirror).apply()
-            statusText.text = "旋转=${rotationQuadrant * 90}° 镜像=${if (mirror) "开" else "关"}"
+        findViewById<Button>(R.id.button_flip).setOnClickListener {
+            flipNormal = !flipNormal
+            renderer.flipNormal = flipNormal
         }
         bindSeekBar(R.id.ar_distance, distanceCm, 20, 120) { v ->
             distanceCm = v
@@ -175,17 +162,12 @@ class ArActivity : AppCompatActivity() {
                     .build()
                     .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
                 provider.unbindAll()
-                val camera = provider.bindToLifecycle(
+                provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_FRONT_CAMERA,
                     preview,
                     analysis,
                 )
-                // 相机传感器与竖屏显示的旋转差：背景与 overlay 投影同象限旋转，
-                // 保证画面方向正确且锚定不错位。
-                val delta = camera.cameraInfo.getSensorRotationDegrees(0)
-                renderer.outputRotationQuadrant = (delta / 90) % 4
-                renderer.outputMirror = true
                 statusText.text = "等待人脸…"
             } catch (e: Exception) {
                 statusText.text = "相机启动失败: ${e.message}"

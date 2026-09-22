@@ -128,32 +128,11 @@
                 android:layout_height="wrap_content"
                 android:max="200" />
 
-            <LinearLayout
+            <Button
+                android:id="@+id/button_flip"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/button_rotate"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="旋转 90°" />
-
-                <Button
-                    android:id="@+id/button_mirror"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="镜像" />
-
-                <Button
-                    android:id="@+id/button_flip"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="法线翻转" />
-            </LinearLayout>
+                android:text="法线翻转" />
         </LinearLayout>
     </FrameLayout>
 
