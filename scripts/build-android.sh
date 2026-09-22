@@ -26,18 +26,31 @@ if [[ -z "${ANDROID_HOME:-}" ]]; then
   done
 fi
 [[ -n "${ANDROID_HOME:-}" && -d "$ANDROID_HOME" ]] || { echo "✗ 未找到 Android SDK（设置 ANDROID_HOME）"; exit 1; }
+export ANDROID_HOME
 
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64)   PREBUILT=darwin-arm64 ;;
+  # NDK 不提供 darwin-arm64 预构建：Apple Silicon 经 Rosetta 运行 x86_64 版
+  Darwin-arm64)   PREBUILT=darwin-x86_64 ;;
   Darwin-x86_64)  PREBUILT=darwin-x86_64 ;;
   Linux-x86_64)   PREBUILT=linux-x86_64 ;;
   *) echo "✗ 未识别主机 $(uname -s)-$(uname -m)"; exit 1 ;;
 esac
 
+
 if [[ -z "${NDK_HOME:-}" ]]; then
   NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1 || true)"
 fi
 [[ -n "${NDK_HOME:-}" && -d "$NDK_HOME" ]] || { echo "✗ 未找到 NDK（$ANDROID_HOME/ndk/）"; exit 1; }
+
+# 兜底：所选预构建目录不存在时，在常见变体中探测
+if [[ ! -d "$NDK_HOME/toolchains/llvm/prebuilt/$PREBUILT" ]]; then
+  for cand in darwin-arm64 darwin-x86_64 linux-x86_64; do
+    if [[ -d "$NDK_HOME/toolchains/llvm/prebuilt/$cand" ]]; then
+      PREBUILT=$cand; break
+    fi
+  done
+fi
+[[ -d "$NDK_HOME/toolchains/llvm/prebuilt/$PREBUILT" ]] || { echo "✗ NDK 预构建目录缺失"; exit 1; }
 
 TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/$PREBUILT/bin"
 export PATH="$TOOLCHAIN:$PATH"
