@@ -97,13 +97,12 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
 
     private val quadVertexBuffer: FloatBuffer = floatBufferOf(
         // x, y, u, v —— 单位平面（中心原点）
-        // 内容逆时针旋转 90°
-        -0.5f, 0.5f, 0f, 1f,
-        -0.5f, -0.5f, 1f, 1f,
-        0.5f, -0.5f, 1f, 0f,
-        -0.5f, 0.5f, 0f, 1f,
-        0.5f, -0.5f, 1f, 0f,
-        0.5f, 0.5f, 0f, 0f,
+        -0.5f, 0.5f, 0f, 0f,
+        -0.5f, -0.5f, 0f, 1f,
+        0.5f, -0.5f, 1f, 1f,
+        -0.5f, 0.5f, 0f, 0f,
+        0.5f, -0.5f, 1f, 1f,
+        0.5f, 0.5f, 1f, 0f,
     )
     private val fullscreenVertexBuffer: FloatBuffer = run {
         val b = ByteBuffer.allocateDirect(24 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -120,6 +119,22 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private val mvp = FloatArray(16)
     private val proj = FloatArray(16)
     private val model = FloatArray(16)
+
+    // 位姿指数平滑状态（抑制 MediaPipe 每帧抖动）
+    // 系数：越小越稳（延迟越大）
+    private val SMOOTH_ALPHA_T = 0.45f
+    private val SMOOTH_ALPHA_R = 0.3f
+    private val smoothT = FloatArray(3)
+    private val smoothR = FloatArray(16)
+    private var smoothValid = false
+
+    /** 屏幕显示 = 分析帧绕视线轴顺时针旋转 90°（相机空间 Rz(-90)，实测校准）。 */
+    private val screenRotation = floatArrayOf(
+        0f, -1f, 0f, 0f,
+        1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    )
 
     /** overlay 解码目标 Surface（MediaCodec 直渲染到我们的纹理）。 */
     fun getOverlaySurface(): Surface {
@@ -177,8 +192,17 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         }
         drawFullscreen(cameraTextureId)
 
-        // 前景：overlay 平面（未锁定人脸时不画）
-        val face = faceMatrix ?: return
+        // 前景：overlay 平面（未锁定人脸时不画）。
+        // 人脸矩阵在分析帧坐标系（未旋转），先旋转到屏幕显示方向。
+        val faceRaw = faceMatrix
+        if (faceRaw == null) {
+            smoothValid = false
+            return
+        }
+        val faceRot = FloatArray(16)
+        multiply(screenRotation, faceRaw, faceRot)
+        val face = FloatArray(16)
+        smoothFace(faceRot, face)
         try {
             overlaySurfaceTexture?.updateTexImage()
         } catch (_: Exception) {
@@ -347,7 +371,7 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        c.drawColor(0x5930E0A0.toInt()) // 半透明青绿底
+        c.drawColor(0xD930E0A0.toInt()) // 高不透明度青绿底（试验期便于观察）
         paint.color = 0xFFEFFF00.toInt()
         paint.style = android.graphics.Paint.Style.STROKE
         paint.strokeWidth = s * 0.02f
@@ -404,6 +428,42 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         GLES20.glAttachShader(program, fs)
         GLES20.glLinkProgram(program)
         return program
+    }
+
+    /**
+     * 位姿指数平滑：平移线性插值，旋转列线性插值后 Gram-Schmidt 正交化。
+     * 人脸丢失（smoothValid 复位）后下一帧直接贴合，避免回跳。
+     */
+    private fun smoothFace(faceRot: FloatArray, out: FloatArray) {
+        if (!smoothValid) {
+            for (i in 0..2) smoothT[i] = faceRot[12 + i]
+            for (i in 0..15) smoothR[i] = faceRot[i]
+            smoothValid = true
+        } else {
+            for (i in 0..2) smoothT[i] += (faceRot[12 + i] - smoothT[i]) * SMOOTH_ALPHA_T
+            for (i in 0..15) smoothR[i] += (faceRot[i] - smoothR[i]) * SMOOTH_ALPHA_R
+        }
+        for (i in 0..15) out[i] = smoothR[i]
+        out[12] = smoothT[0]; out[13] = smoothT[1]; out[14] = smoothT[2]
+        // Gram-Schmidt 正交化旋转列，防止插值漂移导致剪切
+        normalizeCol(out, 0)
+        // 列 1 减去其在列 0 上的投影
+        var d = out[0] * out[4] + out[1] * out[5] + out[2] * out[6]
+        for (i in 0..2) out[4 + i] -= d * out[i]
+        normalizeCol(out, 1)
+        // 列 2 = 列 0 × 列 1
+        out[8] = out[1] * out[6] - out[2] * out[5]
+        out[9] = out[2] * out[4] - out[0] * out[6]
+        out[10] = out[0] * out[5] - out[1] * out[4]
+        out[3] = 0f; out[7] = 0f; out[11] = 0f; out[15] = 1f
+    }
+
+    private fun normalizeCol(m: FloatArray, col: Int) {
+        val b = col * 4
+        val len = kotlin.math.sqrt(m[b] * m[b] + m[b + 1] * m[b + 1] + m[b + 2] * m[b + 2])
+        if (len > 1e-6f) {
+            m[b] /= len; m[b + 1] /= len; m[b + 2] /= len
+        }
     }
 
     private fun multiply(a: FloatArray, b: FloatArray, out: FloatArray) {
