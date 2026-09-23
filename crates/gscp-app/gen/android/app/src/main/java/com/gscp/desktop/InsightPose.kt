@@ -30,7 +30,9 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
     companion object {
         private const val IPD_CM = 6.2f
         private const val TAG = "gscp-ar"
-        private const val DET = 640
+        // 真机实测：NNAPI 被 OS(SELinux)封锁、GPU 峰值 ~31 GFLOPS 不足以加速 640；
+        // CPU 下 640→480 约两倍提速（~274ms→~140ms），故 live 用 480。
+        private const val DET = 480
         private const val LM = 192
         private const val THR = 0.3f
         private const val NMS = 0.4f
@@ -45,6 +47,9 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
     private var detSess: OrtSession? = null
     private var lmSess: OrtSession? = null
     private var lmWarned = false
+    // 观测：det / lm 每 30 次打印一次平均耗时（ms）
+    private var detCnt = 0; private var detAcc = 0L
+    private var lmCnt = 0; private var lmAcc = 0L
     @Volatile
     private var ready = false
 
@@ -75,7 +80,13 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
             try {
                 val dOpts = OrtSession.SessionOptions()
                 val lOpts = OrtSession.SessionOptions()
-                // ONNX Runtime：与 ht 参考一致（CPU EP，稳定可靠；NNAPI 加速留作后续开关）
+                // CPU EP：全核利用 + 图形级优化，最大化 CPU 吞吐（NNAPI/GPU 在本机均无效）。
+                val cores = Runtime.getRuntime().availableProcessors()
+                dOpts.setIntraOpNumThreads(cores); dOpts.setInterOpNumThreads(1)
+                dOpts.setOptimizationLevel(ai.onnxruntime.OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                lOpts.setIntraOpNumThreads(cores); lOpts.setInterOpNumThreads(1)
+                lOpts.setOptimizationLevel(ai.onnxruntime.OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                // ONNX Runtime：与 ht 参考一致（CPU EP，稳定可靠）
                 detSess = env.createSession(File(filesDir, "det_10g.onnx").absolutePath, dOpts)
                 lmSess = env.createSession(File(filesDir, "1k3d68.onnx").absolutePath, lOpts)
             } catch (t: Throwable) {
@@ -116,7 +127,12 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         res.release(); detImg.release()
         val bx = ArrayList<FloatArray>(); val sc = ArrayList<Float>(); val kp = ArrayList<FloatArray>()
         var allScoreMax = 0f
-        val result = runOrt(sess, data, longArrayOf(1, 3, DET.toLong(), DET.toLong())) ?: return null
+        val t0 = System.nanoTime()
+        val result = runOrt(sess, data, longArrayOf(1, 3, DET.toLong(), DET.toLong())) ?: run {
+            detAcc += (System.nanoTime() - t0) / 1_000_000; if (++detCnt % 30 == 0) Log.i(TAG, "perf det=" + (detAcc / detCnt) + "ms")
+            return null
+        }
+        detAcc += (System.nanoTime() - t0) / 1_000_000; if (++detCnt % 30 == 0) Log.i(TAG, "perf det=" + (detAcc / detCnt) + "ms")
         try {
             val map = java.util.HashMap<String, ai.onnxruntime.OnnxTensor>()
             for (e in result) if (e.value is ai.onnxruntime.OnnxTensor) map[e.key] = e.value as ai.onnxruntime.OnnxTensor
@@ -243,6 +259,7 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         val blob = Dnn.blobFromImage(aimg, 1.0, Size(LM.toDouble(), LM.toDouble()), Scalar(0.0, 0.0, 0.0), true, false)
         val data = blobF(blob)
         mMat.release(); aimg.release()
+        val t0 = System.nanoTime()
         val result = runOrt(sess, data, longArrayOf(1, 3, LM.toLong(), LM.toLong())) ?: return null
         val pred: FloatArray
         try {
@@ -251,6 +268,7 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
             outer@ for (e in result) if (e.value is ai.onnxruntime.OnnxTensor) { fc = e.value as ai.onnxruntime.OnnxTensor; break@outer }
             pred = flattenF(fc?.getValue() ?: return null) ?: return null
         } finally { result.close() }
+        lmAcc += (System.nanoTime() - t0) / 1_000_000; if (++lmCnt % 30 == 0) Log.i(TAG, "perf lm=" + (lmAcc / lmCnt) + "ms")
         if (pred.size < 3309) { if (!lmWarned) { lmWarned = true; Log.w(TAG, "1k3d68 bad size=" + pred.size) }; return null }
         val base = pred.size / 3 - 68
         if (base < 0) return null
