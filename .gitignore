@@ -8,3 +8,9 @@
 .gradle-home/
 .pylibs/
 *.swp
+
+# local emulator artifacts (sandbox redirects home dirs into workspace)
+.avd/
+.emu/
+.emuhome/
+:memory:.ses

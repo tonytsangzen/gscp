@@ -65,6 +65,8 @@ class ArActivity : AppCompatActivity() {
     private var connection: ScrcpyConnection? = null
     private var overlayDecoder: VideoDecoder? = null
     private var detector: FaceDetectorYN? = null
+    /** insight_procrustes_coreml 管线（SCRFD det_10g → 1k3d68 → Procrustes） */
+    private var insight: InsightPose? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
 
     private var playing = false
@@ -120,6 +122,16 @@ class ArActivity : AppCompatActivity() {
 
         // OpenCV 本地库（AAR 自带）
         OpenCVLoader.initLocal()
+
+        // insight_procrustes_coreml 模型（assets → filesDir，异步加载不阻塞相机分析）
+        insight = InsightPose(assets, filesDir)
+        insight?.let { ip ->
+            Thread {
+                try { ip.ensureLoaded() } catch (t: Throwable) {
+                    android.util.Log.w("gscp-ar", "insight model init fail", t)
+                }
+            }.start()
+        }
 
         settingsPanel = findViewById(R.id.settings_panel)
         arPanel = findViewById(R.id.ar_panel)
@@ -274,30 +286,28 @@ class ArActivity : AppCompatActivity() {
             org.opencv.imgproc.Imgproc.cvtColor(
                 bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
             )
-            val faces = Mat()
-            detector.detect(bgr, faces)
+            // —— insight_procrustes_coreml：SCRFD det_10g 检测（bbox × 1 + 5 关键点）——
+            val ip = insight
+            val ins = if (ip?.isReady() == true) ip.detect(bgr) else null
             detectCount++
             if (detectCount % 60 == 1) {
                 android.util.Log.i(
                     "gscp-ar",
                     "detect#" + detectCount + " " + W + "x" + H +
-                        " faces=" + faces.rows(),
+                        " insight=" + (if (ins != null) "hit" else "miss"),
                 )
             }
 
-            // 取置信度最高的人脸（行 = [x,y,w,h, 右眼,左眼,鼻尖,右嘴,左嘴, score]）
+            // 取置信度最高的人脸：insight 只返回一行，行 = [x1,y1,x2,y2, 右眼,左眼,鼻,右嘴,左嘴]
             var best = -1
-            var bestScore = 0.0
-            for (r in 0 until faces.rows()) {
-                val score = faces.get(r, 14)[0]
-                if (score > bestScore) { bestScore = score; best = r }
-            }
+            if (ins != null) best = 0
             val hasFace = best >= 0
             synchronized(lock) {
                 val now = System.currentTimeMillis()
                 if (hasFace) {
-                    val g = { c: Int -> faces.get(best, c)[0] }
-                    val bx = g(0); val by = g(1); val bw = g(2); val bh = g(3)
+                    val det = ins!!
+                    val g = { c: Int -> det[c].toDouble() }
+                    val bx = g(0); val by = g(1); val bw = g(2) - g(0); val bh = g(3) - g(1)
                     val ptsPx = listOf(
                         Pair(g(4), g(5)),
                         Pair(g(6), g(7)),
@@ -362,23 +372,19 @@ class ArActivity : AppCompatActivity() {
 
                         // 用 5 点（眼/鼻/嘴）重建金字塔底面平面姿态：优先把 overlay 平面画到与该底面
                         // 平行、距底面 3 瞳距的位置；解算失败才回退到平行画面的 roll 贴纸。
-                        val mouthR = ptsPx[3]; val mouthL = ptsPx[4]
-                        val pose = solveOverlayPose(
-                            rex, rey, lex, ley, nx, ny,
-                            mouthR.first, mouthR.second, mouthL.first, mouthL.second,
-                            focal, W, H,
-                        )
-                        // 统一姿态候选：epnp 与『连续失败后的启发式回退』都先算候选 basis+pos，
+                        // —— 主路径改由 insight_procrustes_coreml（1k3d68+Procrustes）提供姿态 ——
+                        val poseArr = ip?.pose(bgr, floatArrayOf(bx.toFloat(), by.toFloat(), (bx + bw).toFloat(), (by + bh).toFloat()))
+                        // 统一姿态候选：insight 与『连续失败后的启发式回退』都先算候选 basis+pos，
                         // 再走同一个低通出口——避免回退分支把未平滑的原始 yaw/pitch/sRoll
                         // 直接写进渲染器（低通泄漏 → 未稳定时高频抖动）。
                         var candBasis = FloatArray(9)
                         var cpx = 0f; var cpy = 0f; var cpz = 0f
                         var hardUpdate = true
-                        if (pose != null) {
+                        if (poseArr != null) {
                             epnpFail = 0
-                            lastPoseMode = "epnp"
-                            candBasis = pose.first
-                            cpx = pose.second[0]; cpy = pose.second[1]; cpz = pose.second[2]
+                            lastPoseMode = "insight"
+                            candBasis = poseArr.copyOf(9)
+                            cpx = poseArr[9]; cpy = poseArr[10]; cpz = -poseArr[11]
                         } else {
                             epnpFail++
                             if (epnpFail >= 5) {
@@ -509,7 +515,6 @@ class ArActivity : AppCompatActivity() {
                     }
                 }
             }
-            faces.release()
             bgr.release()
         } catch (e: Exception) {
             android.util.Log.w("gscp-ar", "analyze failed", e)

@@ -54,6 +54,7 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
         getByName("debug") {
@@ -106,6 +107,7 @@ dependencies {
     implementation("org.bouncycastle:bcpkix-jdk15to18:1.78")
     // AR 试验模式：人脸检测（OpenCV YuNet）+ 相机预览（CameraX）
     implementation("org.opencv:opencv:4.10.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
     implementation("androidx.camera:camera-core:1.3.4")
     implementation("androidx.camera:camera-camera2:1.3.4")
     implementation("androidx.camera:camera-lifecycle:1.3.4")
