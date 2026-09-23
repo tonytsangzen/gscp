@@ -82,6 +82,20 @@
             android:text="等待人脸…"
             android:textColor="#FFFFFF"
             android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/pose_hud"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:layout_marginTop="72dp"
+            android:background="#66000000"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:text="head: --"
+            android:textColor="#FFE14A"
+            android:textSize="12sp" />
     </FrameLayout>
 
     <!-- 退出按钮（始终可见） -->

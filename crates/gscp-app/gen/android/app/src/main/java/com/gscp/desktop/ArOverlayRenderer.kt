@@ -122,6 +122,16 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
     private var bgUMvp = 0
     private var bgUSTMat = 0
     private var bgUAlpha = 0
+    // head-pose 3D 轴杆：画 GSCP 求解的头部朝向（right/up/normal）作为 3D 彩色线段
+    private var poseLineProgram = 0
+    private var poseAPosition = 0
+    private var poseUMvp = 0
+    private var poseUColor = 0
+    private val poseLineVerts: FloatBuffer = ByteBuffer.allocateDirect(2 * 3 * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    /** 是否在画面里画头部姿态轴杆（调试 HUD）。 */
+    @Volatile
+    var drawHeadPoseAxes = true
     private var viewportW = 1
     private var viewportH = 1
     private var cameraBufferWidth = 1280f
@@ -224,6 +234,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         bgUMvp = GLES20.glGetUniformLocation(bgProgram, "uMvp")
         bgUSTMat = GLES20.glGetUniformLocation(bgProgram, "uSTMat")
 
+        poseLineProgram = buildProgram(POSE_LINE_FRAGMENT, POSE_LINE_VERTEX)
+        poseAPosition = GLES20.glGetAttribLocation(poseLineProgram, "aPosition")
+        poseUMvp = GLES20.glGetUniformLocation(poseLineProgram, "uMvp")
+        poseUColor = GLES20.glGetUniformLocation(poseLineProgram, "uColor")
+
         // 关键：通知 Activity 相机 Surface 已就绪，从而把 CameraX Preview 绑定进来。
         // 83eaa2f 重写时漏掉了这一行，相机从未启动，SurfaceTexture 一直无帧→黑屏。
         cameraSurfaceTexture?.let {
@@ -310,8 +325,45 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val ndcX = imgW * fit / viewportW
         val ndcY = imgH * fit / viewportH
         mvp[0] *= ndcX; mvp[4] *= ndcX; mvp[8] *= ndcX; mvp[12] *= ndcX
+        mvp[0] *= ndcX; mvp[4] *= ndcX; mvp[8] *= ndcX; mvp[12] *= ndcX
         mvp[1] *= ndcY; mvp[5] *= ndcY; mvp[9] *= ndcY; mvp[13] *= ndcY
         drawOverlayQuad()
+        // 头部姿态 3D 轴杆（红=右，绿=上，蓝=法线/朝向相机）
+        val pb = basis ?: floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        if (drawHeadPoseAxes) drawHeadPose(pb, face, ndcX, ndcY)
+    }
+
+    /** 画头部 3D 轴杆：以人脸位置为原点，沿 faceBasis 的右/上/法线各画一条彩线。 */
+    private fun drawHeadPose(basis: FloatArray, face: FloatArray, ndcX: Float, ndcY: Float) {
+        if (poseLineProgram == 0) return
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        GLES20.glUseProgram(poseLineProgram)
+        // 世界坐标（cm）直接投影（model=identity），与 overlay 同一 proj + letterbox
+        val pm = FloatArray(16)
+        for (i in 0 until 16) pm[i] = proj[i]
+        pm[0] *= ndcX; pm[4] *= ndcX; pm[8] *= ndcX; pm[12] *= ndcX
+        pm[1] *= ndcY; pm[5] *= ndcY; pm[9] *= ndcY; pm[13] *= ndcY
+        GLES20.glUniformMatrix4fv(poseUMvp, 1, false, pm, 0)
+        val len = overlayWidthCm.coerceAtLeast(4f) * 0.7f
+        val px = face[12]; val py = face[13]; val pz = face[14]
+        drawAxisLine(px, py, pz, basis[0], basis[1], basis[2], len, 1f, 0.2f, 0.2f)       // 右红
+        drawAxisLine(px, py, pz, basis[3], basis[4], basis[5], len, 0.2f, 1f, 0.2f)       // 上绿
+        drawAxisLine(px, py, pz, basis[6], basis[7], basis[8], len, 0.3f, 0.5f, 1f)        // 法线蓝
+    }
+
+    private fun drawAxisLine(px: Float, py: Float, pz: Float,
+                             dx: Float, dy: Float, dz: Float, len: Float,
+                             r: Float, g: Float, b: Float) {
+        poseLineVerts.position(0)
+        poseLineVerts.put(px); poseLineVerts.put(py); poseLineVerts.put(pz)
+        poseLineVerts.put(px + dx * len); poseLineVerts.put(py + dy * len); poseLineVerts.put(pz + dz * len)
+        poseLineVerts.position(0)
+        GLES20.glUniform4f(poseUColor, r, g, b, 1f)
+        GLES20.glVertexAttribPointer(poseAPosition, 3, GLES20.GL_FLOAT, false, 0, poseLineVerts)
+        GLES20.glEnableVertexAttribArray(poseAPosition)
+        GLES20.glDrawArrays(GLES20.GL_LINES, 0, 2)
+        GLES20.glDisableVertexAttribArray(poseAPosition)
     }
 
     private fun drawOverlayQuad() {
@@ -478,6 +530,24 @@ private val BG_FRAGMENT = """
     void main() {
         vec4 c = texture2D(uTexture, vTexCoord);
         gl_FragColor = vec4(c.rgb, c.a * uAlpha);
+    }
+"""
+
+// head-pose 3D 轴杆：仅位姿顶点 → 线
+private val POSE_LINE_VERTEX = """
+    precision mediump float;
+    attribute vec3 aPosition;
+    uniform mat4 uMvp;
+    void main() {
+        gl_Position = uMvp * vec4(aPosition, 1.0);
+    }
+"""
+
+private val POSE_LINE_FRAGMENT = """
+    precision mediump float;
+    uniform vec4 uColor;
+    void main() {
+        gl_FragColor = uColor;
     }
 """
 

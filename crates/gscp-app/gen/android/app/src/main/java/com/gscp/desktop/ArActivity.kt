@@ -57,6 +57,7 @@ class ArActivity : AppCompatActivity() {
     private lateinit var arPanel: View
     private lateinit var glSurface: android.opengl.GLSurfaceView
     private lateinit var statusText: TextView
+    private lateinit var poseHud: TextView
     private lateinit var progressView: View
     private lateinit var ipEdit: EditText
     private lateinit var renderer: ArOverlayRenderer
@@ -74,6 +75,7 @@ class ArActivity : AppCompatActivity() {
     private var firstFaceAtMillis = 0L
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
+    private var hudLogAt = 0L
     private var detectCount = 0
     private val lock = Any()
 
@@ -141,6 +143,7 @@ class ArActivity : AppCompatActivity() {
         arPanel = findViewById(R.id.ar_panel)
         glSurface = findViewById(R.id.ar_gl_surface)
         statusText = findViewById(R.id.ar_status)
+        poseHud = findViewById(R.id.pose_hud)
         progressView = findViewById(R.id.progress_bar)
         ipEdit = findViewById(R.id.ip_address)
         val connectButton = findViewById<Button>(R.id.button_connect)
@@ -486,6 +489,25 @@ class ArActivity : AppCompatActivity() {
                             tm[12] = sPx; tm[13] = sPy; tm[14] = sPz; tm[15] = 1f
                             renderer.faceMatrix = tm
                             renderer.faceRoll = 0f
+
+                            // HUD：由 3D 姿态 basis（右/上/法线）显式画 head pose
+                            if (now - hudLogAt > 200) {
+                                hudLogAt = now
+                                val rx = sB[0].toDouble(); val ry = sB[1].toDouble()
+                                val ny = sB[7].toDouble(); val nx = sB[6].toDouble()
+                                val deg = 180.0 / kotlin.math.PI
+                                val yaw = kotlin.math.asin(nx.coerceIn(-1.0, 1.0)) * deg
+                                val pitch = kotlin.math.asin(ny.coerceIn(-1.0, 1.0)) * deg
+                                val roll = kotlin.math.atan2(ry, rx) * deg
+                                val dep = -sPz
+                                val txt = String.format(
+                                    java.util.Locale.US,
+                                    "head  yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
+                                        "      dist %3.0fcm  pos (%.0f,%.0f,%.0f)",
+                                    yaw, pitch, roll, dep, sPx, sPy, sPz,
+                                )
+                                runOnUiThread { poseHud.text = txt }
+                            }
                         }
 
                         // overlay 大小：固定物理宽度（眼镜常规 ~14cm），由 3D 投影自然缩放，
@@ -502,11 +524,15 @@ class ArActivity : AppCompatActivity() {
                             val p = ptsPx
                             val msg = (
                                 "face %s d=%.0fcm t=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f) " +
+                                    "hud[yaw %+5.0f pitch %+5.0f roll %+5.0f] " +
                                     "pts=re(%.0f,%.0f)le(%.0f,%.0f)no(%.0f,%.0f)rm(%.0f,%.0f)lm(%.0f,%.0f)"
                                 ).format(
                                 lastPoseMode, sDist,
                                 t?.get(12) ?: 0f, t?.get(13) ?: 0f, t?.get(14) ?: 0f,
                                 nx, ny, nz,
+                                kotlin.math.asin((b?.get(6) ?: 0f).coerceIn(-1f, 1f).toDouble()) * 180.0 / kotlin.math.PI,
+                                kotlin.math.asin((b?.get(7) ?: 0f).coerceIn(-1f, 1f).toDouble()) * 180.0 / kotlin.math.PI,
+                                kotlin.math.atan2(b?.get(1) ?: 0f, b?.get(0) ?: 0f) * 180.0 / kotlin.math.PI,
                                 p[0].first, p[0].second, p[1].first, p[1].second,
                                 p[2].first, p[2].second, p[3].first, p[3].second,
                                 p[4].first, p[4].second,
@@ -523,6 +549,7 @@ class ArActivity : AppCompatActivity() {
                         poseInit = false
                         renderer.faceMatrix = null
                         runOnUiThread { statusText.text = "等待人脸…" }
+                        runOnUiThread { poseHud.text = "head: --" }
                     }
                 }
             }
