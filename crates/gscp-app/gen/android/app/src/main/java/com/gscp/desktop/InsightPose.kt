@@ -1,8 +1,5 @@
 package com.gscp.desktop
 
-import ai.onnxruntime.OnnxTensor
-import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtSession
 import android.content.res.AssetManager
 import android.util.Log
 import org.opencv.core.Core
@@ -32,20 +29,18 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         private const val TAG = "gscp-ar"
         // 真机实测：NNAPI 被 OS(SELinux)封锁、GPU 峰值 ~31 GFLOPS 不足以加速 640；
         // CPU 下 640→480 约两倍提速（~274ms→~140ms），故 live 用 480。
-        private const val DET = 480
+        private const val DET = 640
         private const val LM = 192
         private const val THR = 0.3f
         private const val NMS = 0.4f
         private val STRIDES = intArrayOf(8, 16, 32)
-        // det_10g 输出（batched=False，2-D）：scores / boxes / kps，按 stride 8,16,32 分组命名
-        private val SCORES_OUT = arrayOf("448", "471", "494")
-        private val BOXES_OUT = arrayOf("451", "474", "497")
-        private val KPS_OUT = arrayOf("454", "477", "500")
+        // ht det_10g.ncnn 输出（640 输入）：out0/1/2 = scores stride8/16/32 [N]，
+        // out3/4/5 = boxes [N,4]，out6/7/8 = kps [N,10]
+        private val SCORES_OUT = arrayOf("out0", "out1", "out2")
+        private val BOXES_OUT = arrayOf("out3", "out4", "out5")
+        private val KPS_OUT = arrayOf("out6", "out7", "out8")
     }
 
-    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
-    private var detSess: OrtSession? = null
-    private var lmSess: OrtSession? = null
     private var lmWarned = false
     // 观测：det / lm 每 30 次打印一次平均耗时（ms）
     private var detCnt = 0; private var detAcc = 0L
@@ -76,21 +71,20 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         if (ready) return
         synchronized(this) {
             if (ready) return
-            ensureModel("det_10g.onnx"); ensureModel("1k3d68.onnx")
+            NcnnEngine.initLoad()
+            ensureModel("det_ht.param"); ensureModel("det_ht.bin")
+            ensureModel("1k3d68_192_f16.param"); ensureModel("1k3d68_192_f16.bin")
             try {
-                val dOpts = OrtSession.SessionOptions()
-                val lOpts = OrtSession.SessionOptions()
-                // CPU EP：全核利用 + 图形级优化，最大化 CPU 吞吐（NNAPI/GPU 在本机均无效）。
-                val cores = Runtime.getRuntime().availableProcessors()
-                dOpts.setIntraOpNumThreads(cores); dOpts.setInterOpNumThreads(1)
-                dOpts.setOptimizationLevel(ai.onnxruntime.OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                lOpts.setIntraOpNumThreads(cores); lOpts.setInterOpNumThreads(1)
-                lOpts.setOptimizationLevel(ai.onnxruntime.OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                // ONNX Runtime：与 ht 参考一致（CPU EP，稳定可靠）
-                detSess = env.createSession(File(filesDir, "det_10g.onnx").absolutePath, dOpts)
-                lmSess = env.createSession(File(filesDir, "1k3d68.onnx").absolutePath, lOpts)
+                // NCNN(-vulkan, fp16)：真 Vulkan GPU 计算；GPU 不可用则原生回退 CPU。
+                val detOk = NcnnEngine.initDet(
+                    File(filesDir, "det_ht.param").absolutePath,
+                    File(filesDir, "det_ht.bin").absolutePath, true)
+                val lmOk = NcnnEngine.initLm(
+                    File(filesDir, "1k3d68_192_f16.param").absolutePath,
+                    File(filesDir, "1k3d68_192_f16.bin").absolutePath, true)
+                if (!detOk || !lmOk) { Log.w(TAG, "ncnn init fail detOk=" + detOk + " lmOk=" + lmOk); return }
             } catch (t: Throwable) {
-                Log.w(TAG, "insight ort session fail", t)
+                Log.w(TAG, "ncnn init fail", t)
                 return
             }
             ready = true
@@ -111,7 +105,7 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
     // ---------------- SCRFD 检测 ----------------
     /** 检测最大/最明显人脸。返回全帧坐标 {x1,y1,x2,y2, 5×关键点(右眼,左眼,鼻,右嘴,左嘴 ×(x,y))}（14 浮点），失败 null。 */
     fun detect(bgr: Mat): FloatArray? {
-        val sess = detSess ?: return null
+        if (!NcnnEngine.isDetReady()) return null
         val h = bgr.rows(); val w = bgr.cols()
         val r = h.toFloat() / w
         val nh: Int; val nw: Int
@@ -126,25 +120,16 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         val data = blobF(blob)
         res.release(); detImg.release()
         val bx = ArrayList<FloatArray>(); val sc = ArrayList<Float>(); val kp = ArrayList<FloatArray>()
-        var allScoreMax = 0f
         val t0 = System.nanoTime()
-        val result = runOrt(sess, data, longArrayOf(1, 3, DET.toLong(), DET.toLong())) ?: run {
-            detAcc += (System.nanoTime() - t0) / 1_000_000; if (++detCnt % 30 == 0) Log.i(TAG, "perf det=" + (detAcc / detCnt) + "ms")
-            return null
-        }
+        val tensors = NcnnEngine.runDet(data)
         detAcc += (System.nanoTime() - t0) / 1_000_000; if (++detCnt % 30 == 0) Log.i(TAG, "perf det=" + (detAcc / detCnt) + "ms")
-        try {
-            val map = java.util.HashMap<String, ai.onnxruntime.OnnxTensor>()
-            for (e in result) if (e.value is ai.onnxruntime.OnnxTensor) map[e.key] = e.value as ai.onnxruntime.OnnxTensor
-            for (k in 0..2) {
-                val sv = flattenF(map[SCORES_OUT[k]]?.getValue() ?: continue)
-                val bv = flattenF(map[BOXES_OUT[k]]?.getValue() ?: continue)
-                val kv = flattenF(map[KPS_OUT[k]]?.getValue() ?: continue)
-                if (sv != null) for (v in sv) if (v > allScoreMax) allScoreMax = v
-                if (sv == null || bv == null || kv == null) continue
-                decodeStride(sv, bv, kv, STRIDES[k], bx, sc, kp)
-            }
-        } finally { result.close() }
+        if (tensors == null) return null
+        for (k in 0..2) {
+            val sv = tensors[SCORES_OUT[k]] ?: continue
+            val bv = tensors[BOXES_OUT[k]] ?: continue
+            val kv = tensors[KPS_OUT[k]] ?: continue
+            decodeStride(sv, bv, kv, STRIDES[k], bx, sc, kp)
+        }
         if (sc.isEmpty()) return null
         val n = sc.size
         // NMS（按 score 降序）
@@ -172,16 +157,18 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         }
         val b = bx[pick]; val pk = kp[pick]
         val bw = b[2] - b[0]; val bh = b[3] - b[1]
-        if (!b[0].isFinite() || bw <= 0f || bh <= 0f) { Log.d(TAG, "guard bbox b=" + java.util.Arrays.toString(b)); return null }
+        if (!b[0].isFinite() || bw <= 0f || bh <= 0f) return null
         if (bw * bh < 8f) return null   // 拒绝 1~2px 幻影框（缩放帧坐标）
-        // 拒绝「5 关键点塌缩成一点」的退化人脸（真脸在缩放帧内至少几十像素跨度）
+        // 拒绝「5 关键点塌缩成一点」的退化人脸（真脸在缩放帧内至少几十像素跨度）。
+        // 注：真机上 ncnn 该 det 的 kps 分支会退化成近中心点，但姿态主路径只用 bbox →
+        // 1k3d68（landmarks()），故仅拒绝“完全同一个点”的幻影，宽容塌缩。
         var kx0 = pk[0]; var kx1 = pk[0]; var ky0 = pk[1]; var ky1 = pk[1]
         for (i in 0 until 5) {
             val px = pk[i * 2]; val py = pk[i * 2 + 1]
             if (px < kx0) kx0 = px; if (px > kx1) kx1 = px
             if (py < ky0) ky0 = py; if (py > ky1) ky1 = py
         }
-        if (kx1 - kx0 < 12f || ky1 - ky0 < 12f) return null
+        if ((kx1 - kx0 < 1f && ky1 - ky0 < 1f) && bw * bh < 64f) return null
         val out = FloatArray(14)
         out[0] = b[0] / scale; out[1] = b[1] / scale; out[2] = b[2] / scale; out[3] = b[3] / scale
         for (i in 0 until 10) out[4 + i] = pk[i] / scale
@@ -215,37 +202,10 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         }
     }
 
-    private fun runOrt(sess: OrtSession, data: FloatArray, shape: LongArray): OrtSession.Result? {
-        return try {
-            val input = OnnxTensor.createTensor(env, FloatBuffer.wrap(data), shape)
-            val names = java.util.HashMap<String, OnnxTensor>(); names.put(sess.inputNames.first(), input)
-            val out = sess.run(names)
-            input.close()
-            out
-        } catch (t: Throwable) {
-            Log.w(TAG, "ort run fail", t)
-            null
-        }
-    }
-
-    private fun flatFloat(getValue: Any): FloatArray? = flattenF(getValue)
-
-    /** 递归展平 N-D float 数组（适配 onnxruntime 各种 shape 返回的 Object）。 */
-    private fun flattenF(o: Any): FloatArray? {
-        val out = ArrayList<Float>()
-        fun f(x: Any) {
-            val comp = x.javaClass.componentType
-            if (comp == java.lang.Float.TYPE) { for (v in x as FloatArray) out.add(v) }
-            else { val len = java.lang.reflect.Array.getLength(x); for (i in 0 until len) f(java.lang.reflect.Array.get(x, i)!!) }
-        }
-        f(o)
-        return if (out.isEmpty()) null else out.toFloatArray()
-    }
-
     // ---------------- 1k3d68 + Procrustes + 渲染器姿态 ----------------
     /** 68 地标（x,y 全帧 px；z 相对头深 mm）。 */
     fun landmarks(bgr: Mat, bbox: FloatArray): FloatArray? {
-        val sess = lmSess ?: return null
+        if (!NcnnEngine.isLmReady()) return null
         val w0 = bbox[2] - bbox[0]; val h0 = bbox[3] - bbox[1]
         val cx = (bbox[2] + bbox[0]) / 2f; val cy = (bbox[3] + bbox[1]) / 2f
         val scaleS = LM / (max(w0, h0) * 1.5f)
@@ -260,14 +220,7 @@ class InsightPose(private val assets: AssetManager, private val filesDir: File) 
         val data = blobF(blob)
         mMat.release(); aimg.release()
         val t0 = System.nanoTime()
-        val result = runOrt(sess, data, longArrayOf(1, 3, LM.toLong(), LM.toLong())) ?: return null
-        val pred: FloatArray
-        try {
-            // fc1 输出 [1,3309]
-            var fc: ai.onnxruntime.OnnxTensor? = null
-            outer@ for (e in result) if (e.value is ai.onnxruntime.OnnxTensor) { fc = e.value as ai.onnxruntime.OnnxTensor; break@outer }
-            pred = flattenF(fc?.getValue() ?: return null) ?: return null
-        } finally { result.close() }
+        val pred = NcnnEngine.runLm(data) ?: return null
         lmAcc += (System.nanoTime() - t0) / 1_000_000; if (++lmCnt % 30 == 0) Log.i(TAG, "perf lm=" + (lmAcc / lmCnt) + "ms")
         if (pred.size < 3309) { if (!lmWarned) { lmWarned = true; Log.w(TAG, "1k3d68 bad size=" + pred.size) }; return null }
         val base = pred.size / 3 - 68

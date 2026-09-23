@@ -127,7 +127,11 @@ class ArActivity : AppCompatActivity() {
         insight = InsightPose(assets, filesDir)
         insight?.let { ip ->
             Thread {
-                try { ip.ensureLoaded() } catch (t: Throwable) {
+                try {
+                    ip.ensureLoaded()
+                    // 最小测试：模拟器（无相机）跑 det/lm 合成输入验证输出张量形状；真机走正常相机链路
+                    if (android.os.Build.HARDWARE == "ranchu" && ip.isReady()) runSyntheticTest(ip)
+                } catch (t: Throwable) {
                     android.util.Log.w("gscp-ar", "insight model init fail", t)
                 }
             }.start()
@@ -214,14 +218,21 @@ class ArActivity : AppCompatActivity() {
                     .build()
                     .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
                 provider.unbindAll()
+                // 模拟器只有后置相机(virtualscene 有人脸场景)；真机用前置
+                val isEmulator = android.os.Build.HARDWARE == "ranchu"
+                val camSel = if (isEmulator)
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                else
+                    CameraSelector.DEFAULT_FRONT_CAMERA
                 provider.bindToLifecycle(
                     this,
-                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                    camSel,
                     preview,
                     analysis,
                 )
                 statusText.text = "等待人脸…"
             } catch (e: Exception) {
+                android.util.Log.e("gscp-ar", "camera start fail", e)
                 statusText.text = "相机启动失败: ${e.message}"
             }
         }, ContextCompat.getMainExecutor(this))
@@ -758,5 +769,44 @@ class ArActivity : AppCompatActivity() {
         analysisExecutor.shutdown()
         detector = null
         super.onDestroy()
+    }
+
+    /** 最小测试（无相机依赖）：合成输入直接跑 det/lm，验证各输出张量形状。 */
+    private fun runSyntheticTest(ip: InsightPose) {
+        try {
+            val detN = 640 * 640 * 3
+            val detData = FloatArray(detN)
+            for (i in 0 until detN) detData[i] = ((i * 31) % 255).toFloat() - 127.5f
+            // 中央放一个“脸状”亮块，便于检测分支有真实响应
+            val half = 70
+            for (y in 320 - half until 320 + half) for (x in 320 - half until 320 + half) {
+                val b = ((y * 640 + x) * 3)
+                detData[b] = 100f; detData[b + 1] = 80f; detData[b + 2] = 90f
+            }
+            val t0 = System.nanoTime()
+            val tensors = NcnnEngine.runDet(detData)
+            val dt = (System.nanoTime() - t0) / 1_000_000
+            if (tensors == null) { android.util.Log.i("gscp-ar", "syntest det=null"); return }
+            val sb = StringBuilder()
+            for (k in NcnnEngine.DET_NAMES) {
+                val v = tensors[k]
+                sb.append(k).append(":").append(if (v == null) -1 else v.size).append(" ")
+            }
+            android.util.Log.i("gscp-ar", "syntest det ms=" + dt + " dims=" + sb.toString())
+
+            val lmN = 192 * 192 * 3
+            val lmData = FloatArray(lmN)
+            for (i in 0 until lmN) lmData[i] = ((i * 17) % 255).toFloat() - 128f
+            for (y in 96 - 40 until 96 + 40) for (x in 96 - 40 until 96 + 40) {
+                val b = ((y * 192 + x) * 3)
+                lmData[b] = 90f; lmData[b + 1] = 90f; lmData[b + 2] = 100f
+            }
+            val t1 = System.nanoTime()
+            val pred = NcnnEngine.runLm(lmData)
+            val lt = (System.nanoTime() - t1) / 1_000_000
+            android.util.Log.i("gscp-ar", "syntest lm ms=" + lt + " size=" + (pred?.size ?: -1))
+        } catch (t: Throwable) {
+            android.util.Log.e("gscp-ar", "syntest fail", t)
+        }
     }
 }

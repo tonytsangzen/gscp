@@ -14,3 +14,11 @@
 .emu/
 .emuhome/
 :memory:.ses
+
+# ncnn android/host build artifacts (rebuilt from tools/ncnn/src)
+tools/ncnn/build-android-arm64/
+tools/ncnn/build-host/
+
+# vendored ncnn upstream checkout (shim builds against it; fetch from Tencent/ncnn)
+tools/ncnn/src/
+__pycache__/
