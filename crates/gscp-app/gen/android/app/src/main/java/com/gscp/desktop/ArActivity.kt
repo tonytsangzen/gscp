@@ -300,9 +300,9 @@ class ArActivity : AppCompatActivity() {
             org.opencv.imgproc.Imgproc.cvtColor(
                 bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
             )
-            // —— insight_procrustes_coreml：SCRFD det_10g 检测（bbox × 1 + 5 关键点）——
+            // —— 整条 pose 链在 native C++ 完成（det→SCRFD→landmark→Procrustes）——
             val ip = insight
-            val ins = if (ip?.isReady() == true) ip.detect(bgr) else null
+            val ins = if (ip?.isReady() == true) ip.pose(bgr) else null
             detectCount++
             if (detectCount % 60 == 1) {
                 android.util.Log.i(
@@ -311,245 +311,95 @@ class ArActivity : AppCompatActivity() {
                         " insight=" + (if (ins != null) "hit" else "miss"),
                 )
             }
-
-            // 取置信度最高的人脸：insight 只返回一行，行 = [x1,y1,x2,y2, 右眼,左眼,鼻,右嘴,左嘴]
-            var best = -1
-            if (ins != null) best = 0
-            val hasFace = best >= 0
+            // nativePose: [0..8]=basis, [9..11]=pos3(cm), [12..25]=bbox14(全帧 px)
+            val hasFace = ins != null
             synchronized(lock) {
-                val now = System.currentTimeMillis()
+                val now = java.lang.System.currentTimeMillis()
                 if (hasFace) {
-                    val det = ins!!
-                    val g = { c: Int -> det[c].toDouble() }
-                    val bx = g(0); val by = g(1); val bw = g(2) - g(0); val bh = g(3) - g(1)
-                    val ptsPx = listOf(
-                        Pair(g(4), g(5)),
-                        Pair(g(6), g(7)),
-                        Pair(g(8), g(9)),
-                        Pair(g(10), g(11)),
-                        Pair(g(12), g(13)),
-                    )
-
+                    val p = ins!!
+                    var bad = false
+                    for (i in 0..11) if (p[i] != p[i]) { bad = true; break }
+                    if (bad) { renderer.faceMatrix = null; return@synchronized }
                     if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
                     lastFaceAtMillis = now
-                    // 稳定判定：连续追踪 ~0.5s 后锚定第一张人脸
                     if (!faceLocked && now - firstFaceAtMillis >= 500) {
                         faceLocked = true
-                        filterInit = false  // 锚定时重置滤波，避免带着旧值造成滞后
+                        poseInit = false   // 锚定时重置 EMA，避免旧值滞后
                         runOnUiThread { statusText.text = "已锁定人脸" }
                     }
-
                     if (faceLocked) {
-                        // 针孔模型（正立空间）：垂直 FOV 50°
-                        val focal = (H / 2.0) / tan(Math.toRadians(25.0))
-                        val rawDistance = (focal * 15.0 / bw).coerceIn(10.0, 300.0)
-
-                        // 位置：脸中心（bbox 中心）在深度 distance 的视线上
-                        val cxN = (bx + bw / 2.0) / W
-                        val cyN = (by + bh / 2.0) / H
-
-                        // 朝向（5 点几何启发式）：roll=眼线角度；yaw/pitch=鼻尖偏移
-                        val (rex, rey) = ptsPx[0]
-                        val (lex, ley) = ptsPx[1]
-                        val (nx, ny) = ptsPx[2]
-                        val eyeMidX = (rex + lex) / 2.0
-                        val eyeMidY = (rey + ley) / 2.0
-                        val facePxW = maxOf(abs(lex - rex), 1.0)
-                        val kR = if (invertRoll) -1.0 else 1.0
-                        val kY = if (invertYaw) -1.0 else 1.0
-                        val kP = if (invertPitch) -1.0 else 1.0
-                        val roll = kR * atan2(ley - rey, lex - rex)
-                        val yaw = kY * kotlin.math.asin(
-                            ((nx - eyeMidX) / facePxW * 1.8).coerceIn(-1.0, 1.0),
-                        )
-                        val pitch = kP * kotlin.math.asin(
-                            (((ny - eyeMidY) / facePxW) * 1.5).coerceIn(-1.0, 1.0),
-                        )
-                        val eyePx =
-                            kotlin.math.hypot((lex - rex), (ley - rey)).coerceAtLeast(1.0)
-                        val rawSize = 15.0 * eyePx / bw * OVERLAY_EYE_MULT
-
-                        // —— 一阶低通（EMA）防抖：对位置/深度/roll/尺寸做滤波，
-                        //    防止逐帧检测抖动使 overlay 跳变。首帧时初始化状态。
-                        if (!filterInit) {
-                            sCx = cxN; sCy = cyN; sDist = rawDistance
-                            sRoll = roll; sSize = rawSize
-                            filterInit = true
+                        // nativePose 输出：[0..8]=basis, [9..11]=pos3(cm, z 朝前)
+                        val candBasis = FloatArray(9)
+                        for (i in 0..8) candBasis[i] = p[i]
+                        val cpx = p[9]; val cpy = p[10]; val cpz = -p[11]  // 渲染器负朝前系
+                        // 唯一低通出口：EMA 平滑 native 残余抖动
+                        if (!poseInit) {
+                            sPx = cpx; sPy = cpy; sPz = cpz
+                            for (i in 0..8) sB[i] = candBasis[i]
+                            poseInit = true
                         } else {
-                            val a = SMOOTH_ALPHA
-                            sCx += (cxN - sCx) * a
-                            sCy += (cyN - sCy) * a
-                            sDist += (rawDistance - sDist) * a
-                            sRoll += (roll - sRoll) * a
-                            sSize += (rawSize - sSize) * a
+                            val a = POSE_SMOOTH_ALPHA
+                            sPx += (cpx - sPx) * a; sPy += (cpy - sPy) * a; sPz += (cpz - sPz) * a
+                            for (i in 0..8) sB[i] += (candBasis[i] - sB[i]) * a
                         }
-
-                        // 用 5 点（眼/鼻/嘴）重建金字塔底面平面姿态：优先把 overlay 平面画到与该底面
-                        // 平行、距底面 3 瞳距的位置；解算失败才回退到平行画面的 roll 贴纸。
-                        // —— 主路径改由 insight_procrustes_coreml（1k3d68+Procrustes）提供姿态 ——
-                        val poseArr = ip?.pose(bgr, floatArrayOf(bx.toFloat(), by.toFloat(), (bx + bw).toFloat(), (by + bh).toFloat()))
-                        // 统一姿态候选：insight 与『连续失败后的启发式回退』都先算候选 basis+pos，
-                        // 再走同一个低通出口——避免回退分支把未平滑的原始 yaw/pitch/sRoll
-                        // 直接写进渲染器（低通泄漏 → 未稳定时高频抖动）。
-                        var candBasis = FloatArray(9)
-                        var cpx = 0f; var cpy = 0f; var cpz = 0f
-                        var hardUpdate = true
-                        if (poseArr != null) {
-                            epnpFail = 0
-                            lastPoseMode = "insight"
-                            candBasis = poseArr.copyOf(9)
-                            cpx = poseArr[9]; cpy = poseArr[10]; cpz = -poseArr[11]
-                        } else {
-                            epnpFail++
-                            if (epnpFail >= 5) {
-                                lastPoseMode = "heur"
-                                // 连续失败才回退启发式（避免 epnp/启发式来回切换造成跳变）
-                                val cy2 = kotlin.math.cos(yaw); val sy2 = kotlin.math.sin(yaw)
-                                val cp = kotlin.math.cos(pitch); val sp = kotlin.math.sin(pitch)
-                                val cr = kotlin.math.cos(sRoll); val sr = kotlin.math.sin(sRoll)
-                                val rym = floatArrayOf(
-                                    cy2.toFloat(), 0f, -sy2.toFloat(), 0f,
-                                    0f, 1f, 0f, 0f,
-                                    sy2.toFloat(), 0f, cy2.toFloat(), 0f,
-                                    0f, 0f, 0f, 1f,
-                                )
-                                val rxm = floatArrayOf(
-                                    1f, 0f, 0f, 0f,
-                                    0f, cp.toFloat(), sp.toFloat(), 0f,
-                                    0f, -sp.toFloat(), cp.toFloat(), 0f,
-                                    0f, 0f, 0f, 1f,
-                                )
-                                val rzm = floatArrayOf(
-                                    cr.toFloat(), sr.toFloat(), 0f, 0f,
-                                    -sr.toFloat(), cr.toFloat(), 0f, 0f,
-                                    0f, 0f, 1f, 0f,
-                                    0f, 0f, 0f, 1f,
-                                )
-                                val tb = FloatArray(16)
-                                val rot = FloatArray(16)
-                                multiplyCm(rxm, rzm, tb)
-                                multiplyCm(rym, tb, rot)
-                                val nx = rot[8]; val ny = rot[9]; val nz = rot[10]
-                                candBasis = floatArrayOf(
-                                    rot[0], rot[1], rot[2],
-                                    rot[4], rot[5], rot[6],
-                                    nx, ny, nz,
-                                )
-                                // 圆心 = 滤波后的面中心（cm）；位置 = 圆心 + 3 瞳距×法线
-                                val halfHcm2 = (sDist * tan(Math.toRadians(25.0))).toFloat()
-                                val halfWcm2 = halfHcm2 * W / H
-                                val ox = ((sCx - 0.5) * 2 * halfWcm2).toFloat()
-                                val oy = ((0.5 - sCy) * 2 * halfHcm2).toFloat()
-                                val oz = (-sDist).toFloat()
-                                val d3 = (3.0 * IPD_CM).toFloat()
-                                cpx = ox + nx * d3
-                                cpy = oy + ny * d3
-                                cpz = oz + nz * d3
-                            } else {
-                                // 偶发失败（<5 帧）：保持上一帧已平滑状态，不更新、不作跳变
-                                hardUpdate = false
-                            }
-                        }
-
-                        if (hardUpdate) {
-                            // 唯一低通出口：epnp 与启发式候选都经同一 EMA 滤波
-                            if (!poseInit) {
-                                sPx = cpx; sPy = cpy; sPz = cpz
-                                System.arraycopy(candBasis, 0, sB, 0, 9)
-                                poseInit = true
-                            } else {
-                                val a = POSE_SMOOTH_ALPHA
-                                sPx += (cpx - sPx) * a
-                                sPy += (cpy - sPy) * a
-                                sPz += (cpz - sPz) * a
-                                for (i in 0..8) sB[i] += (candBasis[i] - sB[i]) * a
-                            }
-                            // 归一化右/上/法线并保证法线朝相机（EMA 后恢复单位长度/朝向）
-                            val rl = kotlin.math.sqrt(
-                                (sB[0]*sB[0]+sB[1]*sB[1]+sB[2]*sB[2]).toDouble(),
-                            ).toFloat().coerceAtLeast(1e-6f)
-                            sB[0]/=rl; sB[1]/=rl; sB[2]/=rl
-                            val ul = kotlin.math.sqrt(
-                                (sB[3]*sB[3]+sB[4]*sB[4]+sB[5]*sB[5]).toDouble(),
-                            ).toFloat().coerceAtLeast(1e-6f)
-                            sB[3]/=ul; sB[4]/=ul; sB[5]/=ul
-                            val nl = kotlin.math.sqrt(
-                                (sB[6]*sB[6]+sB[7]*sB[7]+sB[8]*sB[8]).toDouble(),
-                            ).toFloat().coerceAtLeast(1e-6f)
-                            sB[6]/=nl; sB[7]/=nl; sB[8]/=nl
-                            if (sB[8] < 0f) { sB[6] = -sB[6]; sB[7] = -sB[7]; sB[8] = -sB[8] }
-                            // 安全钳位：位置限制在画面内保证可见
-                            val halfW = (sPz * tan(Math.toRadians(25.0)) * 0.9f).toFloat()
-                                .coerceAtLeast(6f)
-                            sPx = sPx.coerceIn(-halfW, halfW)
-                            sPy = sPy.coerceIn(-halfW * (H / W.toFloat()), halfW * (H / W.toFloat()))
-                            sPz = sPz.coerceIn(-150f, -10f)
-                            renderer.faceBasis = sB.copyOf()   // 复制：避免撕裂读 → 抖动
-                            val tm = FloatArray(16)
-                            tm[12] = sPx; tm[13] = sPy; tm[14] = sPz; tm[15] = 1f
-                            renderer.faceMatrix = tm
-                            renderer.faceRoll = 0f
-
-                            // HUD：由 3D 姿态 basis（右/上/法线）显式画 head pose
-                            if (now - hudLogAt > 200) {
-                                hudLogAt = now
-                                val rx = sB[0].toDouble(); val ry = sB[1].toDouble()
-                                val ny = sB[7].toDouble(); val nx = sB[6].toDouble()
-                                val deg = 180.0 / kotlin.math.PI
-                                val yaw = kotlin.math.asin(nx.coerceIn(-1.0, 1.0)) * deg
-                                val pitch = kotlin.math.asin(ny.coerceIn(-1.0, 1.0)) * deg
-                                val roll = kotlin.math.atan2(ry, rx) * deg
-                                val dep = -sPz
-                                val txt = String.format(
-                                    java.util.Locale.US,
-                                    "head  yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
-                                        "      dist %3.0fcm  pos (%.0f,%.0f,%.0f)",
-                                    yaw, pitch, roll, dep, sPx, sPy, sPz,
-                                )
-                                runOnUiThread { poseHud.text = txt }
-                            }
-                        }
-
-                        // overlay 大小：固定物理宽度（眼镜常规 ~14cm），由 3D 投影自然缩放，
-                        // 不再用投影眼距驱动（侧脸时眼距缩小会让尺寸/距离跳变）。
+                        // 归一化 basis，保证法线朝相机
+                        val rl = kotlin.math.sqrt(sB[0]*sB[0]+sB[1]*sB[1]+sB[2]*sB[2]).toFloat().coerceAtLeast(1e-6f)
+                        sB[0]/=rl; sB[1]/=rl; sB[2]/=rl
+                        val ul = kotlin.math.sqrt(sB[3]*sB[3]+sB[4]*sB[4]+sB[5]*sB[5]).toFloat().coerceAtLeast(1e-6f)
+                        sB[3]/=ul; sB[4]/=ul; sB[5]/=ul
+                        val nl = kotlin.math.sqrt(sB[6]*sB[6]+sB[7]*sB[7]+sB[8]*sB[8]).toFloat().coerceAtLeast(1e-6f)
+                        sB[6]/=nl; sB[7]/=nl; sB[8]/=nl
+                        if (sB[8] < 0f) { sB[6] = -sB[6]; sB[7] = -sB[7]; sB[8] = -sB[8] }
+                        // 位置钳位在画面内
+                        val halfW = (sPz * tan(Math.toRadians(25.0)) * 0.9f).toFloat().coerceAtLeast(6f)
+                        sPx = sPx.coerceIn(-halfW, halfW)
+                        sPy = sPy.coerceIn(-halfW * (H / W.toFloat()), halfW * (H / W.toFloat()))
+                        sPz = sPz.coerceIn(-150f, -10f)
+                        renderer.faceBasis = sB.copyOf()
+                        val tm = FloatArray(16)
+                        tm[12] = sPx; tm[13] = sPy; tm[14] = sPz; tm[15] = 1f
+                        renderer.faceMatrix = tm
+                        renderer.faceRoll = 0f
                         renderer.overlayWidthCm = 14f
 
+                        // HUD：由 3D 姿态 basis 显式画 head pose
+                        if (now - hudLogAt > 200) {
+                            hudLogAt = now
+                            val ny = sB[7].toDouble(); val nx = sB[6].toDouble()
+                            val ry = sB[1].toDouble(); val rx = sB[0].toDouble()
+                            val deg = 180.0 / kotlin.math.PI
+                            val yaw = kotlin.math.asin(nx.coerceIn(-1.0, 1.0)) * deg
+                            val pitch = kotlin.math.asin(ny.coerceIn(-1.0, 1.0)) * deg
+                            val roll = kotlin.math.atan2(ry, rx) * deg
+                            val txt = String.format(
+                                java.util.Locale.US,
+                                "head  yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
+                                    "      dist %3.0fcm  pos (%.0f,%.0f,%.0f)",
+                                yaw, pitch, roll, -sPz, sPx, sPy, sPz,
+                            )
+                            runOnUiThread { poseHud.text = txt }
+                        }
                         if (now - lastMatrixLogAt > 500) {
                             lastMatrixLogAt = now
-                            val t = renderer.faceMatrix
-                            val b = renderer.faceBasis
-                            val nx = b?.get(6) ?: 0f
-                            val ny = b?.get(7) ?: 0f
-                            val nz = b?.get(8) ?: 0f
-                            val p = ptsPx
-                            val msg = (
-                                "face %s d=%.0fcm t=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f) " +
-                                    "hud[yaw %+5.0f pitch %+5.0f roll %+5.0f] " +
-                                    "pts=re(%.0f,%.0f)le(%.0f,%.0f)no(%.0f,%.0f)rm(%.0f,%.0f)lm(%.0f,%.0f)"
-                                ).format(
-                                lastPoseMode, sDist,
-                                t?.get(12) ?: 0f, t?.get(13) ?: 0f, t?.get(14) ?: 0f,
-                                nx, ny, nz,
-                                kotlin.math.asin((b?.get(6) ?: 0f).coerceIn(-1f, 1f).toDouble()) * 180.0 / kotlin.math.PI,
-                                kotlin.math.asin((b?.get(7) ?: 0f).coerceIn(-1f, 1f).toDouble()) * 180.0 / kotlin.math.PI,
-                                kotlin.math.atan2(b?.get(1) ?: 0f, b?.get(0) ?: 0f) * 180.0 / kotlin.math.PI,
-                                p[0].first, p[0].second, p[1].first, p[1].second,
-                                p[2].first, p[2].second, p[3].first, p[3].second,
-                                p[4].first, p[4].second,
+                            val msg = String.format(
+                                java.util.Locale.US,
+                                "face native d=%.0fcm t=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f)",
+                                -sPz, sPx, sPy, sPz, sB[6], sB[7], sB[8],
                             )
                             android.util.Log.i("gscp-ar", msg)
                         }
                     }
-                    } else {
-                    renderer.faceMatrix = null
+                } else {
                     firstFaceAtMillis = 0L
-                    if (faceLocked && now - lastFaceAtMillis > 1000) {
+                    // 短暂(single-frame)miss 不清 overlay，避免闪烁；连续丢脸 >1.2s 才复位
+                    if (faceLocked && now - lastFaceAtMillis > 1200) {
                         faceLocked = false
-                        filterInit = false  // 丢脸后重置滤波，重新追踪时不滞后
                         poseInit = false
                         renderer.faceMatrix = null
                         runOnUiThread { statusText.text = "等待人脸…" }
                         runOnUiThread { poseHud.text = "head: --" }
+                    } else if (!faceLocked) {
+                        renderer.faceMatrix = null
                     }
                 }
             }

@@ -19,6 +19,24 @@ object NcnnEngine {
     external fun nativeRun(handle: Long, inputName: String, data: FloatArray,
                            names: Array<String>, dims: IntArray): FloatArray?
     external fun nativeRelease(handle: Long)
+    // 整条 det→landmark→Procrustes→pose 链（C++ 确定性移植）。frame 为 BGR(w×h×3)；
+    // out 需 ≥26：out[0..8]=basis(right,up,normal), [9..11]=pos3(cm,z 朝前),
+    // [12..25]=bbox14(x1,y1,x2,y2,5×2 kps, 全帧 px)。返回 1=成功。
+    external fun nativePose(det: Long, lm: Long, frame: ByteArray, w: Int, h: Int, out: FloatArray): Int
+
+    /** 一次调用拿整条 head-pose：输入「正立 BGR」帧，返回 [26]（见 nativePose）或 null。 */
+    fun poseOf(bgr: org.opencv.core.Mat): FloatArray? {
+        if (detNet == 0L || lmNet == 0L) return null
+        val w = bgr.cols().toInt(); val h = bgr.rows().toInt()
+        if (w <= 0 || h <= 0) return null
+        val bytes = ByteArray(w * h * 3)
+        bgr.get(0, 0, bytes)
+        val out = FloatArray(26)
+        val hit = try {
+            nativePose(detNet, lmNet, bytes, w, h, out)
+        } catch (t: Throwable) { Log.w("gscp-ncnn", "nativePose fail", t); 0 }
+        return if (hit == 1) out else null
+    }
 
     fun initLoad() {
         try {
