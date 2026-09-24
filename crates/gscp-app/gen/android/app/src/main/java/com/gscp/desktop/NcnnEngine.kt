@@ -21,7 +21,8 @@ object NcnnEngine {
     external fun nativeRelease(handle: Long)
     /** 清空跨帧锁定（离线逐帧测试用；设备端不需要）。 */
     external fun nativeResetTrack()
-    /** nativePose 内部 6 阶段平均耗时（µs）+ 成功帧数：det前处理/det前向/解码+NMS/lm裁剪/lm前向/解算。 */
+    /** nativePose 内部 6 阶段平均耗时（µs）+ 计数：[6]成功帧 [7]调用次数 [8]真跑 det 的次数。
+     *  各阶段按自己的样本数取均值；节流后 det 均值只算 det 帧，每帧摊销值 = det × [8]/[7]。 */
     external fun nativeProf(): DoubleArray
     external fun nativeProfReset()
     // 整条 det→landmark→Procrustes→pose 链（C++ 确定性移植）。frame 为 BGR(w×h×3)；

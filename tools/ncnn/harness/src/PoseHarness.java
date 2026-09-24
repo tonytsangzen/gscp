@@ -94,7 +94,9 @@ public class PoseHarness {
                 }
             }
             decoded++;
-            eng.nativeResetTrack();
+            // 默认逐帧独立（对齐 CoreML 参考）；GSCP_KEEP_TRACK=1 时保留跨帧锁定，
+            // 用于喂连续帧序列验证 det 节流的外推质量。
+            if (System.getenv("GSCP_KEEP_TRACK") == null) eng.nativeResetTrack();
             float[] p = new float[26];
             int ok = eng.nativePose(det, lm, bgr, w, h, p);
             String ds = datasetOf(src);
@@ -153,9 +155,11 @@ public class PoseHarness {
                     pct(v, 0.5), pct(v, 0.95), Collections.max(v));
         }
         double[] pr = eng.nativeProf();
+        double detRatio = pr[7] > 0 ? pr[8] / pr[7] : 0;
         System.out.printf(Locale.US,
-                "nativePose 阶段均值 µs/帧 (n=%d): det前处理 %.0f | det前向 %.0f | 解码+NMS %.0f | lm裁剪 %.0f | lm前向 %.0f | 解算+Procrustes %.0f%n",
-                (long) pr[6], pr[0], pr[1], pr[2], pr[3], pr[4], pr[5]);
+                "nativePose 阶段均值 µs/帧 (成功=%d 调用=%d 实际det=%d 每%.2f帧一次): det前处理 %.0f | det前向 %.0f | 解码+NMS %.0f | lm裁剪 %.0f | lm前向 %.0f | 解算+Procrustes %.0f%n",
+                (long) pr[6], (long) pr[7], (long) pr[8], 1.0 / Math.max(detRatio, 1e-9),
+                pr[0], pr[1], pr[2], pr[3], pr[4], pr[5]);
     }
 
     /** 从 src 路径取数据集名（metahuman_tracking 再带一层子目录）。 */

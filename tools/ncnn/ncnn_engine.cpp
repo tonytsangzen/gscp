@@ -67,7 +67,14 @@ static ncnn::Net* load_net(const std::string& param, const std::string& bin, boo
     }
     if (gpu && nc_gpu_count() > 0) {
         o.use_vulkan_compute = true;
-        const bool stor = allow_fp16 && mode != 2;
+        // 两个网各自独立开 fp16，便于真机 A/B：debug.gscp.f16.det / debug.gscp.f16.lm = 0/1
+        // 覆盖调用方的 allow_fp16（未设 → 沿用默认，当前两网都走 fp32）。Mali 上 fp32 算术是
+        // det 160ms/lm 58ms 的主因（CPU 口径分别 386/143ms），fp16 才有带宽与算力收益。
+        char f16s[8] = {0};
+        __system_property_get(param.find("det_") != std::string::npos
+                                  ? "debug.gscp.f16.det" : "debug.gscp.f16.lm", f16s);
+        const bool wantFp16 = f16s[0] == '0' ? false : f16s[0] == '1' ? true : allow_fp16;
+        const bool stor = wantFp16 && mode != 2;
         o.use_fp16_packed = stor;
         o.use_fp16_storage = stor;
         o.use_fp16_arithmetic = stor && mode != 3;
@@ -94,16 +101,18 @@ static ncnn::Net* load_net(const std::string& param, const std::string& bin, boo
 
 // ── nativePose 分阶段累计耗时（ms）────────────────────────────────────────────
 // 0=det 前处理 1=det 前向 2=解码+NMS+选脸 3=lm 裁剪 4=lm 前向 5=解算+Procrustes+定位
+// 每段各自的样本数单独记：检不出脸的帧也真的付了 det 前向的时间，却在解算前 break，
+// 若用「累计时间 / 成功帧数」会把 miss 帧摊进成功帧的均值里（时间被高估）。
 static double g_prof[6] = {0, 0, 0, 0, 0, 0};
-static long g_profN = 0;
+static long g_pc[6] = {0, 0, 0, 0, 0, 0};
 
 static inline double nc_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
 }
-// 只在成功路径上记账：失败帧的提前 break 不计入，避免把「没跑完」摊进平均值。
-#define NCP(mark) do { double _n = nc_ms(); g_prof[mark] += _n - _t; _t = _n; } while (0)
+// 每段独立计数：某段之后的时间只在跑到下一段的帧里出现。
+#define NCP(mark) do { double _n = nc_ms(); g_prof[mark] += _n - _t; g_pc[mark]++; _t = _n; } while (0)
 
 extern "C" {
 
@@ -246,6 +255,14 @@ static const float* nc_unpack(const ncnn::Mat& src, ncnn::Mat& tmp) {
     return (const float*)m.data;
 }
 
+// det 输入的等比缩放系数（aspect-preserve，长边→640）。节流帧不跑 det 也要用它把
+// 640px 空间的锁定框换回帧坐标，所以单独成函数，与 nc_det_input 严格同源。
+static float nc_det_scale(int w, int h) {
+    const float rr = (float)h / w;
+    const int nh = (rr > 1) ? NCPOSE_DET : (int)(NCPOSE_DET * rr);
+    return (float)nh / h;
+}
+
 // det 输入：BGR 帧 aspect-preserve letterbox 到 640（图像占左上区）；返回归一化 RGB (x-127.5)/128。
 static ncnn::Mat nc_det_input(const unsigned char* bgr, int w, int h, float& scale) {
     const int D = NCPOSE_DET;
@@ -314,8 +331,56 @@ static void nc_decode(const ncnn::Mat* out, std::vector<NCDet>& dets) {
 }
 
 // —— 跨帧检测关联（锁定上一帧人脸，IoU 关联），避免 pick 在多张脸/窗口间来回切换 ——
-struct NCTrack { bool on = false; float x1 = 0, y1 = 0, x2 = 0, y2 = 0; };
+// 框与关键点都在 det 的 640 letterbox 像素空间；ex/ey/sh 是上一帧 landmark 观测到的
+// 特征（同空间），用来把框平移+缩放到下一帧，从而支持「det 隔帧跑」的节流。
+struct NCTrack {
+    bool on = false; float x1 = 0, y1 = 0, x2 = 0, y2 = 0; float kps[10] = {0};
+    float ex = 0, ey = 0, sh = 0;        // 眼中心 + 眼→下巴竖直跨度（尺度参考）
+    float vx = 0, vy = 0, vsr = 0;       // 每帧速度：由相邻两帧观测 EWMA 差分
+    bool hasF = false;
+    int sinceDet = 0;                    // 距上次真正跑 SCRFD 的帧数
+};
 static NCTrack g_track;
+// det 节流档位：debug.gscp.detN = 每 N 帧跑一次 SCRFD（1=逐帧，与节流前行为完全一致）。
+// 环境变量 GSCP_DET_N 供 host 离线测试用（host 的 __system_property_get 是桩）。
+static int g_detEvery = 1;
+static int g_sinceProp = 0;   // 属性读取节流计数（免每帧走 property 查找）
+static long g_poseCalls = 0;  // nativePose 调用次数
+static long g_detCalls = 0;   // 其中真正跑了 det 的次数
+
+static void nc_det_prop() {
+    if (g_sinceProp++ % 30) return;
+    char s[8] = {0};
+    __system_property_get("debug.gscp.detN", s);
+    const char* e = getenv("GSCP_DET_N");
+    int v = e && *e ? atoi(e) : (s[0] ? atoi(s) : 1);
+    g_detEvery = v < 1 ? 1 : (v > 16 ? 16 : v);
+}
+
+// 用上帧观测到的运动把锁定框搬到本帧；返回 true = 本帧不必跑 SCRFD。
+// 节奏：sinceDet = 距上次 det 已过的帧数（det 帧归零）。跳过帧 1..N-1、第 N 帧重检测
+// → 恰好「每 N 帧一次 det」。任何不该外推的情形（未锁定/无特征/运动或尺度突变）都返回
+// false 退回检测 —— 节流的全部风险都在这一步，宁可多跑 det。N=1 时恒 false，与逐帧检测等价。
+static bool nc_track_predict(NCDet& box) {
+    if (!g_track.on || g_detEvery <= 1) return false;
+    if (g_track.sinceDet >= g_detEvery) return false;   // 到重检测周期
+    if (!g_track.hasF) return false;
+    const float bw = g_track.x2 - g_track.x1, bh = g_track.y2 - g_track.y1;
+    if (!(bw > 8.f && bh > 8.f)) return false;
+    if (std::abs(g_track.vx) > 0.15f * bw || std::abs(g_track.vy) > 0.15f * bh) return false;
+    const float rho = 1.f + g_track.vsr;
+    if (rho < 0.85f || rho > 1.18f) return false;
+    const float cx = (g_track.x1 + g_track.x2) * 0.5f + g_track.vx;
+    const float cy = (g_track.y1 + g_track.y2) * 0.5f + g_track.vy;
+    const float hw = bw * 0.5f * rho, hh = bh * 0.5f * rho;
+    box.x1 = cx - hw; box.y1 = cy - hh; box.x2 = cx + hw; box.y2 = cy + hh;
+    box.score = 1.f;   // 复用框：置信度只用于日志，不参与挑选
+    for (int i = 0; i < 5; i++) {
+        box.kps[i * 2] = cx + (g_track.kps[i * 2] - (g_track.x1 + g_track.x2) * 0.5f) * rho;
+        box.kps[i * 2 + 1] = cy + (g_track.kps[i * 2 + 1] - (g_track.y1 + g_track.y2) * 0.5f) * rho;
+    }
+    return box.x2 > box.x1 && box.y2 > box.y1;
+}
 
 static float bb_iou(float a1x, float a1y, float a2x, float a2y,
                     float b1x, float b1y, float b2x, float b2y) {
@@ -372,7 +437,7 @@ static int nc_pick(std::vector<NCDet>& dets) {
         // 锁住的目标不在画面：短时不乱跳；连续超额帧仍没有才弃锁
         g_lostCnt++;
         if (g_lostCnt > 16) {
-            g_track.on = false; g_lostCnt = 0;
+            g_track = NCTrack(); g_lostCnt = 0;
             // 允许重新获取：选当前最高分
             int bi = keep[0]; float bs = -1.f;
             for (int k : keep) if (dets[k].score > bs) { bs = dets[k].score; bi = k; }
@@ -501,32 +566,48 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         const unsigned char* bgr = (const unsigned char*)b;
 
         double _t = nc_ms();
-        float scale = 1.f;
-        ncnn::Mat inm = nc_det_input(bgr, w, h, scale);
-        NCP(0);
+        g_poseCalls++;
+        nc_det_prop();
+        if (g_track.on) g_track.sinceDet++;   // 距上次检测的帧数；跑 det 的帧会归零
+        float scale = nc_det_scale(w, h);
+        NCDet dm;
+        // det 节流：SCRFD 640×640 是单帧最大成本（真机 Mali fp32 实测 det 131–160 ms，
+        // 1k3d68@192 只 32–42 ms），而位姿由 landmark 决定。每 g_detEvery 帧跑一次 SCRFD，
+        // 其余帧用上一帧 landmark 观测到的平移/缩放把锁定框外推出来（见 nc_track_predict）。
+        // g_detEvery=1（默认/属性未设）时 predict 直接返回 false → 与逐帧检测完全等价。
+        if (!nc_track_predict(dm)) {
+            ncnn::Mat inm = nc_det_input(bgr, w, h, scale);
+            NCP(0);
 
-        // det forward → 9 输出
-        ncnn::Mat outm[9];
-        {
-            ncnn::Extractor ex = det->create_extractor();
-            if (ex.input("in0", inm) != 0) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
-            const char* os[9] = {"out0","out1","out2","out3","out4","out5","out6","out7","out8"};
-            bool ok = true;
-            for (int i = 0; i < 9; i++) if (ex.extract(os[i], outm[i]) != 0) { ok = false; break; }
-            if (!ok) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
+            // det forward → 9 输出
+            ncnn::Mat outm[9];
+            {
+                ncnn::Extractor ex = det->create_extractor();
+                if (ex.input("in0", inm) != 0) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
+                const char* os[9] = {"out0","out1","out2","out3","out4","out5","out6","out7","out8"};
+                bool ok = true;
+                for (int i = 0; i < 9; i++) if (ex.extract(os[i], outm[i]) != 0) { ok = false; break; }
+                if (!ok) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
+            }
+            NCP(1);
+            g_detCalls++;
+
+            std::vector<NCDet> dets;
+            nc_decode(outm, dets);
+            int pick = nc_pick(dets);
+            if (pick < 0) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
+            dm = dets[pick];
+            if (!(dm.x1 >= 0.f)) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }   // NaN 校验
+            g_track.sinceDet = 0;
+            NCP(2);
+        } else {
+            NCP(2);
         }
-        NCP(1);
-
-        std::vector<NCDet> dets;
-        nc_decode(outm, dets);
-        int pick = nc_pick(dets);
-        if (pick < 0) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
-        const NCDet& dm = dets[pick];
-        float bw = dm.x2 - dm.x1, bh = dm.y2 - dm.y1;
-        if (!(dm.x1 >= 0.f) || bw <= 0.f || bh <= 0.f) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }   // NaN 校验
-        // 更新跨帧跟踪（640px 坐标）：保持同一张脸
+        const float bw = dm.x2 - dm.x1, bh = dm.y2 - dm.y1;
+        if (!(bw > 0.f && bh > 0.f)) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
+        // 更新跨帧锁定（640px 坐标 + 关键点，供下一帧外推）：保持同一张脸
         g_track.on = true; g_track.x1 = dm.x1; g_track.y1 = dm.y1; g_track.x2 = dm.x2; g_track.y2 = dm.y2;
-        NCP(2);
+        for (int i = 0; i < 10; i++) g_track.kps[i] = dm.kps[i];
 
         float bx1 = dm.x1 / scale, by1 = dm.y1 / scale, bx2 = dm.x2 / scale, by2 = dm.y2 / scale;
 
@@ -563,6 +644,22 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         }
         bool nany = false; for (int i = 0; i < 68 * 3; i++) if (!(lmk[i] == lmk[i])) { nany = true; break; }
         if (nany) break;
+        // —— 节流用的特征观测（与锁定框同在 640px 空间：lmk 是帧坐标，×scale 还原）——
+        // 眼中心给平移，眼→下巴竖直跨度给尺度：跨度沿 y 方向，受 yaw 影响小，比瞳距稳。
+        {
+            const float exx = (eye_center_x(lmk, 36, 40) + eye_center_x(lmk, 42, 46)) * 0.5f * scale;
+            const float eyy = (eye_center_y(lmk, 36, 40) + eye_center_y(lmk, 42, 46)) * 0.5f * scale;
+            const float shh = lmk[8 * 3 + 1] * scale - eyy;
+            if (shh > 4.f) {
+                if (g_track.hasF) {
+                    const float a = 0.5f;   // EWMA：不把单帧 landmark 噪声全转成速度
+                    g_track.vx += (exx - g_track.ex - g_track.vx) * a;
+                    g_track.vy += (eyy - g_track.ey - g_track.vy) * a;
+                    g_track.vsr += (shh / g_track.sh - 1.f - g_track.vsr) * a;
+                }
+                g_track.ex = exx; g_track.ey = eyy; g_track.sh = shh; g_track.hasF = true;
+            }
+        }
 #ifdef __APPLE__
         if (getenv("GSCP_LMK")) {
             double mz = 0; for (int i = 0; i < 68; i++) mz += lmk[i * 3 + 2];
@@ -637,30 +734,33 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         o[9] = px; o[10] = py1; o[11] = pz;
         o[12] = bx1; o[13] = by1; o[14] = bx2; o[15] = by2;
         for (int i = 0; i < 5 && 4 + i * 2 + 1 < 14; i++) { o[16 + i * 2] = dm.kps[i * 2] / scale; o[17 + i * 2] = dm.kps[i * 2 + 1] / scale; }
-        NCP(5); g_profN++;
+        NCP(5);
         R = 1;
     } while (0);
     env->ReleaseFloatArrayElements(out, o, R ? 0 : JNI_ABORT);
     return R;
 }
 
-/** 返回 nativePose 的 6 个阶段平均耗时（µs）+ 成功帧数；见文件级 g_prof 注释。 */
+/** nativePose 阶段均值（µs）+ 计数：
+ *  [0..5]=六段均值 [6]=成功帧数 [7]=调用次数 [8]=其中真正跑了 det 的次数。
+ *  各段样本数不同（见 g_pc 注释）；节流后 det 均值只按 det 帧算，摊到每帧要乘 [8]/[7]。 */
 JNIEXPORT jdoubleArray JNICALL
 Java_com_gscp_desktop_NcnnEngine_nativeProf(JNIEnv* env, jobject) {
-    jdoubleArray a = env->NewDoubleArray(7);
+    jdoubleArray a = env->NewDoubleArray(9);
     if (!a) return nullptr;
-    double v[7];
-    double n = g_profN > 0 ? (double)g_profN : 1.0;
-    for (int i = 0; i < 6; i++) v[i] = g_prof[i] / n * 1e3;
-    v[6] = (double)g_profN;
-    env->SetDoubleArrayRegion(a, 0, 7, v);
+    double v[9];
+    for (int i = 0; i < 6; i++) v[i] = g_prof[i] / (g_pc[i] > 0 ? g_pc[i] : 1) * 1e3;
+    v[6] = (double)g_pc[5];
+    v[7] = (double)g_poseCalls;
+    v[8] = (double)g_detCalls;
+    env->SetDoubleArrayRegion(a, 0, 9, v);
     return a;
 }
 
 JNIEXPORT void JNICALL
 Java_com_gscp_desktop_NcnnEngine_nativeProfReset(JNIEnv*, jobject) {
-    for (int i = 0; i < 6; i++) g_prof[i] = 0;
-    g_profN = 0;
+    for (int i = 0; i < 6; i++) { g_prof[i] = 0; g_pc[i] = 0; }
+    g_poseCalls = 0; g_detCalls = 0;
 }
 
 }  // extern "C"

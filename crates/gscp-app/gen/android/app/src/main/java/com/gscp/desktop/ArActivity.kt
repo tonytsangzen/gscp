@@ -484,13 +484,16 @@ class ArActivity : AppCompatActivity() {
                         detectCount, fpsNow, msAvg[5], msAvg[0], msAvg[1], msAvg[2], msAvg[3],
                         msAvg[4], msAvg[5] - sum),
                 )
-                // 原生链内部拆分（µs→ms）：det前处理/det前向/解码NMS/lm裁剪/lm前向/解算
+                // 原生链内部拆分（µs→ms）：det前处理/det前向/解码NMS/lm裁剪/lm前向/解算。
+                // det 均值只按真跑了 det 的帧算 → 摊销值乘 det次数/调用次数（节流后才是每帧成本）。
                 val pr = NcnnEngine.nativeProf()
+                val detRatio = if (pr[7] > 0) pr[8] / pr[7] else 0.0
                 android.util.Log.i(
                     "gscp-ar",
                     String.format(java.util.Locale.US,
-                        "native#%d n=%.0f｜前处理 %5.1f det %6.1f 解码 %4.2f｜裁剪 %5.1f lm %6.1f 解算 %4.2f",
-                        detectCount, pr[6], pr[0] / 1e3, pr[1] / 1e3, pr[2] / 1e3,
+                        "native#%d 成功%.0f/%.0f帧 det每%.1f帧｜前处理 %5.1f det %6.1f(摊 %5.1f) 解码 %4.2f｜裁剪 %5.1f lm %6.1f 解算 %4.2f",
+                        detectCount, pr[6], pr[7], if (detRatio > 0) 1.0 / detRatio else 0.0,
+                        pr[0] / 1e3, pr[1] / 1e3, pr[1] * detRatio / 1e3, pr[2] / 1e3,
                         pr[3] / 1e3, pr[4] / 1e3, pr[5] / 1e3),
                 )
             }
