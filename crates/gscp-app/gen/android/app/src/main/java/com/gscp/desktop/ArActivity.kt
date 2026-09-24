@@ -533,6 +533,18 @@ class ArActivity : AppCompatActivity() {
                         pr[0] / 1e3, pr[1] / 1e3, pr[1] * detRatio / 1e3, pr[2] / 1e3,
                         pr[3] / 1e3, pr[4] / 1e3, pr[5] / 1e3),
                 )
+                // 节流退回原因占比：节奏本身(周期)之外的份额就是「本可以外推却退回检测」的
+                // 开销，用来判断该往哪个方向放宽外推条件（运动/尺度阈值、特征参考）。
+                val tk = (9..14).map { pr[it].toLong() }.toLongArray()
+                val tkS = tk.sum().coerceAtLeast(1L)
+                android.util.Log.i(
+                    "gscp-ar",
+                    String.format(java.util.Locale.US,
+                        "throttle# 周期%.0f%% 未锁%.0f%% 无特征%.0f%% 框小%.0f%% 运动%.0f%% 尺度%.0f%% 退化%.0f%%",
+                        tk[0] * 100.0 / tkS, tk[1] * 100.0 / tkS, tk[2] * 100.0 / tkS,
+                        tk[3] * 100.0 / tkS, tk[4] * 100.0 / tkS, tk[5] * 100.0 / tkS,
+                        tk[6] * 100.0 / tkS),
+                )
             }
         } catch (e: Exception) {
             android.util.Log.w("gscp-ar", "analyze failed", e)

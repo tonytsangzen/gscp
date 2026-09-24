@@ -350,6 +350,10 @@ static int g_detEvery = 3;
 static int g_sinceProp = 0;   // 属性读取节流计数（免每帧走 property 查找）
 static long g_poseCalls = 0;  // nativePose 调用次数
 static long g_detCalls = 0;   // 其中真正跑了 det 的次数
+// 节流退回原因计数（nc_track_predict 每帧归一类）：0=到重检测周期 1=未锁定 2=无 landmark
+// 参考 3=框过小 4=位移过快 5=尺度突变 6=外推框退化。用来在真机上判断「det 每 2.4 帧一次」
+// 到底是节奏本身还是退回条件太紧，进而决定往哪个方向放宽。
+static long g_tkR[7] = {0, 0, 0, 0, 0, 0, 0};
 
 static void nc_det_prop() {
     if (g_sinceProp++ % 30) return;
@@ -365,14 +369,16 @@ static void nc_det_prop() {
 // → 恰好「每 N 帧一次 det」。任何不该外推的情形（未锁定/无特征/运动或尺度突变）都返回
 // false 退回检测 —— 节流的全部风险都在这一步，宁可多跑 det。N=1 时恒 false，与逐帧检测等价。
 static bool nc_track_predict(NCDet& box) {
-    if (!g_track.on || g_detEvery <= 1) return false;
-    if (g_track.sinceDet >= g_detEvery) return false;   // 到重检测周期
-    if (!g_track.hasF) return false;
+    if (!g_track.on || g_detEvery <= 1) { g_tkR[1]++; return false; }
+    if (g_track.sinceDet >= g_detEvery) { g_tkR[0]++; return false; }  // 到重检测周期
+    if (!g_track.hasF) { g_tkR[2]++; return false; }
     const float bw = g_track.x2 - g_track.x1, bh = g_track.y2 - g_track.y1;
-    if (!(bw > 8.f && bh > 8.f)) return false;
-    if (std::abs(g_track.vx) > 0.15f * bw || std::abs(g_track.vy) > 0.15f * bh) return false;
+    if (!(bw > 8.f && bh > 8.f)) { g_tkR[3]++; return false; }
+    if (std::abs(g_track.vx) > 0.15f * bw || std::abs(g_track.vy) > 0.15f * bh) {
+        g_tkR[4]++; return false;
+    }
     const float rho = 1.f + g_track.vsr;
-    if (rho < 0.85f || rho > 1.18f) return false;
+    if (rho < 0.85f || rho > 1.18f) { g_tkR[5]++; return false; }
     const float cx = (g_track.x1 + g_track.x2) * 0.5f + g_track.vx;
     const float cy = (g_track.y1 + g_track.y2) * 0.5f + g_track.vy;
     const float hw = bw * 0.5f * rho, hh = bh * 0.5f * rho;
@@ -382,7 +388,8 @@ static bool nc_track_predict(NCDet& box) {
         box.kps[i * 2] = cx + (g_track.kps[i * 2] - (g_track.x1 + g_track.x2) * 0.5f) * rho;
         box.kps[i * 2 + 1] = cy + (g_track.kps[i * 2 + 1] - (g_track.y1 + g_track.y2) * 0.5f) * rho;
     }
-    return box.x2 > box.x1 && box.y2 > box.y1;
+    if (!(box.x2 > box.x1 && box.y2 > box.y1)) { g_tkR[6]++; return false; }
+    return true;
 }
 
 static float bb_iou(float a1x, float a1y, float a2x, float a2y,
@@ -745,18 +752,20 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
 }
 
 /** nativePose 阶段均值（µs）+ 计数：
- *  [0..5]=六段均值 [6]=成功帧数 [7]=调用次数 [8]=其中真正跑了 det 的次数。
+ *  [0..5]=六段均值 [6]=成功帧数 [7]=调用次数 [8]=其中真正跑了 det 的次数
+ *  [9..15]=节流退回原因计数（见 g_tkR 注释：0=周期 1=未锁 2=无特征 3=框小 4=运动 5=尺度 6=退化）。
  *  各段样本数不同（见 g_pc 注释）；节流后 det 均值只按 det 帧算，摊到每帧要乘 [8]/[7]。 */
 JNIEXPORT jdoubleArray JNICALL
 Java_com_gscp_desktop_NcnnEngine_nativeProf(JNIEnv* env, jobject) {
-    jdoubleArray a = env->NewDoubleArray(9);
+    jdoubleArray a = env->NewDoubleArray(9 + 7);
     if (!a) return nullptr;
-    double v[9];
+    double v[9 + 7];
     for (int i = 0; i < 6; i++) v[i] = g_prof[i] / (g_pc[i] > 0 ? g_pc[i] : 1) * 1e3;
     v[6] = (double)g_pc[5];
     v[7] = (double)g_poseCalls;
     v[8] = (double)g_detCalls;
-    env->SetDoubleArrayRegion(a, 0, 9, v);
+    for (int i = 0; i < 7; i++) v[9 + i] = (double)g_tkR[i];
+    env->SetDoubleArrayRegion(a, 0, 9 + 7, v);
     return a;
 }
 
@@ -764,6 +773,7 @@ JNIEXPORT void JNICALL
 Java_com_gscp_desktop_NcnnEngine_nativeProfReset(JNIEnv*, jobject) {
     for (int i = 0; i < 6; i++) { g_prof[i] = 0; g_pc[i] = 0; }
     g_poseCalls = 0; g_detCalls = 0;
+    for (int i = 0; i < 7; i++) g_tkR[i] = 0;
 }
 
 }  // extern "C"
