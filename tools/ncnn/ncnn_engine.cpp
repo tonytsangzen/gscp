@@ -1,8 +1,26 @@
-// ncnn_engine.cpp — JNI shim for NCNN(-vulkan, fp16) det_10g + 1k3d68.
+// ncnn_engine.cpp — JNI shim for NCNN(-vulkan) det_10g + 1k3d68，GPU 上 fp32 激活存储
+// （Mali 上 fp16 存储致 SCRFD 逐帧闪跳、fp16 权重致 landmark 漂移，真机+ht §5.13b 实测）。
 // 除原生张量注入(nativeRun)外，还提供整条「det→landmark→Procrustes→pose」链的
-// 确定性 C++ 移植 nativePose()：一次调用返回 right/up/normal + 世界位(cm)。
+// 确定性 C++ 移植 nativePose()：一次调用返回 R 的行(r1,r2,r3；人脸轴取 R 的列) + 世界位(cm)。
+#ifdef __APPLE__
+// host 离线测试构建（jar harness）：桩掉 android log / system property，其余逻辑与设备一致。
+#include <jni.h>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+enum { ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5 };
+static inline int __android_log_print(int, const char* tag, const char* fmt, ...)
+{
+    if (getenv("GSCP_HOST_LOG")) { va_list ap; va_start(ap, fmt); fprintf(stderr, "[%s] ", tag);
+        vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap); }
+    return 0;
+}
+static inline int __system_property_get(const char*, char* v) { v[0] = 0; return 0; }
+#else
 #include <jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
+#endif
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -11,14 +29,20 @@
 #include <thread>
 #include "net.h"
 #include "gpu.h"
-#include <sys/system_properties.h>
 
 #define TAG "gscp-ncnn"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-static ncnn::Net* load_net(const std::string& param, const std::string& bin, bool gpu) {
-    (void)ncnn::get_gpu_count();
+// host 构建链接的 libncnn.a 是 CPU-only（NCNN_VULKAN=OFF），无 get_gpu_count 符号。
+#ifdef __APPLE__
+static inline int nc_gpu_count() { return 0; }
+#else
+static inline int nc_gpu_count() { return ncnn::get_gpu_count(); }
+#endif
+
+static ncnn::Net* load_net(const std::string& param, const std::string& bin, bool gpu, bool allow_fp16) {
+    (void)nc_gpu_count();
     ncnn::Net* net = new ncnn::Net();
     ncnn::Option o = net->opt;
     o.num_threads = (int)std::thread::hardware_concurrency();
@@ -31,19 +55,21 @@ static ncnn::Net* load_net(const std::string& param, const std::string& bin, boo
     o.lightmode = false;
     o.use_packing_layout = true;
     char pb[64]={0}; __system_property_get("debug.gscp.novulkan", pb);
-    // 引擎选择：默认（未设）全 GPU fp16（det+lm，~95ms/帧，真机已验）；
-    // debug.gscp.novulkan 1=强制全 CPU，2=全 GPU fp32。
+    // 引擎选择：默认（未设）全 GPU，fp16 与否由各调用方 allow_fp16 决定（当前 det/lmk 均 fp32，
+    // 见 NcnnEngine.initDet 注释——Mali 上 fp16 激活存储致 SCRFD 逐帧闪跳，真机实测）。
+    // debug.gscp.novulkan 1=强制全 CPU，2=全 GPU fp32，3=fp16 存储+fp32 算术（对照实验档）。
     int mode = pb[0] ? pb[0] - '0' : -1;
     if (mode == 1) {
         gpu = false;               // 全 CPU
-    } else {                        // 默认/-1、0、2 → 全 GPU（-1/0=fp16，2=fp32）
+    } else {                        // 默认/-1、0、2、3 → 全 GPU
         gpu = true;
     }
-    if (gpu && ncnn::get_gpu_count() > 0) {
+    if (gpu && nc_gpu_count() > 0) {
         o.use_vulkan_compute = true;
-        o.use_fp16_packed = (mode != 2);
-        o.use_fp16_storage = (mode != 2);
-        o.use_fp16_arithmetic = (mode != 2);
+        const bool stor = allow_fp16 && mode != 2;
+        o.use_fp16_packed = stor;
+        o.use_fp16_storage = stor;
+        o.use_fp16_arithmetic = stor && mode != 3;
         o.use_int8_storage = false;
         o.use_int8_arithmetic = false;
     } else {
@@ -61,7 +87,7 @@ static ncnn::Net* load_net(const std::string& param, const std::string& bin, boo
         return nullptr;
     }
     LOGI("loaded %s gpu=%d vulkanAvail=%d fp16Arith=%d", param.c_str(),
-         (int)o.use_vulkan_compute, (int)(ncnn::get_gpu_count() > 0), (int)o.use_fp16_arithmetic);
+         (int)o.use_vulkan_compute, (int)(nc_gpu_count() > 0), (int)o.use_fp16_arithmetic);
     return net;
 }
 
@@ -69,10 +95,11 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL
 Java_com_gscp_desktop_NcnnEngine_nativeInit(JNIEnv* env, jobject,
-                                            jstring param, jstring bin, jboolean useGpu) {
+                                            jstring param, jstring bin, jboolean useGpu,
+                                            jboolean allowFp16) {
     const char* p = env->GetStringUTFChars(param, nullptr);
     const char* b = env->GetStringUTFChars(bin, nullptr);
-    ncnn::Net* net = p && b ? load_net(p, b, useGpu == JNI_TRUE) : nullptr;
+    ncnn::Net* net = p && b ? load_net(p, b, useGpu == JNI_TRUE, allowFp16 == JNI_TRUE) : nullptr;
     if (p) env->ReleaseStringUTFChars(param, p);
     if (b) env->ReleaseStringUTFChars(bin, b);
     return (jlong)net;
@@ -153,12 +180,14 @@ Java_com_gscp_desktop_NcnnEngine_nativeRun(JNIEnv* env, jobject, jlong handle,
 
 // ============================================================================
 // 整条 face→landmark→pose 链的确定性 C++ 移植（源自 ht/insightface/Kotlin）。
-// nativePose(frame BGR, w, h) → out[0..8]=basis(right,up,normal)，
-// out[9..11]=pos3(cm,z 朝前)，out[12..25]=bbox14(x1,y1,x2,y2,5×2 kps 全帧 px)。
+// nativePose(frame BGR, w, h) → out[0..8]=R 的行 (r1,r2,r3)，R 把 canonical 帧旋到 landmark 系 L
+//   (X 右 / Y 下 / Z 朝相机)；人脸自身三轴 = R 的「列」：横轴=(o0,o3,o6)、下轴=(o1,o4,o7)、
+//   朝外法线=(o2,o5,o8)。不做朝相机强制翻号（翻号会让 yaw 反号，与 CoreML/insightface 不一致）。
+// out[9..11]=pos3(cm, x右/y上/z朝前，含 3×IPD 前移)，out[12..25]=bbox14(x1,y1,x2,y2,5×2 kps 全帧 px)。
 // 返回 1=有脸并解出；0=失败。
 // ============================================================================
 
-#define NCPOSE_DET 640
+#define NCPOSE_DET 640   // 必须与 det 导出的固定 Reshape 尺寸一致（param 里 12800/3200/800=640²）
 #define NCPOSE_LM 192
 #define NCPOSE_THR 0.45f
 #define NCPOSE_NMS 0.4f
@@ -279,6 +308,12 @@ static float bb_iou(float a1x, float a1y, float a2x, float a2y,
 // NMS + 锁定式跟踪：一旦锁定某个人脸，只跟随与其重叠(IoU>0.3)的候选；
 // 短暂找不到时不乱跳到随机框(保持锁定)，连续超阈值帧仍无重叠才放弃并重新获取。
 static int g_lostCnt = 0;   // 已无法关联到的连续帧数
+
+JNIEXPORT void JNICALL
+Java_com_gscp_desktop_NcnnEngine_nativeResetTrack(JNIEnv*, jobject)
+{
+    g_track.on = false; g_lostCnt = 0;
+}
 static int nc_pick(std::vector<NCDet>& dets) {
     if (dets.empty()) {   // 本帧det没输出可用框
         if (g_track.on) { g_lostCnt++; if (g_lostCnt > 16) { g_track.on = false; g_lostCnt = 0; } }
@@ -357,10 +392,13 @@ static ncnn::Mat lm_input(const unsigned char* bgr, int w, int h, float bx1, flo
 
     ncnn::Mat o(L, L, 3);
     for (int c = 0; c < 3; c++) { float* pc = (float*)o.channel(c); for (int p = 0; p < L * L; p++) pc[p] = 0.f; }
+    // 重采样必须用 dst→src 的逆仿射(i**)：等价于 cv2.warpAffine(M) 的内部映射。
+    // 曾用正变换 a**（步进 sM<1）→ 只采到以 cx,cy 为中心 ~85px 窗（远小于 1.5×bbox），
+    // landmark 网络输入错误，姿态近常数（jar 离线测试复现）。
     for (int py = 0; py < L; py++) {
-        double v = a10 * py + a12;
+        double v = i11 * py + i12;
         for (int px = 0; px < L; px++) {
-            double u = a00 * px + a02;
+            double u = i00 * px + i02;
             int u0 = (int)std::floor(u), v0 = (int)std::floor(v);
             double fu = u - u0, fv = v - v0;
             float rb = 0, rg = 0, rr = 0;
@@ -473,12 +511,15 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         ncnn::Mat predM;
         {
             ncnn::Extractor ex = lm->create_extractor();
-            if (ex.input("data", lmIn) != 0) break;
-            if (ex.extract("fc1", predM) != 0) break;
+            if (ex.input("in0", lmIn) != 0) break;
+            if (ex.extract("out0", predM) != 0) break;
         }
         ncnn::Mat pu;
         const float* pred = nc_unpack(predM, pu);
-        size_t npred = predM.total();
+        // 逻辑长度（w*h*c=3309=1103点×3），不能用 predM.total()：ncnn 会按 SIMD 对齐
+        // 补到 3312（1104点），使 base=npred/3-68 多算 1 点 → x/y/z 三元组整体错位
+        // 1 点，姿态被锁死成近常数（jar 离线测试对 ht/CoreML 实测复现）。
+        size_t npred = (size_t)predM.w * predM.h * predM.c;
         if (npred < 3 * 69) break;
         size_t base = npred / 3 - 68;
         float half = NCPOSE_LM * 0.5f;
@@ -494,6 +535,29 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         }
         bool nany = false; for (int i = 0; i < 68 * 3; i++) if (!(lmk[i] == lmk[i])) { nany = true; break; }
         if (nany) break;
+#ifdef __APPLE__
+        if (getenv("GSCP_LMK")) {
+            double mz = 0; for (int i = 0; i < 68; i++) mz += lmk[i * 3 + 2];
+            fprintf(stderr, "[lmk] npred=%zu base=%zu lm0=(%.1f,%.1f,%.2f) lm30=(%.1f,%.1f,%.2f) meanz=%.2f\n",
+                    (size_t)(predM.total()), base, lmk[0], lmk[1], lmk[2], lmk[90], lmk[91], lmk[92], mz / 68);
+            if (getenv("GSCP_RAW")) {
+                fprintf(stderr, "[raw] w=%d h=%d c=%d pack=%d es=%d tot=%zu zS=%.4f i00=%.4f i02=%.2f i11=%.4f i12=%.2f\n",
+                        predM.w, predM.h, predM.c, predM.elempack, predM.elemsize, predM.total(), zS, i00, i02, i11, i12);
+                fprintf(stderr, "[raw] first12="); for (int i=0;i<12;i++) fprintf(stderr," %.5f", pred[i]); fprintf(stderr,"\n");
+                fprintf(stderr, "[raw] last6pts="); for (int i=0;i<2;i++) fprintf(stderr," (%.4f,%.4f,%.4f)", pred[base*3+i*3],pred[base*3+i*3+1],pred[base*3+i*3+2]); fprintf(stderr,"\n");
+            }
+            if (getenv("GSCP_RAW2")) {
+                FILE* f = fopen("/tmp/lmk_raw.txt", "a");
+                if (f) { for (int i = 0; i < 68; i++) fprintf(f, "%.5f %.5f %.5f\n",
+                          pred[(base+i)*3], pred[(base+i)*3+1], pred[(base+i)*3+2]); fclose(f); }
+            }
+            if (getenv("GSCP_LMK2")) {
+                FILE* f = fopen("/tmp/lmk_dump.txt", "a");
+                if (f) { for (int i = 0; i < 68; i++) fprintf(f, "%.4f %.4f %.4f\n", lmk[i*3], lmk[i*3+1], lmk[i*3+2]);
+                         fprintf(f, "# bbox %.2f %.2f %.2f %.2f img %dx%d\n", bx1, by1, bx2, by2, w, h); fclose(f); }
+            }
+        }
+#endif
 
         // —— Procrustes（法方程）→ basis ——
         double A[4][4] = {{0}}, RHS[4][3] = {{0}};
@@ -517,7 +581,8 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         double n3 = std::sqrt(r3n[0]*r3n[0] + r3n[1]*r3n[1] + r3n[2]*r3n[2]);
         if (n3 < 1e-9) break;
         float nx = (float)(r3n[0]/n3), ny = (float)(r3n[1]/n3), nz = (float)(r3n[2]/n3);
-        if (nz < 0.f) { nx = -nx; ny = -ny; nz = -nz; }
+        // 此处曾强制 nz>0（法线朝相机）：与 insightface P2sRt 的 r3 约定不一致，
+        // 会使 yaw 反号（jar 离线测试对 CoreML 实测）。朝向修正只放在渲染层做。
         float rx = (float)r1n[0], ry = (float)r1n[1], rz = (float)r1n[2];
         float ux = (float)r2n[0], uy = (float)r2n[1], uz = (float)r2n[2];
 
@@ -532,7 +597,10 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         float wxx = (bcx - w * 0.5f) / (float)focal * depth;
         float wy = (h * 0.5f - bcy) / (float)focal * depth;
         float d3 = 3.0f * NCPOSE_IPD_CM;
-        float px = wxx + nx * d3, py1 = wy + ny * d3, pz = depth + nz * d3;
+        // landmark/Procrustes 系 L：X 右 / Y 下 / Z 朝相机（canonical 鼻尖 z 最大 → 脸法线 = +R 第3列）。
+        // 位置系 P：X 右 / Y 上 / Z 朝前（渲染器再取 -z 得 GL 系）。
+        // 朝相机位移 = +法线在 P 系 = (rz, -uz, -nz)；旧实现误用 r3 行并强制 +z，overlay 被推到脸后 18.6cm。
+        float px = wxx + rz * d3, py1 = wy - uz * d3, pz = depth - nz * d3;
 
         // —— 写出 ——
         o[0] = rx; o[1] = ry; o[2] = rz;

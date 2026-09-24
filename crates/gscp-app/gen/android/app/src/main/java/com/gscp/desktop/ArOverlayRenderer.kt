@@ -273,9 +273,11 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         } catch (_: Exception) {
         }
 
-        // 投影：FOV 以正立画面（720×1280）垂直方向为基准，完整视野可见
-        val imgW = 720f
-        val imgH = 1280f
+        // 投影几何必须与 drawFullscreen 画的相机底图完全同源：正立画面尺寸 =
+        // (cameraBufferHeight × cameraBufferWidth)。之前硬编码 720×1280（9:16），而预览缓冲
+        // 实际是 4:3，frustum 的横向比例与画面差 1.33 倍——脸上位置越偏越歪，轴杆直接落到画面外。
+        val imgW = cameraBufferHeight
+        val imgH = cameraBufferWidth
         val near = 5f
         val far = 1000f
         val fovY = Math.toRadians(50.0)
@@ -289,8 +291,8 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         proj[11] = -1f; proj[14] = -2f * far * near / (far - near)
 
         // 平面姿态一律由人脸 3D 决定，不再强制与屏幕平行：
-        // 主路径用 5 点重建的金字塔底面姿态（faceBasis：右/上/法线，世界系，法线朝相机），
-        // 使平面与底面平行且随头部 yaw/pitch 三维倾斜；无解算时退化为正对相机的平面兜底。
+        // 主路径用 Procrustes 解算的人脸姿态（faceBasis：右/上/朝外法线，渲染器系 X右/Y上/Z朝相机，
+        // 法线已保证指向观察者），使平面随头部 yaw/pitch 三维倾斜；无解算时退化为正对相机的平面兜底。
         val size = overlayWidthCm.coerceAtLeast(1f) * planeScale
         val ar = overlayAspect.coerceIn(0.5f, 3f)
         val hy = size / ar
@@ -324,7 +326,6 @@ class ArOverlayRenderer : GLSurfaceView.Renderer {
         val fit = minOf(viewportW / imgW, viewportH / imgH)
         val ndcX = imgW * fit / viewportW
         val ndcY = imgH * fit / viewportH
-        mvp[0] *= ndcX; mvp[4] *= ndcX; mvp[8] *= ndcX; mvp[12] *= ndcX
         mvp[0] *= ndcX; mvp[4] *= ndcX; mvp[8] *= ndcX; mvp[12] *= ndcX
         mvp[1] *= ndcY; mvp[5] *= ndcY; mvp[9] *= ndcY; mvp[13] *= ndcY
         drawOverlayQuad()

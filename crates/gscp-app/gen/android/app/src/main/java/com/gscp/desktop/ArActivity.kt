@@ -34,7 +34,6 @@ import org.opencv.core.MatOfPoint3f
 import org.opencv.core.Point
 import org.opencv.core.Point3
 import org.opencv.core.Size
-import org.opencv.objdetect.FaceDetectorYN
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -43,7 +42,7 @@ import kotlin.math.tan
 
 /**
  * AR 试验模式：仅拉取眼镜 overlay 流，手机摄像头拍摄现实画面，
- * YuNet（OpenCV FaceDetectorYN）检测人脸 + 5 点几何解算头部位姿，
+ * NCNN(-vulkan) SCRFD det_10g + 1k3d68 全链（nativePose）解算头部位姿，
  * 把 overlay 作为虚拟平面绘制在第一张稳定追踪人脸的正前方
  * （平面法线与人脸法线重合，距离/大小可调）。
  *
@@ -65,7 +64,6 @@ class ArActivity : AppCompatActivity() {
 
     private var connection: ScrcpyConnection? = null
     private var overlayDecoder: VideoDecoder? = null
-    private var detector: FaceDetectorYN? = null
     /** insight_procrustes_coreml 管线（SCRFD det_10g → 1k3d68 → Procrustes） */
     private var insight: InsightPose? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
@@ -76,19 +74,25 @@ class ArActivity : AppCompatActivity() {
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
     private var hudLogAt = 0L
-    // 速率统计（FPS + 原生引擎单帧耗时）
+    // 速率统计（FPS + 各阶段单帧耗时）
     private var fpsFrames = 0
     private var fpsStartUp = 0L
     @Volatile private var fpsNow = 0f
-    private var natMsSum = 0L
-    private var natMsCnt = 0
+    // 阶段耗时按 64 帧滑动窗口取均值：累计均值会把冷启动/预热帧永久留在数里，
+    // 读不出一次改动是否真的见效。
+    private val msWin = 64
+    private val preMsRing = FloatArray(msWin)
+    private val natMsRing = FloatArray(msWin)
+    private var msIdx = 0
+    private var msCnt = 0
+    @Volatile private var preMsAvg = 0f
     @Volatile private var natMsAvg = 0f
     private var stabLogAt = 0L
     private var detectCount = 0
     private val lock = Any()
 
     // 可调参数已全部移除（大小改为按眼距自动推算、深度固定）。
-    /** 检测工作尺寸：分析帧缩放到此长边后喂给 YuNet（面积≈该值²，大幅提速）。 */
+    /** 检测工作尺寸：分析帧缩放到此长边后喂给 nativePose（与 det 的 640 输入同尺寸）。 */
     private val detectMaxDim = 640
 
     /** overlay 宽度 = 实测眼距 × 此倍数（约 2.2~2.4 时覆盖整个脸部宽度）。 */
@@ -116,6 +120,9 @@ class ArActivity : AppCompatActivity() {
     private var sPy = 0f
     private var sPz = 0f
     private val sB = FloatArray(9)
+    // 分析帧像素缓冲（按尺寸复用，避免每帧重新分配）
+    private var rgbaBuf: Mat? = null
+    private var bgrBuf: Mat? = null
     private var lastPoseMode = "heur"
     private var epnpFail = 0
 
@@ -218,8 +225,10 @@ class ArActivity : AppCompatActivity() {
                     .setResolutionSelector(
                         androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
                             .setResolutionStrategy(
+                                // 分析流只需 ~2× 检测输入尺寸：det 的输入固定 letterbox 到 640，
+                                // 2160×1620 只会让 toBitmap/缩放/bitmapToMat 多付 4 倍像素开销。
                                 androidx.camera.core.resolutionselector.ResolutionStrategy(
-                                    android.util.Size(2160, 1620),
+                                    android.util.Size(1280, 960),
                                     androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
                                 )
                             )
@@ -249,44 +258,29 @@ class ArActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ── YuNet 人脸检测 + 位姿（正立显示空间）──────────────────
-
-    private fun ensureModelFile(): String {
-        val f = File(filesDir, "face_detection_yunet_2023mar.onnx")
-        if (!f.exists()) {
-            assets.open("face_detection_yunet_2023mar.onnx").use { input ->
-                java.io.FileOutputStream(f).use { output ->
-                    val buf = ByteArray(8192)
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        output.write(buf, 0, n)
-                    }
-                }
-            }
+    /** 阶段耗时滑动窗口均值（仅分析线程写，HUD 读）。 */
+    private fun recordStageMs(pre: Float, nat: Float) {
+        preMsRing[msIdx] = pre
+        natMsRing[msIdx] = nat
+        msIdx = (msIdx + 1) % msWin
+        if (msCnt < msWin) msCnt++
+        var sp = 0f
+        var sn = 0f
+        for (i in 0 until msCnt) {
+            sp += preMsRing[i]
+            sn += natMsRing[i]
         }
-        return f.absolutePath
-    }
-
-    private fun ensureDetector(w: Int, h: Int): FaceDetectorYN {
-        val existing = detector
-        if (existing != null) {
-            existing.setInputSize(Size(w.toDouble(), h.toDouble()))
-            return existing
-        }
-        val d = FaceDetectorYN.create(
-            ensureModelFile(), "", Size(w.toDouble(), h.toDouble()), 0.6f, 0.3f, 3,
-        )
-        detector = d
-        return d
+        preMsAvg = sp / msCnt
+        natMsAvg = sn / msCnt
     }
 
     private fun analyzeFrame(image: ImageProxy) {
         try {
+            val preT0 = android.os.SystemClock.uptimeMillis()
             val full = image.toBitmap()
-            // 一次矩阵变换同时完成「旋转到正立 + 缩放到检测工作尺寸」：
-            // 避免先整帧旋转拷贝、再整帧 bitmapToMat/cvtColor，检测输入面积降至
-            // ≈ detectMaxDim²，YuNet 与像素拷贝耗时随之大幅下降 → 跟踪更跟手。
+            // 一次矩阵变换同时完成「旋转到正立 + 水平镜像 + 缩放到检测工作尺寸」：
+            // 避免先整帧旋转拷贝、再整帧 bitmapToMat/cvtColor，像素搬运量降至
+            // ≈ detectMaxDim²，前处理耗时随之下降 → 跟踪更跟手。
             // 坐标仍在同一帧空间内归一，焦点/距离均用同尺寸 H，缩放不改变位姿数值。
             val sx = full.width
             val sy = full.height
@@ -294,28 +288,40 @@ class ArActivity : AppCompatActivity() {
             val m = Matrix()
             val deg = image.imageInfo.rotationDegrees.toFloat()
             if (deg != 0f) m.postRotate(deg)
-            m.postScale(scale, scale)
+            // 水平镜像：显示链路（背景 Preview 与 overlay 同一帧空间）是自拍镜像，识别帧必须
+            // 同样左右翻转，否则 bbox/landmark/pos 的 x 与画面里的脸左右相反。负 x 缩放直接
+            // 融进这一次矩阵变换，不额外多走一遍像素。
+            m.postScale(-scale, scale)
             val work = Bitmap.createBitmap(full, 0, 0, sx, sy, m, true)
             if (work !== full) full.recycle()
             val W = work.width
             val H = work.height
 
-            val detector = ensureDetector(W, H)
-            val bgr = Mat()
-            Utils.bitmapToMat(work, bgr)
+            // Mat 复用：位图→Mat→BGR 两路缓冲按尺寸缓存，避免每帧重新分配 ~1MB 像素。
+            var rgba = rgbaBuf
+            if (rgba == null || rgba.cols().toInt() != W || rgba.rows().toInt() != H) {
+                rgba?.release()
+                rgba = Mat().also { rgbaBuf = it }
+            }
+            var bgr = bgrBuf
+            if (bgr == null || bgr.cols().toInt() != W || bgr.rows().toInt() != H) {
+                bgr?.release()
+                bgr = Mat().also { bgrBuf = it }
+            }
+            Utils.bitmapToMat(work, rgba)
             work.recycle()
-            // FaceDetectorYN 要求 BGR 3 通道；bitmapToMat 产出 RGBA 4 通道
+            // bitmapToMat 产出 RGBA 4 通道；nativePose 要 BGR 3 通道
             org.opencv.imgproc.Imgproc.cvtColor(
-                bgr, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
+                rgba, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
             )
             // —— 整条 pose 链在 native C++ 完成（det→SCRFD→landmark→Procrustes）——
             val ip = insight
-            // 原生引擎单帧耗时 + FPS 统计
+            // 前处理（取帧/旋转镜像缩放/像素转换）与原生推理分开计时：两者的优化手法完全不同
+            val preMs = (android.os.SystemClock.uptimeMillis() - preT0).toFloat()
             val natT0 = android.os.SystemClock.uptimeMillis()
             val ins = if (ip?.isReady() == true) ip.pose(bgr) else null
             val natMs = (android.os.SystemClock.uptimeMillis() - natT0).toFloat()
-            natMsSum += natMs.toLong(); natMsCnt++
-            natMsAvg = natMsSum.toFloat() / maxOf(natMsCnt.toLong(), 1)
+            recordStageMs(preMs, natMs)
             fpsFrames++
             if (fpsStartUp == 0L) fpsStartUp = android.os.SystemClock.uptimeMillis()
             else if (android.os.SystemClock.uptimeMillis() - fpsStartUp >= 1000) {
@@ -331,7 +337,8 @@ class ArActivity : AppCompatActivity() {
                         detectCount, W, H, if (ins != null) "hit" else "miss", fpsNow, natMsAvg),
                 )
             }
-            // nativePose: [0..8]=basis, [9..11]=pos3(cm), [12..25]=bbox14(全帧 px)
+            // nativePose: [0..8]=R 的行(r1,r2,r3；landmark 系 L=X右/Y下/Z朝相机，人脸轴取 R 的列)，
+            //               [9..11]=pos3(cm, x右/y上/z朝前), [12..25]=bbox14(全帧 px)
             val hasFace = ins != null
             synchronized(lock) {
                 val now = java.lang.System.currentTimeMillis()
@@ -361,7 +368,7 @@ class ArActivity : AppCompatActivity() {
                         runOnUiThread { statusText.text = "已锁定人脸" }
                     }
                     if (faceLocked) {
-                        // nativePose 输出：[0..8]=basis, [9..11]=pos3(cm, z 朝前)
+                        // EMA 只做在 native 原始行向量上（帧间连续），渲染轴在下方换算
                         val candBasis = FloatArray(9)
                         for (i in 0..8) candBasis[i] = p[i]
                         val cpx = p[9]; val cpy = p[10]; val cpz = -p[11]  // 渲染器负朝前系
@@ -375,20 +382,27 @@ class ArActivity : AppCompatActivity() {
                             sPx += (cpx - sPx) * a; sPy += (cpy - sPy) * a; sPz += (cpz - sPz) * a
                             for (i in 0..8) sB[i] += (candBasis[i] - sB[i]) * a
                         }
-                        // 归一化 basis，保证法线朝相机
+                        // 归一化：sB 是 R 的行 (r1,r2,r3)，R 把 canonical 帧旋到 landmark 系 L
+                        // (X 右 / Y 下 / Z 朝相机)；人脸自身三轴在 L 里是 R 的「列」。
                         val rl = kotlin.math.sqrt(sB[0]*sB[0]+sB[1]*sB[1]+sB[2]*sB[2]).toFloat().coerceAtLeast(1e-6f)
                         sB[0]/=rl; sB[1]/=rl; sB[2]/=rl
                         val ul = kotlin.math.sqrt(sB[3]*sB[3]+sB[4]*sB[4]+sB[5]*sB[5]).toFloat().coerceAtLeast(1e-6f)
                         sB[3]/=ul; sB[4]/=ul; sB[5]/=ul
                         val nl = kotlin.math.sqrt(sB[6]*sB[6]+sB[7]*sB[7]+sB[8]*sB[8]).toFloat().coerceAtLeast(1e-6f)
                         sB[6]/=nl; sB[7]/=nl; sB[8]/=nl
-                        if (sB[8] < 0f) { sB[6] = -sB[6]; sB[7] = -sB[7]; sB[8] = -sB[8] }
+                        // L 系(X右,Y下,Z朝相机) → 渲染器系(X右,Y上,Z朝相机)：只翻 y。
+                        // 横轴=R第1列、上轴=-R第2列、朝外法线=+R第3列。
+                        val rb = FloatArray(9)
+                        rb[0] = sB[0]; rb[1] = -sB[3]; rb[2] = sB[6]
+                        rb[3] = -sB[1]; rb[4] = sB[4]; rb[5] = -sB[7]
+                        rb[6] = sB[2]; rb[7] = -sB[5]; rb[8] = sB[8]
+                        if (rb[8] < 0f) { rb[6] = -rb[6]; rb[7] = -rb[7]; rb[8] = -rb[8] }  // 蓝轴始终指向观察者
                         // 位置钳位在画面内
                         val halfW = (sPz * tan(Math.toRadians(25.0)) * 0.9f).toFloat().coerceAtLeast(6f)
                         sPx = sPx.coerceIn(-halfW, halfW)
                         sPy = sPy.coerceIn(-halfW * (H / W.toFloat()), halfW * (H / W.toFloat()))
                         sPz = sPz.coerceIn(-150f, -10f)
-                        renderer.faceBasis = sB.copyOf()
+                        renderer.faceBasis = rb
                         val tm = FloatArray(16)
                         tm[12] = sPx; tm[13] = sPy; tm[14] = sPz; tm[15] = 1f
                         renderer.faceMatrix = tm
@@ -398,18 +412,22 @@ class ArActivity : AppCompatActivity() {
                         // HUD：绘「原始 ncnn 引擎」输出的 pos + 姿态 + 速率统计
                         if (now - hudLogAt > 200) {
                             hudLogAt = now
-                            val deg = 180.0 / kotlin.math.PI
-                            val nYaw = kotlin.math.asin(p[6].toDouble().coerceIn(-1.0, 1.0)) * deg
-                            val nPit = kotlin.math.asin(p[7].toDouble().coerceIn(-1.0, 1.0)) * deg
-                            val nRol = kotlin.math.atan2(p[1].toDouble(), p[0].toDouble()) * deg
+                            val rad2deg = 180.0 / kotlin.math.PI
+                            // rot_to_ypr 作用于 R 的行：yaw=atan2(-o6,√(o0²+o3²))、pitch=atan2(o7,o8)、
+                            // roll=atan2(o3,o0)。报告约定再取反 yaw（ht 校准 p012s-++，yaw>0=转向其自身右侧）。
+                            // 注意：识别帧已按画面做水平镜像，故这里读到的左右方向与画面一致。
+                            val nYaw = -kotlin.math.atan2(-p[6].toDouble(),
+                                kotlin.math.sqrt(p[0] * p[0] + p[3] * p[3]).toDouble()) * rad2deg
+                            val nPit = kotlin.math.atan2(p[7].toDouble(), p[8].toDouble()) * rad2deg
+                            val nRol = kotlin.math.atan2(p[3].toDouble(), p[0].toDouble()) * rad2deg
                             val txt = String.format(
                                 java.util.Locale.US,
                                 "ncnn  pos (%6.1f,%6.1f,%6.1f)cm\n" +
                                     "      yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
-                                    "rate  %4.1f fps · avg %4.1f ms/帧",
+                                    "rate %4.1f fps · pre %4.1f + nat %5.1f ms/帧",
                                 p[9], p[10], -p[11],
                                 nYaw, nPit, nRol,
-                                fpsNow, natMsAvg,
+                                fpsNow, preMsAvg, natMsAvg,
                             )
                             runOnUiThread { poseHud.text = txt }
                         }
@@ -418,7 +436,7 @@ class ArActivity : AppCompatActivity() {
                             val msg = String.format(
                                 java.util.Locale.US,
                                 "face native d=%.0fcm t=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f)",
-                                -sPz, sPx, sPy, sPz, sB[6], sB[7], sB[8],
+                                -sPz, sPx, sPy, sPz, rb[6], rb[7], rb[8],
                             )
                             android.util.Log.i("gscp-ar", msg)
                         }
@@ -678,7 +696,6 @@ class ArActivity : AppCompatActivity() {
         playing = false
         connection?.disconnect()
         analysisExecutor.shutdown()
-        detector = null
         super.onDestroy()
     }
 
