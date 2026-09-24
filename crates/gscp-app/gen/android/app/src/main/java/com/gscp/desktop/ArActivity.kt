@@ -76,6 +76,13 @@ class ArActivity : AppCompatActivity() {
     private var faceLocked = false
     private var lastMatrixLogAt = 0L
     private var hudLogAt = 0L
+    // 速率统计（FPS + 原生引擎单帧耗时）
+    private var fpsFrames = 0
+    private var fpsStartUp = 0L
+    @Volatile private var fpsNow = 0f
+    private var natMsSum = 0L
+    private var natMsCnt = 0
+    @Volatile private var natMsAvg = 0f
     private var detectCount = 0
     private val lock = Any()
 
@@ -302,13 +309,25 @@ class ArActivity : AppCompatActivity() {
             )
             // —— 整条 pose 链在 native C++ 完成（det→SCRFD→landmark→Procrustes）——
             val ip = insight
+            // 原生引擎单帧耗时 + FPS 统计
+            val natT0 = android.os.SystemClock.uptimeMillis()
             val ins = if (ip?.isReady() == true) ip.pose(bgr) else null
+            val natMs = (android.os.SystemClock.uptimeMillis() - natT0).toFloat()
+            natMsSum += natMs.toLong(); natMsCnt++
+            natMsAvg = natMsSum.toFloat() / maxOf(natMsCnt.toLong(), 1)
+            fpsFrames++
+            if (fpsStartUp == 0L) fpsStartUp = android.os.SystemClock.uptimeMillis()
+            else if (android.os.SystemClock.uptimeMillis() - fpsStartUp >= 1000) {
+                fpsNow = fpsFrames * 1000.0f / (android.os.SystemClock.uptimeMillis() - fpsStartUp)
+                fpsFrames = 0; fpsStartUp = android.os.SystemClock.uptimeMillis()
+            }
             detectCount++
             if (detectCount % 60 == 1) {
                 android.util.Log.i(
                     "gscp-ar",
-                    "detect#" + detectCount + " " + W + "x" + H +
-                        " insight=" + (if (ins != null) "hit" else "miss"),
+                    String.format(java.util.Locale.US,
+                        "detect#%d %dx%d insight=%s fps=%.1f nat=%.0fms",
+                        detectCount, W, H, if (ins != null) "hit" else "miss", fpsNow, natMsAvg),
                 )
             }
             // nativePose: [0..8]=basis, [9..11]=pos3(cm), [12..25]=bbox14(全帧 px)
@@ -362,20 +381,21 @@ class ArActivity : AppCompatActivity() {
                         renderer.faceRoll = 0f
                         renderer.overlayWidthCm = 14f
 
-                        // HUD：由 3D 姿态 basis 显式画 head pose
+                        // HUD：绘「原始 ncnn 引擎」输出的 pos + 姿态 + 速率统计
                         if (now - hudLogAt > 200) {
                             hudLogAt = now
-                            val ny = sB[7].toDouble(); val nx = sB[6].toDouble()
-                            val ry = sB[1].toDouble(); val rx = sB[0].toDouble()
                             val deg = 180.0 / kotlin.math.PI
-                            val yaw = kotlin.math.asin(nx.coerceIn(-1.0, 1.0)) * deg
-                            val pitch = kotlin.math.asin(ny.coerceIn(-1.0, 1.0)) * deg
-                            val roll = kotlin.math.atan2(ry, rx) * deg
+                            val nYaw = kotlin.math.asin(p[6].toDouble().coerceIn(-1.0, 1.0)) * deg
+                            val nPit = kotlin.math.asin(p[7].toDouble().coerceIn(-1.0, 1.0)) * deg
+                            val nRol = kotlin.math.atan2(p[1].toDouble(), p[0].toDouble()) * deg
                             val txt = String.format(
                                 java.util.Locale.US,
-                                "head  yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
-                                    "      dist %3.0fcm  pos (%.0f,%.0f,%.0f)",
-                                yaw, pitch, roll, -sPz, sPx, sPy, sPz,
+                                "ncnn  pos (%6.1f,%6.1f,%6.1f)cm\n" +
+                                    "      yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
+                                    "rate  %4.1f fps · avg %4.1f ms/帧",
+                                p[9], p[10], -p[11],
+                                nYaw, nPit, nRol,
+                                fpsNow, natMsAvg,
                             )
                             runOnUiThread { poseHud.text = txt }
                         }
