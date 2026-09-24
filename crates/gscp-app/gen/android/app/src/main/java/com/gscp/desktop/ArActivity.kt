@@ -83,6 +83,7 @@ class ArActivity : AppCompatActivity() {
     private var natMsSum = 0L
     private var natMsCnt = 0
     @Volatile private var natMsAvg = 0f
+    private var stabLogAt = 0L
     private var detectCount = 0
     private val lock = Any()
 
@@ -218,7 +219,7 @@ class ArActivity : AppCompatActivity() {
                         androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
                             .setResolutionStrategy(
                                 androidx.camera.core.resolutionselector.ResolutionStrategy(
-                                    android.util.Size(480, 960),
+                                    android.util.Size(2160, 1620),
                                     androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
                                 )
                             )
@@ -339,6 +340,19 @@ class ArActivity : AppCompatActivity() {
                     var bad = false
                     for (i in 0..11) if (p[i] != p[i]) { bad = true; break }
                     if (bad) { renderer.faceMatrix = null; return@synchronized }
+                    // 稳定性诊断：每 200ms 打当前 pick 的人脸框中心，观察是否在多处跳
+                    if (now - stabLogAt > 200) {
+                        stabLogAt = now
+                        val bcx = (p[12] + p[14]) / 2f
+                        val bcy = (p[13] + p[15]) / 2f
+                        android.util.Log.i(
+                            "gscp-trk",
+                            String.format(java.util.Locale.US,
+                                "pick c=(%5.1f,%5.1f) s=(%4.0fx%4.0f) pos=(%6.1f,%6.1f,%6.1f) fps=%.1f",
+                                bcx, bcy, p[14] - p[12], p[15] - p[13],
+                                p[9], p[10], -p[11], fpsNow),
+                        )
+                    }
                     if (firstFaceAtMillis == 0L) firstFaceAtMillis = now
                     lastFaceAtMillis = now
                     if (!faceLocked && now - firstFaceAtMillis >= 500) {

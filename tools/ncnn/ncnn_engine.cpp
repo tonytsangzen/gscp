@@ -160,9 +160,10 @@ Java_com_gscp_desktop_NcnnEngine_nativeRun(JNIEnv* env, jobject, jlong handle,
 
 #define NCPOSE_DET 640
 #define NCPOSE_LM 192
-#define NCPOSE_THR 0.35f
+#define NCPOSE_THR 0.45f
 #define NCPOSE_NMS 0.4f
 #define NCPOSE_IPD_CM 6.2f
+#define NCPOSE_FACE_CM 24.0f
 
 // canonical 68pt 模板（与 insightface / Kotlin 完全一致）
 static const float NC_CANONICAL[68 * 3] = {
@@ -261,9 +262,28 @@ static void nc_decode(const ncnn::Mat* out, std::vector<NCDet>& dets) {
     }
 }
 
-// NMS + 挑一张脸(score≥max(THR, .9·best) 的最大面积)
+// —— 跨帧检测关联（锁定上一帧人脸，IoU 关联），避免 pick 在多张脸/窗口间来回切换 ——
+struct NCTrack { bool on = false; float x1 = 0, y1 = 0, x2 = 0, y2 = 0; };
+static NCTrack g_track;
+
+static float bb_iou(float a1x, float a1y, float a2x, float a2y,
+                    float b1x, float b1y, float b2x, float b2y) {
+    float xx1 = std::max(a1x, b1x), yy1 = std::max(a1y, b1y),
+          xx2 = std::min(a2x, b2x), yy2 = std::min(a2y, b2y);
+    float iw = std::max(0.f, xx2 - xx1), ih = std::max(0.f, yy2 - yy1);
+    float ix = iw * ih;
+    float u = (a2x - a1x) * (a2y - a1y) + (b2x - b1x) * (b2y - b1y) - ix;
+    return u > 1e-9f ? ix / u : 0.f;
+}
+
+// NMS + 锁定式跟踪：一旦锁定某个人脸，只跟随与其重叠(IoU>0.3)的候选；
+// 短暂找不到时不乱跳到随机框(保持锁定)，连续超阈值帧仍无重叠才放弃并重新获取。
+static int g_lostCnt = 0;   // 已无法关联到的连续帧数
 static int nc_pick(std::vector<NCDet>& dets) {
-    if (dets.empty()) return -1;
+    if (dets.empty()) {   // 本帧det没输出可用框
+        if (g_track.on) { g_lostCnt++; if (g_lostCnt > 16) { g_track.on = false; g_lostCnt = 0; } }
+        return -1;
+    }
     std::vector<int> order(dets.size());
     for (size_t i = 0; i < dets.size(); i++) order[i] = (int)i;
     std::sort(order.begin(), order.end(), [&](int a, int b) { return dets[a].score > dets[b].score; });
@@ -283,14 +303,41 @@ static int nc_pick(std::vector<NCDet>& dets) {
         }
     }
     if (keep.empty()) return -1;
-    float best = -1.f; for (int k : keep) best = std::max(best, dets[k].score);
-    float thr = std::max(NCPOSE_THR, 0.9f * best);
-    int pick = keep[0], area = -1;
-    for (int k : keep) if (dets[k].score >= thr) {
-        float a = (dets[k].x2 - dets[k].x1) * (dets[k].y2 - dets[k].y1);
-        if (a > area) { area = (int)a; pick = k; }
+    if (g_track.on) {
+        // 已锁定：找与锁定框重叠(IoU>0.3)的候选，只跟随它
+        int bestPick = -1; float bestIo = 0.1f;
+        for (int k : keep) {
+            float iou = bb_iou(g_track.x1, g_track.y1, g_track.x2, g_track.y2,
+                               dets[k].x1, dets[k].y1, dets[k].x2, dets[k].y2);
+            if (iou > bestIo) { bestIo = iou; bestPick = k; }
+        }
+        if (bestPick >= 0) { g_lostCnt = 0; return bestPick; }
+        // 锁住的目标不在画面：短时不乱跳；连续超额帧仍没有才弃锁
+        g_lostCnt++;
+        if (g_lostCnt > 16) {
+            g_track.on = false; g_lostCnt = 0;
+            // 允许重新获取：选当前最高分
+            int bi = keep[0]; float bs = -1.f;
+            for (int k : keep) if (dets[k].score > bs) { bs = dets[k].score; bi = k; }
+            g_track.on = true; g_track.x1 = dets[bi].x1; g_track.y1 = dets[bi].y1;
+            g_track.x2 = dets[bi].x2; g_track.y2 = dets[bi].y2;
+            return bi;
+        }
+        return -1;
+    } else {
+        // 初始/重新获取：选 score≥max(THR, .9·best) 中面积最大者作为新锁定
+        g_lostCnt = 0;
+        float best = -1.f; for (int k : keep) best = std::max(best, dets[k].score);
+        float thr = std::max(NCPOSE_THR, 0.9f * best);
+        int pick = keep[0], area = -1;
+        for (int k : keep) if (dets[k].score >= thr) {
+            float a = (dets[k].x2 - dets[k].x1) * (dets[k].y2 - dets[k].y1);
+            if (a > area) { area = (int)a; pick = k; }
+        }
+        g_track.on = true; g_track.x1 = dets[pick].x1; g_track.y1 = dets[pick].y1;
+        g_track.x2 = dets[pick].x2; g_track.y2 = dets[pick].y2;
+        return pick;
     }
-    return pick;
 }
 
 // 1k3d68 输入：BGR 帧按仿射 M=[s0..] 裁剪到 192（raw RGB 0..255）
@@ -414,6 +461,8 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         const NCDet& dm = dets[pick];
         float bw = dm.x2 - dm.x1, bh = dm.y2 - dm.y1;
         if (!(dm.x1 >= 0.f) || bw <= 0.f || bh <= 0.f) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }   // NaN 校验
+        // 更新跨帧跟踪（640px 坐标）：保持同一张脸
+        g_track.on = true; g_track.x1 = dm.x1; g_track.y1 = dm.y1; g_track.x2 = dm.x2; g_track.y2 = dm.y2;
 
         float bx1 = dm.x1 / scale, by1 = dm.y1 / scale, bx2 = dm.x2 / scale, by2 = dm.y2 / scale;
 
@@ -472,13 +521,13 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         float rx = (float)r1n[0], ry = (float)r1n[1], rz = (float)r1n[2];
         float ux = (float)r2n[0], uy = (float)r2n[1], uz = (float)r2n[2];
 
-        // —— 位置（IPD + 垂直 FOV 50° 针孔，3 瞳距前移）——
-        float rex = eye_center_x(lmk, 36, 41), rey = eye_center_y(lmk, 36, 41);
-        float lex = eye_center_x(lmk, 42, 47), ley = eye_center_y(lmk, 42, 47);
-        float ipdPx = std::hypot(rex - lex, rey - ley);
-        if (!(ipdPx >= 1.f)) break;
+        // —— 位置（人脸框高度 + 垂直 FOV 50° 针孔，3 瞳距前移）——
+        // 深度由检测框竖直跨度推得：框高受锁定时比 IPD 稳定，避免远处小脸的
+        // 眼距/landmark 噪声让深度在帧间大幅跳动。
+        float fbh = by2 - by1;
+        if (!(fbh > 1.f)) break;
         double focal = (h * 0.5) / std::tan(25.0 * (3.14159265358979323846 / 180.0));
-        float depth = NCPOSE_IPD_CM * (float)focal / ipdPx;
+        float depth = NCPOSE_FACE_CM * (float)focal / fbh;
         float bcx = (bx1 + bx2) * 0.5f, bcy = (by1 + by2) * 0.5f;
         float wxx = (bcx - w * 0.5f) / (float)focal * depth;
         float wy = (h * 0.5f - bcy) / (float)focal * depth;
