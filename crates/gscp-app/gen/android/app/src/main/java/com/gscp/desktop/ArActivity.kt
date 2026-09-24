@@ -21,11 +21,10 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.calib3d.Calib3d
+import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfDouble
@@ -34,6 +33,7 @@ import org.opencv.core.MatOfPoint3f
 import org.opencv.core.Point
 import org.opencv.core.Point3
 import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -81,7 +81,7 @@ class ArActivity : AppCompatActivity() {
     // 阶段耗时按 64 帧滑动窗口取均值：累计均值会把冷启动/预热帧永久留在数里，
     // 读不出一次改动是否真的见效。子阶段在 1ms 以下，故用 nanoTime 而非 uptimeMillis。
     private val msWin = 64
-    // 依次：toBitmap(YUV→RGBA) / 旋转镜像缩放 / bitmapToMat / cvtColor / pose(Mat→byte + nativePose) / 整次分析
+    // 依次：toBitmap(YUV→RGBA) / bitmapToMat / cvtColor / 旋转+镜像 / pose(nativePose) / 整次分析
     private val msRing = Array(6) { FloatArray(msWin) }
     private val msAvg = FloatArray(6)
     private var msIdx = 0
@@ -122,6 +122,8 @@ class ArActivity : AppCompatActivity() {
     private val sB = FloatArray(9)
     // 分析帧像素缓冲（按尺寸复用，避免每帧重新分配）
     private var rgbaBuf: Mat? = null
+    private var flatBuf: Mat? = null
+    private var spunBuf: Mat? = null
     private var bgrBuf: Mat? = null
     private var lastPoseMode = "heur"
     private var epnpFail = 0
@@ -225,10 +227,14 @@ class ArActivity : AppCompatActivity() {
                     .setResolutionSelector(
                         androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
                             .setResolutionStrategy(
-                                // 分析流只需 ~2× 检测输入尺寸：det 的输入固定 letterbox 到 640，
-                                // 2160×1620 只会让 toBitmap/缩放/bitmapToMat 多付 4 倍像素开销。
+                                // 分析流只要检测真正吃的那份像素：det 输入固定 letterbox 到 640，
+                                // 工作帧也就是 480×640，所以直接向 ISP 要 640×480（与预览同为 4:3，
+                                // 等比、不额外裁 FOV）。原先要 1280×960 再软件下采样一半，那一步
+                                // 每帧白付 ~12 ms；交给硬件缩放后同一份像素免费。模型输入尺寸完全
+                                // 不变（det letterbox 640、landmark 从框裁 192），所以这不是「降分辨
+                                // 率换 fps」。
                                 androidx.camera.core.resolutionselector.ResolutionStrategy(
-                                    android.util.Size(1280, 960),
+                                    android.util.Size(640, 480),
                                     androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
                                 )
                             )
@@ -289,47 +295,78 @@ class ArActivity : AppCompatActivity() {
             val full = image.toBitmap()
             val msToBitmap = msSince(t)
             t = System.nanoTime()
-            // 一次矩阵变换同时完成「旋转到正立 + 水平镜像 + 缩放到检测工作尺寸」：
-            // 避免先整帧旋转拷贝、再整帧 bitmapToMat/cvtColor，像素搬运量降至
-            // ≈ detectMaxDim²，前处理耗时随之下降 → 跟踪更跟手。
-            // 坐标仍在同一帧空间内归一，焦点/距离均用同尺寸 H，缩放不改变位姿数值。
+            // 像素搬运改走 OpenCV 的 NEON 内核：bitmapToMat → cvtColor(RGBA2BGR) →
+            // rotate(转正) → flip(水平镜像)。原先这一步是 Skia 的 createBitmap(矩阵+滤波)，
+            // 同一份 480×640 像素要 ~11 ms，而三趟 8UC3 拷贝合计约 2 ms。
+            // 顺序与旧矩阵严格一致：先旋转到正立、再在正立帧里左右翻转（自拍镜像），
+            // 否则 bbox/landmark/pos 的 x 与画面里的脸左右相反。
             val sx = full.width
             val sy = full.height
+            // CameraX 约定 rotationDegrees ∈ {0,90,180,270}；这里仍先吸附到最近的直角，
+            // 避免个别机型报 271 之类的值时整条几何搬运退化成「不旋转」。
+            val deg = ((image.imageInfo.rotationDegrees + 45) / 90 * 90) % 360
+            // 分析流已按检测工作尺寸申请（640×480），scale 正常恒为 1；若某机型回落到更大
+            // 尺寸，这里仍等比缩到 detectMaxDim，喂给模型的像素规格与旧路径一致。
             val scale = (detectMaxDim / maxOf(sx, sy).toFloat()).coerceIn(0.0f, 1f)
-            val m = Matrix()
-            val deg = image.imageInfo.rotationDegrees.toFloat()
-            if (deg != 0f) m.postRotate(deg)
-            // 水平镜像：显示链路（背景 Preview 与 overlay 同一帧空间）是自拍镜像，识别帧必须
-            // 同样左右翻转，否则 bbox/landmark/pos 的 x 与画面里的脸左右相反。负 x 缩放直接
-            // 融进这一次矩阵变换，不额外多走一遍像素。
-            m.postScale(-scale, scale)
-            val work = Bitmap.createBitmap(full, 0, 0, sx, sy, m, true)
-            if (work !== full) full.recycle()
-            val msScale = msSince(t)
-            t = System.nanoTime()
-            val W = work.width
-            val H = work.height
+            val sw = (sx * scale).toInt().coerceAtLeast(1)
+            val sh = (sy * scale).toInt().coerceAtLeast(1)
+            val rot90 = deg == 90 || deg == 270
+            val W = if (rot90) sh else sw
+            val H = if (rot90) sw else sh
 
-            // Mat 复用：位图→Mat→BGR 两路缓冲按尺寸缓存，避免每帧重新分配 ~1MB 像素。
+            // Mat 复用：RGBA(sx×sy) → BGR(sw×sh) → 旋转后(W×H) → 镜像输出(W×H)，
+            // 四块缓冲按尺寸缓存，避免每帧重新分配 ~1 MB 像素。
             var rgba = rgbaBuf
-            if (rgba == null || rgba.cols().toInt() != W || rgba.rows().toInt() != H) {
+            if (rgba == null || rgba.cols().toInt() != sx || rgba.rows().toInt() != sy) {
                 rgba?.release()
                 rgba = Mat().also { rgbaBuf = it }
+            }
+            var flat = flatBuf
+            if (flat == null || flat.cols().toInt() != sw || flat.rows().toInt() != sh) {
+                flat?.release()
+                flat = Mat().also { flatBuf = it }
+            }
+            var spun = spunBuf
+            if (spun == null || spun.cols().toInt() != W || spun.rows().toInt() != H) {
+                spun?.release()
+                spun = Mat().also { spunBuf = it }
             }
             var bgr = bgrBuf
             if (bgr == null || bgr.cols().toInt() != W || bgr.rows().toInt() != H) {
                 bgr?.release()
                 bgr = Mat().also { bgrBuf = it }
             }
-            Utils.bitmapToMat(work, rgba)
-            work.recycle()
+            Utils.bitmapToMat(full, rgba)
+            full.recycle()
             val msToMat = msSince(t)
             t = System.nanoTime()
-            // bitmapToMat 产出 RGBA 4 通道；nativePose 要 BGR 3 通道
-            org.opencv.imgproc.Imgproc.cvtColor(
-                rgba, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
-            )
+            // 先降到 3 通道再做几何搬运，缩放/旋转/镜像各少付 25% 字节
+            if (scale < 1f) {
+                val rs = Mat()
+                Imgproc.resize(rgba, rs, Size(sw.toDouble(), sh.toDouble()),
+                    0.0, 0.0, Imgproc.INTER_AREA)
+                Imgproc.cvtColor(rs, flat, Imgproc.COLOR_RGBA2BGR)
+                rs.release()
+            } else {
+                Imgproc.cvtColor(rgba, flat, Imgproc.COLOR_RGBA2BGR)
+            }
             val msCvt = msSince(t)
+            t = System.nanoTime()
+            // 旋转到正立 + 水平镜像：两趟 NEON 拷贝（deg=0 时只剩镜像一趟）
+            val upright = when (deg) {
+                90 -> {
+                    Core.rotate(flat, spun, Core.ROTATE_90_CLOCKWISE); spun
+                }
+                180 -> {
+                    Core.rotate(flat, spun, Core.ROTATE_180); spun
+                }
+                270 -> {
+                    Core.rotate(flat, spun, Core.ROTATE_90_COUNTERCLOCKWISE); spun
+                }
+                else -> flat
+            }
+            Core.flip(upright, bgr, 1)
+            val msScale = msSince(t)
             // —— 整条 pose 链在 native C++ 完成（det→SCRFD→landmark→Procrustes）——
             val ip = insight
             t = System.nanoTime()
@@ -480,7 +517,7 @@ class ArActivity : AppCompatActivity() {
                 android.util.Log.i(
                     "gscp-ar",
                     String.format(java.util.Locale.US,
-                        "stage#%d %.1ffps｜整帧 %5.1f = 取图 %5.1f + 缩放 %4.1f + 转Mat %4.1f + 色转 %4.1f + 原生 %5.1f + 其余 %4.1f",
+                        "stage#%d %.1ffps｜整帧 %5.1f = 取图 %5.1f + 旋镜 %4.1f + 转Mat %4.1f + 色转 %4.1f + 原生 %5.1f + 其余 %4.1f",
                         detectCount, fpsNow, msAvg[5], msAvg[0], msAvg[1], msAvg[2], msAvg[3],
                         msAvg[4], msAvg[5] - sum),
                 )
@@ -739,6 +776,8 @@ class ArActivity : AppCompatActivity() {
         analysisExecutor.shutdown()
         // 前处理的两路 Mat 跨帧复用（每帧 release 会逼着 OpenCV 重新分配 ~1MB），只在退出时释放
         rgbaBuf?.release(); rgbaBuf = null
+        flatBuf?.release(); flatBuf = null
+        spunBuf?.release(); spunBuf = null
         bgrBuf?.release(); bgrBuf = null
         super.onDestroy()
     }
