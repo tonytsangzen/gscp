@@ -7,4 +7,7 @@ public class NcnnEngine {
     public native void nativeResetTrack();
     public native int nativePose(long det, long lm, byte[] frame, int w, int h, float[] out);
     public native float[] nativeRun(long handle, String inputName, float[] data, String[] names, int[] dimsOut);
+    /** nativePose 的 5 阶段平均耗时（µs）+ 成功帧数。 */
+    public native double[] nativeProf();
+    public native void nativeProfReset();
 }

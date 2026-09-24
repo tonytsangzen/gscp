@@ -21,6 +21,9 @@ object NcnnEngine {
     external fun nativeRelease(handle: Long)
     /** 清空跨帧锁定（离线逐帧测试用；设备端不需要）。 */
     external fun nativeResetTrack()
+    /** nativePose 内部 6 阶段平均耗时（µs）+ 成功帧数：det前处理/det前向/解码+NMS/lm裁剪/lm前向/解算。 */
+    external fun nativeProf(): DoubleArray
+    external fun nativeProfReset()
     // 整条 det→landmark→Procrustes→pose 链（C++ 确定性移植）。frame 为 BGR(w×h×3)；
     // out 需 ≥26：out[0..8]=R 的行(r1,r2,r3；landmark 系 L=X右/Y下/Z朝相机，人脸轴取 R 的列),
     // [9..11]=pos3(cm,x右/y上/z朝前), [12..25]=bbox14(x1,y1,x2,y2,5×2 kps, 全帧 px)。返回 1=成功。

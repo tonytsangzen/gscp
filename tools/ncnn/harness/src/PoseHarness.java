@@ -152,6 +152,10 @@ public class PoseHarness {
                     e.getKey(), cv[0], cv[1], 100.0 * cv[0] / Math.max(1, cv[0] + cv[1]),
                     pct(v, 0.5), pct(v, 0.95), Collections.max(v));
         }
+        double[] pr = eng.nativeProf();
+        System.out.printf(Locale.US,
+                "nativePose 阶段均值 µs/帧 (n=%d): det前处理 %.0f | det前向 %.0f | 解码+NMS %.0f | lm裁剪 %.0f | lm前向 %.0f | 解算+Procrustes %.0f%n",
+                (long) pr[6], pr[0], pr[1], pr[2], pr[3], pr[4], pr[5]);
     }
 
     /** 从 src 路径取数据集名（metahuman_tracking 再带一层子目录）。 */

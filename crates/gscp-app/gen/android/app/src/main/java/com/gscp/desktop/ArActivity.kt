@@ -79,13 +79,13 @@ class ArActivity : AppCompatActivity() {
     private var fpsStartUp = 0L
     @Volatile private var fpsNow = 0f
     // 阶段耗时按 64 帧滑动窗口取均值：累计均值会把冷启动/预热帧永久留在数里，
-    // 读不出一次改动是否真的见效。
+    // 读不出一次改动是否真的见效。子阶段在 1ms 以下，故用 nanoTime 而非 uptimeMillis。
     private val msWin = 64
-    private val preMsRing = FloatArray(msWin)
-    private val natMsRing = FloatArray(msWin)
+    // 依次：toBitmap(YUV→RGBA) / 旋转镜像缩放 / bitmapToMat / cvtColor / pose(Mat→byte + nativePose) / 整次分析
+    private val msRing = Array(6) { FloatArray(msWin) }
+    private val msAvg = FloatArray(6)
     private var msIdx = 0
     private var msCnt = 0
-    @Volatile private var preMsAvg = 0f
     @Volatile private var natMsAvg = 0f
     private var stabLogAt = 0L
     private var detectCount = 0
@@ -258,26 +258,37 @@ class ArActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** 阶段耗时滑动窗口均值（仅分析线程写，HUD 读）。 */
-    private fun recordStageMs(pre: Float, nat: Float) {
-        preMsRing[msIdx] = pre
-        natMsRing[msIdx] = nat
+    /** 距上一时间戳的毫秒数（浮点，保留亚毫秒分辨率）。 */
+    private fun msSince(nanoStart: Long): Float = (System.nanoTime() - nanoStart) / 1e6f
+
+    /** 记一帧的 6 段耗时并刷新滑动窗口均值（仅分析线程调用；HUD 读 msAvg）。 */
+    private fun recordStageMs(
+        toBitmap: Float, scale: Float, toMat: Float, cvt: Float, pose: Float, total: Float,
+    ) {
+        msRing[0][msIdx] = toBitmap
+        msRing[1][msIdx] = scale
+        msRing[2][msIdx] = toMat
+        msRing[3][msIdx] = cvt
+        msRing[4][msIdx] = pose
+        msRing[5][msIdx] = total
         msIdx = (msIdx + 1) % msWin
         if (msCnt < msWin) msCnt++
-        var sp = 0f
-        var sn = 0f
-        for (i in 0 until msCnt) {
-            sp += preMsRing[i]
-            sn += natMsRing[i]
+        for (k in 0..5) {
+            var s = 0f
+            val ring = msRing[k]
+            for (i in 0 until msCnt) s += ring[i]
+            msAvg[k] = s / msCnt
         }
-        preMsAvg = sp / msCnt
-        natMsAvg = sn / msCnt
+        natMsAvg = msAvg[4]
     }
 
     private fun analyzeFrame(image: ImageProxy) {
         try {
-            val preT0 = android.os.SystemClock.uptimeMillis()
+            var t = System.nanoTime()
+            val tFrame = t
             val full = image.toBitmap()
+            val msToBitmap = msSince(t)
+            t = System.nanoTime()
             // 一次矩阵变换同时完成「旋转到正立 + 水平镜像 + 缩放到检测工作尺寸」：
             // 避免先整帧旋转拷贝、再整帧 bitmapToMat/cvtColor，像素搬运量降至
             // ≈ detectMaxDim²，前处理耗时随之下降 → 跟踪更跟手。
@@ -294,6 +305,8 @@ class ArActivity : AppCompatActivity() {
             m.postScale(-scale, scale)
             val work = Bitmap.createBitmap(full, 0, 0, sx, sy, m, true)
             if (work !== full) full.recycle()
+            val msScale = msSince(t)
+            t = System.nanoTime()
             val W = work.width
             val H = work.height
 
@@ -310,18 +323,18 @@ class ArActivity : AppCompatActivity() {
             }
             Utils.bitmapToMat(work, rgba)
             work.recycle()
+            val msToMat = msSince(t)
+            t = System.nanoTime()
             // bitmapToMat 产出 RGBA 4 通道；nativePose 要 BGR 3 通道
             org.opencv.imgproc.Imgproc.cvtColor(
                 rgba, bgr, org.opencv.imgproc.Imgproc.COLOR_RGBA2BGR,
             )
+            val msCvt = msSince(t)
             // —— 整条 pose 链在 native C++ 完成（det→SCRFD→landmark→Procrustes）——
             val ip = insight
-            // 前处理（取帧/旋转镜像缩放/像素转换）与原生推理分开计时：两者的优化手法完全不同
-            val preMs = (android.os.SystemClock.uptimeMillis() - preT0).toFloat()
-            val natT0 = android.os.SystemClock.uptimeMillis()
+            t = System.nanoTime()
             val ins = if (ip?.isReady() == true) ip.pose(bgr) else null
-            val natMs = (android.os.SystemClock.uptimeMillis() - natT0).toFloat()
-            recordStageMs(preMs, natMs)
+            val natMs = msSince(t)
             fpsFrames++
             if (fpsStartUp == 0L) fpsStartUp = android.os.SystemClock.uptimeMillis()
             else if (android.os.SystemClock.uptimeMillis() - fpsStartUp >= 1000) {
@@ -420,14 +433,19 @@ class ArActivity : AppCompatActivity() {
                                 kotlin.math.sqrt(p[0] * p[0] + p[3] * p[3]).toDouble()) * rad2deg
                             val nPit = kotlin.math.atan2(p[7].toDouble(), p[8].toDouble()) * rad2deg
                             val nRol = kotlin.math.atan2(p[3].toDouble(), p[0].toDouble()) * rad2deg
+                            // native 内部分阶段均值：det前处理/det前向/解码NMS/lm裁剪/lm前向/解算
+                            val pr = NcnnEngine.nativeProf()
                             val txt = String.format(
                                 java.util.Locale.US,
                                 "ncnn  pos (%6.1f,%6.1f,%6.1f)cm\n" +
                                     "      yaw %+5.0f°  pitch %+5.0f°  roll %+5.0f°\n" +
-                                    "rate %4.1f fps · pre %4.1f + nat %5.1f ms/帧",
+                                    "%4.1f fps｜取图 %5.1f 缩放 %4.1f 转Mat %4.1f 色转 %4.1f\n" +
+                                    "原生 %5.1f｜det %5.1f lm %5.1f｜prep %4.1f 裁剪 %4.1f 尾 %4.1f",
                                 p[9], p[10], -p[11],
                                 nYaw, nPit, nRol,
-                                fpsNow, preMsAvg, natMsAvg,
+                                fpsNow, msAvg[0], msAvg[1], msAvg[2], msAvg[3],
+                                msAvg[4], pr[1] / 1e3, pr[4] / 1e3, pr[0] / 1e3, pr[3] / 1e3,
+                                (pr[2] + pr[5]) / 1e3,
                             )
                             runOnUiThread { poseHud.text = txt }
                         }
@@ -455,7 +473,27 @@ class ArActivity : AppCompatActivity() {
                     }
                 }
             }
-            bgr.release()
+            recordStageMs(msToBitmap, msScale, msToMat, msCvt, natMs, msSince(tFrame))
+            // 全流程耗时一行读尽「取图→原生」：logcat 比 HUD 可靠（HUD 只在识别线程拿到脸时刷新）。
+            if (detectCount % 60 == 0) {
+                val sum = msAvg[0] + msAvg[1] + msAvg[2] + msAvg[3] + msAvg[4]
+                android.util.Log.i(
+                    "gscp-ar",
+                    String.format(java.util.Locale.US,
+                        "stage#%d %.1ffps｜整帧 %5.1f = 取图 %5.1f + 缩放 %4.1f + 转Mat %4.1f + 色转 %4.1f + 原生 %5.1f + 其余 %4.1f",
+                        detectCount, fpsNow, msAvg[5], msAvg[0], msAvg[1], msAvg[2], msAvg[3],
+                        msAvg[4], msAvg[5] - sum),
+                )
+                // 原生链内部拆分（µs→ms）：det前处理/det前向/解码NMS/lm裁剪/lm前向/解算
+                val pr = NcnnEngine.nativeProf()
+                android.util.Log.i(
+                    "gscp-ar",
+                    String.format(java.util.Locale.US,
+                        "native#%d n=%.0f｜前处理 %5.1f det %6.1f 解码 %4.2f｜裁剪 %5.1f lm %6.1f 解算 %4.2f",
+                        detectCount, pr[6], pr[0] / 1e3, pr[1] / 1e3, pr[2] / 1e3,
+                        pr[3] / 1e3, pr[4] / 1e3, pr[5] / 1e3),
+                )
+            }
         } catch (e: Exception) {
             android.util.Log.w("gscp-ar", "analyze failed", e)
         } finally {
@@ -696,6 +734,9 @@ class ArActivity : AppCompatActivity() {
         playing = false
         connection?.disconnect()
         analysisExecutor.shutdown()
+        // 前处理的两路 Mat 跨帧复用（每帧 release 会逼着 OpenCV 重新分配 ~1MB），只在退出时释放
+        rgbaBuf?.release(); rgbaBuf = null
+        bgrBuf?.release(); bgrBuf = null
         super.onDestroy()
     }
 

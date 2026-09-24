@@ -26,6 +26,7 @@ static inline int __system_property_get(const char*, char* v) { v[0] = 0; return
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <ctime>
 #include <thread>
 #include "net.h"
 #include "gpu.h"
@@ -90,6 +91,19 @@ static ncnn::Net* load_net(const std::string& param, const std::string& bin, boo
          (int)o.use_vulkan_compute, (int)(nc_gpu_count() > 0), (int)o.use_fp16_arithmetic);
     return net;
 }
+
+// ── nativePose 分阶段累计耗时（ms）────────────────────────────────────────────
+// 0=det 前处理 1=det 前向 2=解码+NMS+选脸 3=lm 裁剪 4=lm 前向 5=解算+Procrustes+定位
+static double g_prof[6] = {0, 0, 0, 0, 0, 0};
+static long g_profN = 0;
+
+static inline double nc_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+// 只在成功路径上记账：失败帧的提前 break 不计入，避免把「没跑完」摊进平均值。
+#define NCP(mark) do { double _n = nc_ms(); g_prof[mark] += _n - _t; _t = _n; } while (0)
 
 extern "C" {
 
@@ -240,19 +254,27 @@ static ncnn::Mat nc_det_input(const unsigned char* bgr, int w, int h, float& sca
     if (rr > 1) { nh = D; nw = (int)(D / rr); } else { nw = D; nh = (int)(D * rr); }
     scale = (float)nh / h;
     ncnn::Mat in(D, D, 3);
-    float fill = (0.0f - 127.5f) * (1.0f / 128.0f);
-    for (int c = 0; c < 3; c++) { float* pc = (float*)in.channel(c); for (int p = 0; p < D * D; p++) pc[p] = fill; }
+    const float fill = (0.0f - 127.5f) * (1.0f / 128.0f);
+    const float inv = 1.0f / 128.0f;
+    // 平面指针提出循环：原来每个像素都调 3 次 in.channel(c)（虚调用 + 对齐计算），
+    // 640×480 帧就是 ~92 万次；letterbox 边框用 std::fill 向量化填。
+    float* pR = (float*)in.channel(0);
+    float* pG = (float*)in.channel(1);
+    float* pB = (float*)in.channel(2);
+    std::fill(pR, pR + (size_t)D * D, fill);
+    std::fill(pG, pG + (size_t)D * D, fill);
+    std::fill(pB, pB + (size_t)D * D, fill);
+    const float iscale = 1.0f / scale;   // 乘法替代内层除法
     for (int y = 0; y < nh; y++) {
-        int sy = (int)(y / scale); if (sy >= h) sy = h - 1;
+        int sy = (int)(y * iscale); if (sy >= h) sy = h - 1;
         const unsigned char* row = bgr + ((size_t)sy * w) * 3;
+        size_t off = (size_t)y * D;
         for (int x = 0; x < nw; x++) {
-            int sx = (int)(x / scale); if (sx >= w) sx = w - 1;
+            int sx = (int)(x * iscale); if (sx >= w) sx = w - 1;
             const unsigned char* p = row + sx * 3;
-            float b = p[0], g = p[1], r = p[2];
-            size_t idx = (size_t)y * D + x;
-            ((float*)in.channel(0))[idx] = (r - 127.5f) * (1.0f / 128.0f);   // RGB: 0=R
-            ((float*)in.channel(1))[idx] = (g - 127.5f) * (1.0f / 128.0f);
-            ((float*)in.channel(2))[idx] = (b - 127.5f) * (1.0f / 128.0f);
+            pR[off + x] = (p[2] - 127.5f) * inv;   // RGB: 0=R
+            pG[off + x] = (p[1] - 127.5f) * inv;
+            pB[off + x] = (p[0] - 127.5f) * inv;
         }
     }
     return in;
@@ -478,8 +500,10 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         if (!b) break;
         const unsigned char* bgr = (const unsigned char*)b;
 
+        double _t = nc_ms();
         float scale = 1.f;
         ncnn::Mat inm = nc_det_input(bgr, w, h, scale);
+        NCP(0);
 
         // det forward → 9 输出
         ncnn::Mat outm[9];
@@ -491,6 +515,7 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
             for (int i = 0; i < 9; i++) if (ex.extract(os[i], outm[i]) != 0) { ok = false; break; }
             if (!ok) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }
         }
+        NCP(1);
 
         std::vector<NCDet> dets;
         nc_decode(outm, dets);
@@ -501,12 +526,14 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         if (!(dm.x1 >= 0.f) || bw <= 0.f || bh <= 0.f) { env->ReleaseByteArrayElements(frame, b, JNI_ABORT); break; }   // NaN 校验
         // 更新跨帧跟踪（640px 坐标）：保持同一张脸
         g_track.on = true; g_track.x1 = dm.x1; g_track.y1 = dm.y1; g_track.x2 = dm.x2; g_track.y2 = dm.y2;
+        NCP(2);
 
         float bx1 = dm.x1 / scale, by1 = dm.y1 / scale, bx2 = dm.x2 / scale, by2 = dm.y2 / scale;
 
         // —— 1k3d68 前向 ——
         double i00, i01, i02, i10, i11, i12, zS;
         ncnn::Mat lmIn = lm_input(bgr, w, h, bx1, by1, bx2, by2, i00, i01, i02, i10, i11, i12, zS);
+        NCP(3);
         env->ReleaseByteArrayElements(frame, b, JNI_ABORT);   // 像素用完，释放
         ncnn::Mat predM;
         {
@@ -514,6 +541,7 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
             if (ex.input("in0", lmIn) != 0) break;
             if (ex.extract("out0", predM) != 0) break;
         }
+        NCP(4);
         ncnn::Mat pu;
         const float* pred = nc_unpack(predM, pu);
         // 逻辑长度（w*h*c=3309=1103点×3），不能用 predM.total()：ncnn 会按 SIMD 对齐
@@ -609,10 +637,30 @@ Java_com_gscp_desktop_NcnnEngine_nativePose(JNIEnv* env, jobject,
         o[9] = px; o[10] = py1; o[11] = pz;
         o[12] = bx1; o[13] = by1; o[14] = bx2; o[15] = by2;
         for (int i = 0; i < 5 && 4 + i * 2 + 1 < 14; i++) { o[16 + i * 2] = dm.kps[i * 2] / scale; o[17 + i * 2] = dm.kps[i * 2 + 1] / scale; }
+        NCP(5); g_profN++;
         R = 1;
     } while (0);
     env->ReleaseFloatArrayElements(out, o, R ? 0 : JNI_ABORT);
     return R;
+}
+
+/** 返回 nativePose 的 6 个阶段平均耗时（µs）+ 成功帧数；见文件级 g_prof 注释。 */
+JNIEXPORT jdoubleArray JNICALL
+Java_com_gscp_desktop_NcnnEngine_nativeProf(JNIEnv* env, jobject) {
+    jdoubleArray a = env->NewDoubleArray(7);
+    if (!a) return nullptr;
+    double v[7];
+    double n = g_profN > 0 ? (double)g_profN : 1.0;
+    for (int i = 0; i < 6; i++) v[i] = g_prof[i] / n * 1e3;
+    v[6] = (double)g_profN;
+    env->SetDoubleArrayRegion(a, 0, 7, v);
+    return a;
+}
+
+JNIEXPORT void JNICALL
+Java_com_gscp_desktop_NcnnEngine_nativeProfReset(JNIEnv*, jobject) {
+    for (int i = 0; i < 6; i++) g_prof[i] = 0;
+    g_profN = 0;
 }
 
 }  // extern "C"
