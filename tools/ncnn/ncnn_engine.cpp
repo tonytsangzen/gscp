@@ -341,9 +341,12 @@ struct NCTrack {
     int sinceDet = 0;                    // 距上次真正跑 SCRFD 的帧数
 };
 static NCTrack g_track;
-// det 节流档位：debug.gscp.detN = 每 N 帧跑一次 SCRFD（1=逐帧，与节流前行为完全一致）。
-// 环境变量 GSCP_DET_N 供 host 离线测试用（host 的 __system_property_get 是桩）。
-static int g_detEvery = 1;
+// det 节流档位：每 N 帧跑一次 SCRFD。属性 debug.gscp.detN（真机 A/B）、环境变量 GSCP_DET_N
+// （host 离线；host 的 __system_property_get 是桩）覆盖，未设时用下面的默认值。
+// 默认 3 的依据（vivo/Mali fp32 实测）：N=1 4.9 fps、N=3 7.5 fps、N=6 9.7 fps；离线连续帧
+// 序列上 N=3 相对逐帧检测的偏差 p50 0.07–0.08°/p95 ≤0.66°、覆盖不掉帧（见 ht 报告 §5.13d）。
+// 设备帧间隔约 130 ms，所以 N=3 的外推时间窗 ≈ 离线（25fps 视频）N=6，属已验证范围。
+static int g_detEvery = 3;
 static int g_sinceProp = 0;   // 属性读取节流计数（免每帧走 property 查找）
 static long g_poseCalls = 0;  // nativePose 调用次数
 static long g_detCalls = 0;   // 其中真正跑了 det 的次数
@@ -353,7 +356,7 @@ static void nc_det_prop() {
     char s[8] = {0};
     __system_property_get("debug.gscp.detN", s);
     const char* e = getenv("GSCP_DET_N");
-    int v = e && *e ? atoi(e) : (s[0] ? atoi(s) : 1);
+    int v = e && *e ? atoi(e) : (s[0] ? atoi(s) : 3);
     g_detEvery = v < 1 ? 1 : (v > 16 ? 16 : v);
 }
 
