@@ -189,7 +189,8 @@ class ScrcpyConnection(
                     adb.push(context.assets.open("scrcpy-server"), "/data/local/tmp/scrcpy-server.jar")
                     adb.reverse("forward:localabstract:scrcpy_$id;tcp:27813")
                     val param = if (overlayOnly) {
-                        "log_level=info video=false audio=false max_size=480 overlay=true"
+                        // max_size=640：竖屏设备 overlay 原生 480×640（与真实分辨率一致）
+                        "log_level=info video=false audio=false max_size=640 overlay=true"
                     } else {
                         "log_level=info video_source=camera audio_source=output " +
                             "max_size=1024 video=true audio=$audioEnabled overlay=true"
