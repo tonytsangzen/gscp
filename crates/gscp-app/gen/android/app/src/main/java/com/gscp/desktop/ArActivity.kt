@@ -203,8 +203,6 @@ class ArActivity : Activity() {
     @Volatile private var lastProcMs = 0f
     @Volatile private var lastDrawMs = 0f
 
-    private lateinit var textPaint: Paint
-    private lateinit var panelPaint: Paint
     private lateinit var connPaint: Paint
     private lateinit var meshPaint: Paint
     private val camDimPaint = Paint().apply {
@@ -253,26 +251,30 @@ class ArActivity : Activity() {
             xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.ADD)
         }
     }
+    // overlay 发光（均匀化）：与旧实现同构（1/4 + 1/16 内容降采样、内容网格投影），
+    // 均匀化手段不依赖任何 Paint 特效——剪影统一着色（不透明像素平均色 + alpha 饱和，
+    // 任意字符贡献相同光源）+ 金字塔多级降/升采样烘焙平滑（纯双线性缩放，必定生效）
     private val bloomMidPaint: Paint by lazy {
         Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            maskFilter = android.graphics.BlurMaskFilter(
-                2 * dp0(), android.graphics.BlurMaskFilter.Blur.NORMAL)
+            alpha = 200
             addBlend()
         }
     }
     private val bloomFarPaint: Paint by lazy {
         Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            maskFilter = android.graphics.BlurMaskFilter(
-                5 * dp0(), android.graphics.BlurMaskFilter.Blur.NORMAL)
+            alpha = 150
             addBlend()
         }
     }
-    private val glowAlphaPaint = Paint().apply { alpha = 200 }        // 中距光晕强度
-    private val bloomFarAlphaPaint = Paint().apply { alpha = 150 }    // 远距光晕强度
-    private var glowBmp: Bitmap? = null       // ob 1/4 降采样（中距光晕）
+    private val glowCm = android.graphics.ColorMatrix()
+    private val glowAlphaPaint = Paint(Paint.FILTER_BITMAP_FLAG)   // 剪影绘制（每帧设平均色 + alpha 饱和）
+    private val glowSmoothPaint = Paint(Paint.FILTER_BITMAP_FLAG)  // 金字塔缩放（纯双线性低通）
+    private var glowBmp: Bitmap? = null       // ob 1/4 降采样（中距光晕，烘焙平滑后）
     private var glowCanvas: Canvas? = null
-    private var bloomFarBmp: Bitmap? = null   // ob 1/16 降采样（远距光晕）
+    private var bloomFarBmp: Bitmap? = null   // ob 1/16 降采样（远距光晕，烘焙平滑后）
     private var bloomFarCanvas: Canvas? = null
+    private var glowHalfBmp: Bitmap? = null   // ob 1/8 中间层（金字塔低通用）
+    private var glowHalfCanvas: Canvas? = null
     private var glowSrc = Rect(0, 0, 0, 0)
     private var glowDst = Rect(0, 0, 0, 0)
     private var farDst = Rect(0, 0, 0, 0)
@@ -396,12 +398,10 @@ class ArActivity : Activity() {
 
     private fun initPaints() {
         val dp = resources.displayMetrics.density
-        textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; typeface = Typeface.MONOSPACE; textSize = 12 * dp
-        }
-        // 背景板上的"连接中..."：绿色，板较大用 16dp 保证可见
-        connPaint = Paint(textPaint).apply {
+        // 锚点处"连接中..."：绿色等宽 16dp（人脸已锚定、overlay 内容未到时提示）
+        connPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = 0xFF90EE90.toInt()
+            typeface = Typeface.MONOSPACE
             textSize = 16 * dp
         }
         meshPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
@@ -422,7 +422,6 @@ class ArActivity : Activity() {
         }
         // 背板（亮屏面板）投影区衬底：微绿低透明压暗
         dimPaint = Paint().apply { color = 0x0800FF00.toInt() }
-        panelPaint = Paint().apply { color = 0xB30d1117.toInt() }
     }
 
     private fun tryStart() {
@@ -763,8 +762,7 @@ class ArActivity : Activity() {
     }
 
     /** 提取面板数据（face0 关键点/姿态）与 overlay 四角锚点；人脸丢失时 faceOv 为空。 */
-    private fun parseResult(j: String, rw: Int, rh: Int) {
-        val lines = ArrayList<String>()
+    private fun parseResult(j: String, rw: Int, rh: Int) {        val lines = ArrayList<String>()
         val ovList = ArrayList<FloatArray>()
         var k0: FloatArray? = null
         var p0: FloatArray? = null
@@ -874,7 +872,7 @@ class ArActivity : Activity() {
         // 后摄模式（frontCamera=false）：显示与录像均走 GL 合成（SurfaceMixer 直出，同第一页
         // 连接模式的渲染管线）；此 Canvas 路径仅在 GL 面未就绪时兜底提示连接状态。
         if (!frontCamera) {
-            drawConnectionStatus(c, vw / 2f, vh / 2f)
+            // 后摄显示走 GL 合成（ar_gl_surface）；此 Canvas 兜底仅保持黑屏
             return
         }
         val b: Bitmap? = synchronized(frameLock) { bmp }
@@ -1013,6 +1011,7 @@ class ArActivity : Activity() {
                     }
                     // 金字塔 bloom：远距光晕（1/16，ADD）→ 中距光晕（1/4，ADD）→ 内容（普通合成）。
                     // 只加光不叠字形；与内容同一 mesh 投影、完全重合，随姿态同步。
+                    // 光晕已在构建期剪影化 + 金字塔低通烘焙 → 任意字符均匀、无块状边界
                     val fb = synchronized(overlayLock) { bloomFarBmp }
                     val gb = synchronized(overlayLock) { glowBmp }
                     if (fb != null) {
@@ -1030,8 +1029,6 @@ class ArActivity : Activity() {
                     c.drawText(t, ccx2 - connPaint.measureText(t) / 2f,
                         ccy2 + connPaint.textSize / 3f, connPaint)
                 }
-            } else {
-                drawConnectionStatus(c, vw / 2f, vh / 2f)
             }
     }
 
@@ -1336,23 +1333,54 @@ class ArActivity : Activity() {
         private var aac: MediaCodec? = null
         private var audioThread: Thread? = null
         private var audioPtsUs = 0L
-        // 手机麦克风对数增强查表（样本异 → 增强后样本）：小音量提升、大音量压缩、满幅映射满幅不溢出
+        // 手机麦克风三段式增益查表：噪声底压低 → 语音电平处 10 倍 → 对数衰减到 1 倍；
+        // 混音和值再过软限幅，防削峰破音
         private val micLut = ShortArray(65536)
 
         init {
-            // y = sign*32767 * log1p(C·|x|) / log1p(C·32767)
-            //  |x|→32767 时 y→32767（满幅不削顶）；|x| 很小时斜率≈32767·C/log1p(C·32767) 即放大倍数
-            val c = 0.0005
-            val denom = Math.log1p((c * 32767.0))
+            // 三段式麦克风增益（对 |x| 单调且 C1 连续，无波形折点 → 不产生谐波破音）：
+            //  1) |x|≤噪声门限：f = a·x —— 底噪压低 ~16dB，不再被增益放大
+            //  2) 门限..满增益电平：三次 Hermite 平滑爬升 —— 10 倍增益作用在语音电平上
+            //  3) 满增益电平以上：f = P·ln(1+q·x) 对数衰减，f(M)=10M、f(32767)=32767
+            //     （满幅映射满幅，最大音量保持不变）
+            val nFloor = MIC_NOISE_FLOOR.toDouble()
+            val mLevel = MIC_FULL_GAIN_LEVEL.toDouble()
+            val xMax = 32767.0
+            // 第 3 段参数：P·ln(1+q·M)=gainPeak·M，P·ln(1+q·X)=X；两式相除后对 q 二分求根
+            // （ln(1+qM)/ln(1+qX) 随 q 单调递增，比值域 (M/X, 1)）
+            val target = MIC_PEAK_GAIN * mLevel / xMax
+            var lo = 1e-7; var hi = 1.0
+            repeat(60) {
+                val mid = (lo + hi) / 2
+                if (Math.log1p(mid * mLevel) / Math.log1p(mid * xMax) < target) lo = mid else hi = mid
+            }
+            val q3 = (lo + hi) / 2
+            val p3 = xMax / Math.log1p(q3 * xMax)
+            val y1 = MIC_PEAK_GAIN * mLevel                        // 第 2 段终点值
+            val slopeEnd = p3 * q3 / (1 + q3 * mLevel)             // 与第 3 段 C1 衔接的斜率
+            val d = mLevel - nFloor
+            fun curve(ax: Double): Double = when {
+                ax <= nFloor -> MIC_NOISE_ATTEN * ax
+                ax <= mLevel -> {
+                    val u = (ax - nFloor) / d
+                    val h00 = 2 * u * u * u - 3 * u * u + 1
+                    val h10 = u * u * u - 2 * u * u + u
+                    val h01 = -2 * u * u * u + 3 * u * u
+                    val h11 = u * u * u - u * u
+                    h00 * (MIC_NOISE_ATTEN * nFloor) + h10 * d * MIC_NOISE_ATTEN +
+                        h01 * y1 + h11 * d * slopeEnd
+                }
+                else -> p3 * Math.log1p(q3 * ax)
+            }
             for (idx in 0 until 65536) {
                 val v = idx - 32768
-                val ax = if (v < 0) -v else v
-                val y = if (ax == 0) 0F
-                        else (if (v > 0) 1F else -1F) * 32767F *
-                            (Math.log1p(c * ax) / denom).toFloat()
-                micLut[idx] = if (y > 32767F) 32767.toShort()
-                              else if (y < -32768F) (-32768).toShort()
-                              else y.toInt().toShort()
+                val ax = (if (v < 0) -v else v).toDouble()
+                val y = if (v > 0) curve(ax) else -curve(ax)
+                micLut[idx] = when {
+                    y > 32767.0 -> 32767.toShort()
+                    y < -32768.0 -> (-32768).toShort()
+                    else -> y.toInt().toShort()
+                }
             }
         }
 
@@ -1593,8 +1621,8 @@ class ArActivity : Activity() {
                         k += 4
                     } else { l = 0; r = 0 }
                     val m = if (i < samplesGot) micLut[(micShort[i].toInt() and 0xFFFF)].toInt() else 0
-                    outBi.putShort(clamp(l + m))
-                    outBi.putShort(clamp(r + m))
+                    outBi.putShort(limitSoft(l + m))
+                    outBi.putShort(limitSoft(r + m))
                 }
                 outBi.rewind()
                 val idx = ac.dequeueInputBuffer(10000)
@@ -1622,8 +1650,15 @@ class ArActivity : Activity() {
             java.util.Arrays.fill(glassBytes, remain, glassBytes.size, (0).toByte())
         }
 
-        private fun clamp(v: Int): Short =
-            if (v > 32767) 32767 else if (v < -32768) -32768 else v.toShort()
+        /** 软限幅防削峰：|v|≤拐点原样通过；超出部分 tanh 平滑压向满幅——连续可导、
+         *  永不越过满幅且无硬剪角，替代会产生方波破音的硬 clamp。 */
+        private fun limitSoft(v: Int): Short {
+            val av = if (v < 0) -v else v
+            if (av <= LIMIT_KNEE) return v.toShort()
+            val over = (av - LIMIT_KNEE).toDouble() / (32767.0 - LIMIT_KNEE)
+            val limited = LIMIT_KNEE + (32767.0 - LIMIT_KNEE) * Math.tanh(over)
+            return (if (v < 0) -limited else limited).toInt().toShort()
+        }
 
         private fun drainAac(ac: MediaCodec, bi: MediaCodec.BufferInfo) {
             val mx = muxer ?: return
@@ -1734,18 +1769,6 @@ class ArActivity : Activity() {
         else -> ""          // 已连接：不再提示"等待画面"，避免遮挡
     }
 
-    /** 在锚点（或屏幕中心）画半透明底的连接状态。 */
-    private fun drawConnectionStatus(c: Canvas, cx: Float, cy: Float) {
-        val s = statusTextFor()
-        val tw = textPaint.measureText(s)
-        val th = textPaint.textSize
-        val pad = 10 * resources.displayMetrics.density
-        c.drawRoundRect(
-            RectF(cx - tw / 2 - pad, cy - th / 2 - pad, cx + tw / 2 + pad, cy + th / 2 + pad),
-            10f, 10f, panelPaint)
-        c.drawText(s, cx - tw / 2, cy + th / 3, textPaint)
-    }
-
     /** 解码线程回调：overlay I420 Image → RGBA Bitmap（BT.601 limited，兼容 planar/semiplanar + cropRect）。
      *  行数据先 bulk 拷到 scratch 数组再逐像素索引（直接读 direct ByteBuffer 逐次都是 JNI）。 */
     private fun convertOverlayFrame(img: Image) {
@@ -1800,6 +1823,7 @@ class ArActivity : Activity() {
                 val cropT = crop.top
                 val uBytes = cw * uPs
                 var o = 0
+                var sumR = 0; var sumG = 0; var sumB = 0; var nOp = 0   // 不透明内容平均色（光晕统一色调）
                 for (j in 0 until h) {
                     val yRow = (j + topRow + cropT) * yRs + cropL
                     if (yRow + w > yB.limit()) break
@@ -1839,17 +1863,26 @@ class ArActivity : Activity() {
                         g = (luma + (g - luma) * 28 / 25).coerceIn(0, 255)
                         b = (luma + (b - luma) * 28 / 25).coerceIn(0, 255)
                         pix[o] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                        if (a >= 64) { sumR += r; sumG += g; sumB += b; nOp++ }
                         o++
                     }
                 }
                 overlayBmp!!.setPixels(pix, 0, w, 0, 0, w, h)
-                // 发光底图：ob 降采样（1/4 中距 + 1/16 远距），与内容同源、随姿态同步
+                // 发光底图：内容剪影（不透明像素平均色 + alpha 饱和）→ 金字塔低通烘焙平滑。
+                // 剪影让任意字符贡献相同的发光源；多级降/升采样（纯双线性缩放）等效大半径
+                // 低通，不依赖 maskFilter——光晕均匀、无块状明暗边界
                 val gw = maxOf(8, w shr 2); val gh = maxOf(8, h shr 2)
+                val hw = maxOf(4, w shr 3); val hh = maxOf(4, h shr 3)
                 val fw = maxOf(4, w shr 4); val fh = maxOf(4, h shr 4)
                 if (glowBmp == null || glowBmp!!.width != gw || glowBmp!!.height != gh) {
                     glowBmp?.recycle()
                     glowBmp = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
                     glowCanvas = Canvas(glowBmp!!)
+                }
+                if (glowHalfBmp == null || glowHalfBmp!!.width != hw || glowHalfBmp!!.height != hh) {
+                    glowHalfBmp?.recycle()
+                    glowHalfBmp = Bitmap.createBitmap(hw, hh, Bitmap.Config.ARGB_8888)
+                    glowHalfCanvas = Canvas(glowHalfBmp!!)
                 }
                 if (bloomFarBmp == null || bloomFarBmp!!.width != fw || bloomFarBmp!!.height != fh) {
                     bloomFarBmp?.recycle()
@@ -1857,10 +1890,39 @@ class ArActivity : Activity() {
                     bloomFarCanvas = Canvas(bloomFarBmp!!)
                 }
                 glowSrc.set(0, 0, w, h); glowDst.set(0, 0, gw, gh); farDst.set(0, 0, fw, fh)
-                glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                glowCanvas!!.drawBitmap(overlayBmp!!, glowSrc, glowDst, glowAlphaPaint)
-                bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                bloomFarCanvas!!.drawBitmap(overlayBmp!!, glowSrc, farDst, bloomFarAlphaPaint)
+                if (nOp > 0) {
+                    // 内容平均色 → 光晕统一色调；alpha ×8 饱和 → 剪影（键控羽化边缘计入轮廓）
+                    val tR = sumR.toFloat() / nOp
+                    val tG = sumG.toFloat() / nOp
+                    val tB = sumB.toFloat() / nOp
+                    glowCm.set(floatArrayOf(
+                        0f, 0f, 0f, 0f, tR,
+                        0f, 0f, 0f, 0f, tG,
+                        0f, 0f, 0f, 0f, tB,
+                        0f, 0f, 0f, 8f, 0f,
+                    ))
+                    glowAlphaPaint.colorFilter = android.graphics.ColorMatrixColorFilter(glowCm)
+                    // 剪影 → 1/4
+                    glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    glowCanvas!!.drawBitmap(overlayBmp!!, glowSrc, glowDst, glowAlphaPaint)
+                    // 金字塔低通：1/4 → 1/8 → 1/4 双线性往返 = 大核平滑，两轮更柔
+                    for (round in 0 until 2) {
+                        glowHalfCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                        glowHalfCanvas!!.drawBitmap(glowBmp!!, null,
+                            android.graphics.RectF(0f, 0f, hw.toFloat(), hh.toFloat()),
+                            glowSmoothPaint)
+                        glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                        glowCanvas!!.drawBitmap(glowHalfBmp!!, null,
+                            android.graphics.RectF(0f, 0f, gw.toFloat(), gh.toFloat()),
+                            glowSmoothPaint)
+                    }
+                    // 远距 = 平滑后 1/4 再降 1/16
+                    bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bloomFarCanvas!!.drawBitmap(glowBmp!!, glowDst, farDst, glowSmoothPaint)
+                } else {
+                    glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                }
                 overlayNew = true
                 if (!overLayerReady) { overLayerReady = true; updateRecBtnVisible() }   // 第二层：overlay 首帧解码
             }
@@ -2185,5 +2247,11 @@ class ArActivity : Activity() {
         // det_10g 图内写死了 448 输入的 FPN 上采样尺寸，实时检测同样固定 448
         private const val LIVE_INPUT = 448
         private const val SCORE_THRESH = 0.50f
+        // 麦克风三段式增益 + 软限幅参数
+        private const val MIC_NOISE_FLOOR = 300      // 噪声门限：以下视为底噪，按 0.15 倍压低
+        private const val MIC_FULL_GAIN_LEVEL = 1200 // 满增益电平：语音起始区，此处增益 10 倍
+        private const val MIC_NOISE_ATTEN = 0.15     // 噪声段衰减斜率
+        private const val MIC_PEAK_GAIN = 10.0       // 满增益倍数
+        private const val LIMIT_KNEE = 26214         // 软限幅拐点（0.8 满幅）
     }
 }
