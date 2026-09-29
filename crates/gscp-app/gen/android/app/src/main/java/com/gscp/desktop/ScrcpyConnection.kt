@@ -36,7 +36,10 @@ class ScrcpyConnection(
         fun onConnect()
         fun onVideoPrepare(codec: String, width: Int, height: Int)
         fun onVideoPackage(buffer: ByteArray, offset: Int, length: Int)
-        fun onAudioPrepare(codec: String, frameRate: Int, channel: Int)
+        /** 音频流就绪：codec 为 4 字节串（"opus" 等）。编解码参数由随后的首帧给出。 */
+        fun onAudioPrepare(codec: String)
+        /** 音频首帧 = 配置包（OpusHead / csd-0）。必须原样交给解码器，绝不能丢弃。 */
+        fun onAudioConfig(csd0: ByteArray)
         fun onAudioPackage(buffer: ByteArray, offset: Int, length: Int)
         fun onOverlayPrepare(codec: String, width: Int, height: Int)
         fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int)
@@ -85,29 +88,51 @@ class ScrcpyConnection(
     private val controlHandler = StreamHandler {
         try {
             val stream = it.openOutputStream()
-            Log.d(TAG, "control channel")
+            Log.e(TAG, "control channel opened")
             while (connected) {
                 Thread.sleep(100)
             }
             stream.close()
         } catch (e: Exception) {
-            Log.d(TAG, "control: ${e.message}")
+            Log.e(TAG, "control: ${e.message}")
         }
     }
 
     private val audioHandler = StreamHandler {
         try {
             val stream = it.openInputStream()
-            val buffer = ByteArray(4096)
-            readFully(stream, buffer, 4)
+            // 首 socket 音频 meta：64B 设备名（实测无 dummy 字节），随后紧接 4B codec("opus")。
+            val meta = ByteArray(64)
+            readFully(stream, meta, meta.size)
+            val buffer = ByteArray(16384)
+            val got = readFully(stream, buffer, 4)
             val codec = String(buffer.copyOfRange(0, 4), StandardCharsets.US_ASCII)
-            Log.d(TAG, "audio channel: $codec")
-            callback?.onAudioPrepare(codec, 48000, 2)
-            readFrame(stream, buffer)
+            Log.e(TAG, "audio channel got=$got codec='$codec' hdr=${buffer.copyOfRange(0, 8).joinToString("") { "%02x".format(it) }}")
+            callback?.onAudioPrepare(codec)
+            // 帧头 12B：ptsAndFlags(8) + size(4, BE)；首帧 config 位=ptsAndFlags 最高位。
+            val header = ByteArray(12)
+            var frames = 0
             while (connected) {
-                val size = readFrame(stream, buffer)
-                if (size > 0) callback?.onAudioPackage(buffer, 0, size)
+                if (!readFully(stream, header, 12)) break
+                val isConfig = (header[0].toInt() and 0x80) != 0
+                val size = ByteBuffer.wrap(header, 8, 4).order(ByteOrder.BIG_ENDIAN).int
+                if (size <= 0 || size > buffer.size) break
+                var off = 0
+                while (off < size) {
+                    val n = stream.read(buffer, off, size - off)
+                    if (n < 0) break
+                    off += n
+                }
+                if (off < size) break
+                if (isConfig) {
+                    Log.i(TAG, "audio config ${buffer.copyOf(minOf(size, 24)).joinToString("") { "%02x".format(it) }}")
+                    callback?.onAudioConfig(buffer.copyOf(size))
+                } else {
+                    callback?.onAudioPackage(buffer, 0, size)
+                    frames++
+                }
             }
+            Log.i(TAG, "audio channel end frames=$frames")
             stream.close()
         } catch (e: Exception) {
             Log.d(TAG, "audio: ${e.message}")
@@ -144,7 +169,7 @@ class ScrcpyConnection(
             val codec = String(buffer.copyOfRange(0, 4), StandardCharsets.US_ASCII)
             val width = ByteBuffer.wrap(buffer.copyOfRange(4, 8)).int
             val height = ByteBuffer.wrap(buffer.copyOfRange(8, 12)).int
-            Log.d(TAG, "overlay channel: $codec ${width}x${height}")
+            Log.e(TAG, "overlay channel: $codec ${width}x${height}")
             callback?.onOverlayPrepare(codec, width, height)
             while (connected) {
                 val size = readFrame(stream, buffer)
@@ -156,8 +181,12 @@ class ScrcpyConnection(
         }
     }
 
-    /** 服务器回连顺序：camera 视频、音频（可选）、control、overlay。 */
+    /** 服务器回连顺序：camera 视频、音频（可选）、control、overlay（禁用者跳过）。
+ *  本工程 overlay 模式下 video 恒关，实测服务端开启顺序为 [audio, control, overlay]，
+ *  audio 承载于“首 socket”，前缀带 1 dummy + 64B 设备名（对 display/output 这类
+ *  带设备名的首 socket；PC 端在 scrcpy.rs 的 sniff_first_socket_stream 正是这么读的）。 */
     private val handleList: List<StreamHandler> = when {
+        overlayOnly && audioEnabled -> listOf(audioHandler, controlHandler, overlayHandler, nullHandler)
         overlayOnly -> listOf(controlHandler, overlayHandler, nullHandler, nullHandler)
         audioEnabled -> listOf(videoHandler, audioHandler, controlHandler, overlayHandler)
         else -> listOf(videoHandler, controlHandler, overlayHandler, nullHandler)
@@ -171,9 +200,8 @@ class ScrcpyConnection(
                 override fun onOpen(stream: AdbStream?) {
                     if (stream != null) {
                         val idx = streamCnt
-                        Thread {
-                            handleList.getOrNull(idx)?.run(stream)
-                        }.start()
+                        Log.e("ar-java", "scrcpy stream #$idx opened")
+                        Thread { handleList.getOrNull(idx)?.run(stream) }.start()
                         streamCnt++
                     }
                 }
@@ -189,12 +217,15 @@ class ScrcpyConnection(
                     adb.push(context.assets.open("scrcpy-server"), "/data/local/tmp/scrcpy-server.jar")
                     adb.reverse("forward:localabstract:scrcpy_$id;tcp:27813")
                     val param = if (overlayOnly) {
-                        // max_size=640：竖屏设备 overlay 原生 480×640（与真实分辨率一致）
-                        "log_level=info video=false audio=false max_size=640 overlay=true"
+                        // max_size=640：竖屏设备 overlay 原生 480×640（与真实分辨率一致）；
+                        // overlay 模式可再开 audio（audio_source=output 抓眼镜端输出），video 恒关。
+                        "log_level=info video=false audio=$audioEnabled max_size=640 overlay=true " +
+                            "audio_source=output"
                     } else {
                         "log_level=info video_source=camera audio_source=output " +
                             "max_size=1024 video=true audio=$audioEnabled overlay=true"
                     }
+                    Log.e("ar-java", "server param: $param")
                     adb.run(
                         "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / " +
                             "com.genymobile.scrcpy.Server 3.3.1 scid=$id $param"

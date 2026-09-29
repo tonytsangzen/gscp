@@ -101,7 +101,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         mixer = SurfaceMixer(this, w, h)
-        audioPlayer = AudioPlayer(48000, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+        audioPlayer = AudioPlayer()
 
         loadSettings()
 
@@ -355,8 +355,12 @@ class MainActivity : AppCompatActivity() {
             videoDecoder?.decode(buffer, offset, length)
         }
 
-        override fun onAudioPrepare(codec: String, frameRate: Int, channel: Int) {
-            if (audioEnabled) audioPlayer.start()
+        override fun onAudioPrepare(codec: String) {
+            // 解码参数由首帧 OpusHead（onAudioConfig）给出，此处无需处理
+        }
+
+        override fun onAudioConfig(csd0: ByteArray) {
+            if (audioEnabled) audioPlayer.start(csd0)
         }
 
         override fun onAudioPackage(buffer: ByteArray, offset: Int, length: Int) {

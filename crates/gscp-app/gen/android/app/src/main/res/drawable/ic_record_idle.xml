@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 相机录制按钮——空闲态：白圈 + 中心红色圆点 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:gravity="center">
+        <shape android:shape="oval">
+            <solid android:color="#80FFFFFF" />
+        </shape>
+    </item>
+    <item
+        android:bottom="10dp"
+        android:left="10dp"
+        android:right="10dp"
+        android:top="10dp"
+        android:gravity="center">
+        <shape android:shape="oval">
+            <solid android:color="#FF2E2E" />
+        </shape>
+    </item>
+</layer-list>

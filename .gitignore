@@ -27,3 +27,6 @@ __pycache__/
 tools/ncnn/harness/classes/
 tools/ncnn/harness/*.jar
 .tmp/
+
+# Android cargo target dir
+/target-android/

@@ -82,15 +82,80 @@
             android:padding="8dp"
             android:text="等待人脸…"
             android:textColor="#FFFFFF"
-            android:textSize="13sp" />
+            android:textSize="13sp"
+            android:visibility="gone" />
     </FrameLayout>
 
-    <!-- 退出按钮（始终可见） -->
-    <Button
-        android:id="@+id/button_exit"
+    <!-- 后摄模式 GL 合成输出面：眼镜视频+overlay 由 SurfaceMixer(GLES2) 直出，
+         盖在 ar_surface 之上；仅后摄可见（前摄走 ar_surface 的 Canvas 人脸 AR） -->
+    <android.view.SurfaceView
+        android:id="@+id/ar_gl_surface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- 底部相机 App 控制条：左=最近录像，中=录像，右=前后摄切换（随录像按钮一起显示/隐藏） -->
+    <LinearLayout
+        android:id="@+id/bottom_controls"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_margin="12dp"
-        android:text="退出" />
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="44dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/last_thumb"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginEnd="54dp"
+            android:background="@drawable/bg_thumb"
+            android:contentDescription="最近录像"
+            android:scaleType="fitCenter"
+            android:src="@android:drawable/ic_media_play" />
+
+        <ImageButton
+            android:id="@+id/button_record"
+            android:layout_width="76dp"
+            android:layout_height="76dp"
+            android:background="@drawable/ic_record_idle"
+            android:contentDescription="录像"
+            android:scaleType="fitCenter" />
+
+        <ImageButton
+            android:id="@+id/btn_switch_cam"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="54dp"
+            android:background="@drawable/bg_switch_btn"
+            android:contentDescription="切换前后摄"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_cam_flip" />
+    </LinearLayout>
+
+    <!-- 录像启动/停止中的忙碌指示：与录像按钮同圆心、同外径的旋转进度环（叠加在按钮上） -->
+    <com.gscp.desktop.RingSpinner
+        android:id="@+id/record_spinner"
+        android:layout_width="76dp"
+        android:layout_height="76dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="44dp"
+        android:visibility="gone" />
+
+    <!-- 顶部状态 overlay：录像中→闪烁红点+时长(常驻)；空闲→信息文字 5s 后隐藏 -->
+    <TextView
+        android:id="@+id/rec_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="44dp"
+        android:background="#80000000"
+        android:gravity="center"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="3dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="12sp"
+        android:typeface="monospace"
+        android:visibility="gone" />
 </FrameLayout>

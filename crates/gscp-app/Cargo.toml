@@ -29,3 +29,8 @@ tauri = { version = "2", features = [] }
 # 桌面端播放器（Android 端预览由 Kotlin MediaCodec 实现，见 PLAN.md M5）
 [target.'cfg(not(target_os = "android"))'.dependencies]
 gscp-player = { path = "../gscp-player" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# 眼镜端 opus 软解（与 PC gscp-player 同源）：本机 MediaCodec c2 opus 解码器不可用
+jni = "0.21"
+opus = "0.3"

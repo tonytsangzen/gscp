@@ -34,7 +34,7 @@ class Adb(context: Context, val callback: StreamCallback? = null) : AbsAdbConnec
 
     init {
         api = Build.VERSION.SDK_INT
-        setTimeout(3, TimeUnit.SECONDS)
+        setTimeout(15, TimeUnit.SECONDS)
         val asset = context.assets
         InputStreamReader(asset.open("ca.key")).use {
             val encoded = Base64.decode(it.readText(), 0)
@@ -49,7 +49,7 @@ class Adb(context: Context, val callback: StreamCallback? = null) : AbsAdbConnec
     }
 
     override fun connect(ip: String, port: Int): Boolean {
-        setTimeout(3, TimeUnit.SECONDS)
+        setTimeout(15, TimeUnit.SECONDS)
         val ret = super.connect(ip, port)
         if (ret) {
             adbConnection?.RegisterStreamCallback(callback)

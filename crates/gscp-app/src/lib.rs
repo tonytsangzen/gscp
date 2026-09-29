@@ -8,6 +8,9 @@
 pub mod commands;
 
 #[cfg(target_os = "android")]
+mod opus_jni;
+
+#[cfg(target_os = "android")]
 #[tauri::mobile_entry_point]
 pub fn mobile_entry() {
     env_logger::init();

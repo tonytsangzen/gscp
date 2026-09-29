@@ -3,95 +3,92 @@ package com.gscp.desktop
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.media.MediaCodec
-import android.media.MediaFormat
-import java.nio.ByteBuffer
+import android.util.Log
 
-/** scrcpy 音频（Opus）解码 + AudioTrack 播放。 */
-class AudioPlayer(val rate: Int, val channel: Int, val format: Int) {
-    private val audioTrack: AudioTrack
-    private val minBufferSize: Int = AudioTrack.getMinBufferSize(rate, channel, format)
-    private val mediaCodec: MediaCodec
+/**
+ * 眼镜端音频播放：opus 帧 —— Rust(`gscp-app::opus_jni`)软解 —— PCM —— AudioTrack。
+ * （本机 MediaCodec `c2.android.opus.decoder` 组件不可用，故与 PC gscp-player 同源走软件解码。）
+ *
+ * 解码出的 PCM(统一立体声) 通过 [onPcm] 同时喂给录像混音器（`recorder.feedGlassesPcm`）。
+ */
+class AudioPlayer {
+    /** 解码出的 PCM(i16 LE 立体声交织) 回调：录像混音用。 */
+    var onPcm: ((ByteArray) -> Unit)? = null
 
-    init {
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(format)
-                    .setSampleRate(rate)
-                    .setChannelMask(channel)
-                    .build()
-            )
-            .setBufferSizeInBytes(minBufferSize * 2) // 双倍缓冲
-            .build()
-        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+    companion object {
+        private const val TAG = "ar-audio"
+        private const val SAMPLE_RATE = 48000
+        // 单帧最多 60ms → 48000*0.06*2ch*2B = 23040 字节
+        private const val PCM_BUF = 23040
     }
 
-    @Synchronized
-    fun start() {
-        val mediaFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, rate, channel)
-        mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 102000)
-        // Opus Identification Header：单声道降混由 Mapping Family 0 处理
-        val csd0bytes = byteArrayOf(
-            0x4f, 0x70, 0x75, 0x73,  // "OpusHead"
-            0x48, 0x65, 0x61, 0x64,
-            0x01,  // Version
-            0x02,  // Channel Count
-            0x38, 0x01,  // Pre-skip
-            0x80.toByte(), 0xbb.toByte(), 0x00, 0x00,  // Input Sample Rate 48000
-            0x00, 0x00,  // Output Gain (Q7.8)
-            0x00,  // Mapping Family
-            0x00
-        )
-        val csd1bytes = ByteArray(8)
-        val csd2bytes = ByteArray(8)
-        mediaFormat.setByteBuffer("csd-0", ByteBuffer.wrap(csd0bytes))
-        mediaFormat.setByteBuffer("csd-1", ByteBuffer.wrap(csd1bytes))
-        mediaFormat.setByteBuffer("csd-2", ByteBuffer.wrap(csd2bytes))
+    private var audioTrack: AudioTrack? = null
+    private var started = false
 
-        mediaCodec.reset()
-        mediaCodec.configure(mediaFormat, null, null, 0)
-        mediaCodec.start()
-        audioTrack.play()
-    }
-
+    /** 用眼镜流首帧 OpusHead(csd-0) 配置（无需内容，Rust 解码器按 48k 立体声建）。 */
     @Synchronized
-    fun stop() {
+    fun start(csd0: ByteArray) {
+        if (started) return
         try {
-            audioTrack.stop()
-            mediaCodec.stop()
-        } catch (_: Exception) {
+            val channelCount = if (csd0.size > 9) csd0[9].toInt() and 0xFF else 2
+            var sampleRate = 48000
+            if (csd0.size >= 16) {
+                sampleRate = (csd0[12].toInt() and 0xFF) or
+                    ((csd0[13].toInt() and 0xFF) shl 8) or
+                    ((csd0[14].toInt() and 0xFF) shl 16) or
+                    ((csd0[15].toInt() and 0xFF) shl 24)
+            }
+            val ok = AudioNative.nativeOpusStart()
+            Log.i(TAG, "opus native start=$ok ch=$channelCount sr=$sampleRate")
+            val minBuf = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build())
+                .setAudioFormat(AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .build())
+                .setBufferSizeInBytes(minOf(maxOf(minBuf, PCM_BUF), PCM_BUF * 2))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            audioTrack = track
+            track.play()
+            started = true
+            Log.i(TAG, "audio player started ch=$channelCount sr=$sampleRate")
+        } catch (e: Exception) {
+            started = false
+            Log.w(TAG, "audio start fail", e)
         }
     }
 
     @Synchronized
     fun play(buffer: ByteArray, offset: Int, length: Int) {
-        val decodeBufferInfo = MediaCodec.BufferInfo()
+        if (!started) { Log.w(TAG, "audio play before config, drop ${length}b"); return }
         try {
-            val inputBufferId = mediaCodec.dequeueInputBuffer(-1)
-            if (inputBufferId >= 0) {
-                val inputBuffer = mediaCodec.getInputBuffer(inputBufferId)
-                inputBuffer!!.clear()
-                inputBuffer.put(buffer, offset, length)
-                mediaCodec.queueInputBuffer(inputBufferId, 0, length, 0, 0)
+            val pcmBuf = ByteArray(PCM_BUF)
+            val frame = if (offset == 0 && length == buffer.size) buffer
+                else buffer.copyOfRange(offset, offset + length)
+            val n = AudioNative.nativeOpusDecode(frame, pcmBuf)
+            if (n > 0) {
+                val track = audioTrack
+                if (track != null) track.write(pcmBuf, 0, n)
+                val onPcm = onPcm
+                if (onPcm != null) onPcm.invoke(pcmBuf.copyOf(n))
             }
-            while (true) {
-                val outputBufferId = mediaCodec.dequeueOutputBuffer(decodeBufferInfo, 0)
-                if (outputBufferId < 0) break
-                val outputBuffer = mediaCodec.getOutputBuffer(outputBufferId)
-                val pcm = ByteArray(decodeBufferInfo.size)
-                outputBuffer!!.get(pcm)
-                outputBuffer.clear()
-                audioTrack.write(pcm, 0, pcm.size)
-                mediaCodec.releaseOutputBuffer(outputBufferId, false)
-            }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "audio play error: ${e.message}")
         }
+    }
+
+    @Synchronized
+    fun stop() {
+        started = false
+        try { AudioNative.nativeOpusStop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+        audioTrack = null
     }
 }

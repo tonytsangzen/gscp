@@ -127,6 +127,8 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
                 EGL14.EGL_BLUE_SIZE, 8,
                 EGL14.EGL_ALPHA_SIZE, 8,
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                // RECORDABLE_ANDROID：允许把合成结果挂到 MediaCodec 编码器输入 Surface（录像）
+                android.opengl.EGLExt.EGL_RECORDABLE_ANDROID, 1,
                 EGL14.EGL_NONE
             )
             val configs = arrayOfNulls<EGLConfig>(1)
@@ -256,16 +258,25 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         }
     }
 
-    fun detachOutputSurface(surface: Surface) {
-        synchronized(renderSurfaces) {
-            for (rs in renderSurfaces) {
-                if (rs.surface == surface) {
-                    surface.release()
-                    renderSurfaces.remove(rs)
-                    return
+    /** 摘除一个输出面。同步等待 GL 线程完成（防后续仍向已失效面 swap）；
+     *  releaseSurface=false 用于编码器输入 Surface（生命周期归编码器管，不能在这里 release）。 */
+    fun detachOutputSurface(surface: Surface, releaseSurface: Boolean = true) {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        handler.post {
+            synchronized(renderSurfaces) {
+                val it = renderSurfaces.iterator()
+                while (it.hasNext()) {
+                    val rs = it.next()
+                    if (rs.surface === surface) {
+                        it.remove()
+                        rs.release()
+                    }
                 }
             }
+            if (releaseSurface) surface.release()
+            latch.countDown()
         }
+        try { latch.await(1, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) {}
     }
 
     fun getTopSurface(): Surface = topSurface
