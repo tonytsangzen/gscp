@@ -123,6 +123,11 @@ scripts/build-android.sh --install    # 构建并 adb 安装到已连接设备
 
 产物：`crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk`（可直接安装）。
 
+> **⚠️ 发布/装机必须走 `scripts/build-android.sh`，不要直接 `./gradlew` 或用 IDE 出包：**
+> `libncnnshim.so`（AR 人脸跟踪管线，源码在 `tools/ncnn/`）**不在 Gradle/Rust 构建链内**，
+> 绕过脚本构建不会重编它，APK 会静默带上旧库，曾导致"native 改动没生效/行为不一致"的误判。
+> 详见 [docs/RELEASE.md](docs/RELEASE.md)。
+
 手动构建（等价步骤，便于排查）：
 
 ```sh
