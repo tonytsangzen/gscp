@@ -63,6 +63,11 @@ echo "✓ NDK:  $NDK_HOME"
 # ── Rust 库预构建 ─────────────────────────────────────────
 cargo build --release --package gscp-app --lib --target aarch64-linux-android
 
+# ── ncnn shim 预构建（ar_face_live.cpp → libncnnshim.so）──
+# 踩坑记录：shim 不在 Gradle/Rust 构建链内，只跑本脚本不会重编，
+# 改动 tools/ncnn/*.cpp 后 APK 会静默带上旧库——必须在此统一构建。
+./tools/ncnn/build-shim.sh android
+
 # ── tauri.settings.gradle（gitignored，按 Cargo.lock 生成）──
 ./scripts/gen-tauri-settings.sh
 

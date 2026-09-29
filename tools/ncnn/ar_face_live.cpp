@@ -85,6 +85,7 @@ ncnn::Net* g_hopeNet = nullptr;    // hopenet（大角度融合项）
 ncnn::VulkanDevice* g_vk = nullptr;
 
 int g_poseAlgo = 3;                // 3=融合（默认/唯一主路径） 1=hopenet（对照）
+static volatile int g_ovW = 480, g_ovH = 480;   // 背景层恒为 480×480（首个流帧到达前也按此比例）
 static const char* poseAlgoName() { return g_poseAlgo == 3 ? "fusion" : "hopenet"; }
 
 std::vector<unsigned char> readAsset(AAssetManager* am, const char* name)
@@ -438,6 +439,7 @@ static const float kMeshTpl9[9*3] = {
 #include "mesh_template9.inc"
 };
 static const int kMeshIdx9[9] = {10, 1, 152, 33, 263, 61, 291, 234, 454};
+
 
 // 4x4 对称阵 Jacobi 特征分解：返回最大特征值的单位特征向量
 static void jacobiMaxEig4(double N[4][4], double* q)
@@ -1034,6 +1036,14 @@ Java_com_gscp_desktop_ArNative_nativeFaceSetPoseAlgo(JNIEnv*, jobject, jint algo
  *   {"box":[x1,y1,x2,y2],"score","kps":[x,y x5],"pose":[p,y,r],
  *    "normal":[[起],[终]],"overlay":[[x,y]x4],"ovC":[x,y],"ovD":cm}]}
  */
+extern "C" JNIEXPORT void JNICALL
+Java_com_gscp_desktop_ArNative_nativeSetOverlaySize(
+    JNIEnv*, jobject, jint w, jint h)
+{
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_ovW = w; g_ovH = h;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     JNIEnv* env, jobject, jbyteArray yArr, jbyteArray uArr, jbyteArray vArr,
@@ -1082,9 +1092,18 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     bool ok = true;
     const char* err = "";
 
+    // SCRFD 节流：每 kDetEvery 帧跑一次全图检测，其余帧复用缓存框驱动 facemesh；
+    // mesh 成功后用 468 点包围盒回写缓存框（跟随人脸移动），检测帧全量校正。
+    static int s_frm = 0;
+    static std::vector<Face> s_cached;
+    static float s_lastMax = -1.f;
+    const int kDetEvery = 4;
+    bool detRan = false;   // 检测帧标记（调试/JSON 用）；框口径已统一为 mesh
+    if (!detect) s_cached.clear();
     if (detect) {
         if (!g_net || g_input <= 0) { ok = false; err = "not_open"; }
-        else {
+        else if (s_cached.empty() || (s_frm % kDetEvery) == 0) {
+            detRan = true;
             double t1 = nowMs();
             // letterbox 到 g_input，pad 填均值 127.5（归一化后为 0）
             const float scale = std::min((float)g_input / rw, (float)g_input / rh);
@@ -1150,7 +1169,50 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
                 }
             }
             inferMs = nowMs() - t1;
+            // 热轨道合入：box 保持 mesh 口径不变（SCRFD 框与 mesh 框取景比例不同，
+            // 交替会让 mesh 回归出现周期性偏置 → overlay 跳动）。SCRFD 只刷 kps/score；
+            // 框尺寸偏差 >40% 视为漂移，用 SCRFD 框重同步；无匹配的新脸追加。
+            if (s_cached.empty()) {
+                s_cached = faces;
+            } else {
+                std::vector<bool> matched(s_cached.size(), false);
+                for (const Face& nf : faces) {
+                    const float ndx = (nf.box[0] + nf.box[2]) * 0.5f;
+                    const float ndy = (nf.box[1] + nf.box[3]) * 0.5f;
+                    const float ndiag = hypotf(nf.box[2] - nf.box[0], nf.box[3] - nf.box[1]);
+                    int best = -1; float bd = 1e18f;
+                    for (int tk = 0; tk < (int)s_cached.size(); tk++) {
+                        const float dx = (s_cached[tk].box[0] + s_cached[tk].box[2]) * 0.5f - ndx;
+                        const float dy = (s_cached[tk].box[1] + s_cached[tk].box[3]) * 0.5f - ndy;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 < bd) { bd = d2; best = tk; }
+                    }
+                    const float nside = std::max(nf.box[2] - nf.box[0], nf.box[3] - nf.box[1]);
+                    const float cside = std::max(s_cached[best].box[2] - s_cached[best].box[0],
+                                                 s_cached[best].box[3] - s_cached[best].box[1]);
+                    if (best >= 0 && bd < ndiag * ndiag * 0.5625f) {
+                        memcpy(s_cached[best].kps, nf.kps, sizeof(nf.kps));
+                        // 单向重同步：仅 ROI 过紧（mesh 裁切风险）才用 SCRFD 框救援。
+                        // 双向会让 ROI 在某些角度每 kDetEvery 帧在大/小口径间振荡 → 抖动
+                        if (nside > cside * 1.7f) {
+                            s_cached[best].box[0] = nf.box[0]; s_cached[best].box[1] = nf.box[1];
+                            s_cached[best].box[2] = nf.box[2]; s_cached[best].box[3] = nf.box[3];
+                        }
+                        matched[best] = true;
+                    } else {
+                        s_cached.push_back(nf);
+                    }
+                }
+                int w = 0;
+                for (int tk = 0; tk < (int)s_cached.size(); tk++)
+                    if (matched[tk] || tk >= (int)matched.size()) s_cached[w++] = s_cached[tk];
+                s_cached.resize(w);
+            }
+            if (!faces.empty()) s_lastMax = maxScore;
         }
+        faces = s_cached;
+        if (!detRan) maxScore = s_lastMax;
+        s_frm++;
     }
 
     env->ReleaseByteArrayElements(yArr, yp, JNI_ABORT);
@@ -1177,6 +1239,13 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
         bool hasOE[10] = {false,false,false,false,false,false,false,false,false,false};
         bool hasDim = false;           // 平滑框尺寸状态（overlay 屏尺寸稳定用）
         float bwS = 0, bhS = 0;
+        bool hasEyeD = false;          // eyeD EWMA：kps 仅检测帧刷新，不平滑会周期阶跃
+        float eyeDS = 0;
+        bool hasR1 = false;            // 上一帧面内 x 轴（yaw≈±90° 投影退化时冻结防抖）
+        float r1L[3] = {1.f, 0.f, 0.f};
+        bool hopeOn = false;           // hopenet 接入滞回（38 开/30 关），防边界反复开关
+        float rawW = 0;                // 未膨胀 mesh 包围盒宽 EWMA（板尺寸用，与 ROI 裕量解耦）
+        float eyeDX = 1.f, eyeDY = 0.f;  // 观测眼线 33→263（相机系，板横轴用）
     };
     static PoseTrack s_tracks[3];
     float wtmp3[3];
@@ -1214,13 +1283,55 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
             static float obsFM[468 * 2], obsFMz[468];
             if (facemeshRun(s_upr.data(), rw, rh, f.box, obsFM, obsFMz)
                 && meshProcrustesR(obsFM, obsFMz, R)) {
+                // mesh 468 点包围盒回写缓存框（×1.45 裕量）：所有帧统一 mesh 口径。
+                // 若检测帧保留 SCRFD 框、非检测帧用 mesh 框，tt 中心与框尺寸会按
+                // kDetEvery 周期在两种口径间阶跃（即「跳动」）；统一后仅剩 mesh 噪声。
+                // faces 按 score 排序，检测帧与缓存可能不同序 → 按框中心最近邻匹配回写；
+                // kps 不回写——eyeD 距离标定基于 SCRFD 点位口径，混用 mesh 外眼角会失真。
+                {
+                    float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                    for (int k = 0; k < kFmPoints; k++) {
+                        bx0 = std::min(bx0, obsFM[2*k]);   by0 = std::min(by0, obsFM[2*k+1]);
+                        bx1 = std::max(bx1, obsFM[2*k]);   by1 = std::max(by1, obsFM[2*k+1]);
+                    }
+                    const float mcx = (bx0 + bx1) * 0.5f, mcy = (by0 + by1) * 0.5f;
+                    const float mw = (bx1 - bx0) * 1.45f, mh = (by1 - by0) * 1.45f;
+                    int best = -1; float bd = 1e18f;
+                    for (int tk = 0; tk < (int)s_cached.size(); tk++) {
+                        const float dx = (s_cached[tk].box[0] + s_cached[tk].box[2]) * 0.5f
+                                       - (f.box[0] + f.box[2]) * 0.5f;
+                        const float dy = (s_cached[tk].box[1] + s_cached[tk].box[3]) * 0.5f
+                                       - (f.box[1] + f.box[3]) * 0.5f;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 < bd) { bd = d2; best = tk; }
+                    }
+                    if (best >= 0) {
+                        Face& cf = s_cached[best];
+                        cf.box[0] = mcx - mw * 0.5f; cf.box[1] = mcy - mh * 0.5f;
+                        cf.box[2] = mcx + mw * 0.5f; cf.box[3] = mcy + mh * 0.5f;
+                        // 板尺寸源：原始包围盒宽（不含 ×1.45 ROI 裕量）
+                        const float rwRaw = bx1 - bx0;
+                        PoseTrack* trkRaw = trk;
+                        trkRaw->rawW = trkRaw->rawW > 0.f
+                            ? trkRaw->rawW + (rwRaw - trkRaw->rawW) * 0.15f
+                            : rwRaw;
+                        // 眼线（33→263，相机系）：板横轴直接对齐可见人脸倾斜
+                        trk->eyeDX = obsFM[2*263]   - obsFM[2*33];
+                        trk->eyeDY = obsFM[2*263+1] - obsFM[2*33+1];
+                    }
+                    f.box[0] = mcx - mw * 0.5f; f.box[1] = mcy - mh * 0.5f;
+                    f.box[2] = mcx + mw * 0.5f; f.box[3] = mcy + mh * 0.5f;
+                }
                 float yprM[3];
                 yprFromR(R, yprM);
                 float mag = std::max(fabsf(yprM[1]), fabsf(yprM[0]));
-                // 幅度不足 35° 时 wH=0——直接跳过 hopenet 推理
+                // hopenet 接入滞回：38° 开 / 30° 关——35° 单阈值会在边界上反复开关，
+                // mesh 与 hopenet 的系统偏差交替出现 = 特定角度抖动
+                if (!trk->hopeOn) { if (mag >= 38.f && g_hopeNet) trk->hopeOn = true; }
+                else if (mag < 30.f) trk->hopeOn = false;
                 float yh = 0, ph2 = 0, rh2 = 0;
                 bool haveH = false;
-                if (mag >= 35.f && g_hopeNet)
+                if (trk->hopeOn)
                     haveH = hopenetRun(s_upr.data(), rw, rh, f.box, &yh, &ph2, &rh2);
                 float wH = std::min(std::max((mag - 35.f) / 20.f, 0.f), 1.f);
                 if (haveH && wH > 0.f) {
@@ -1234,7 +1345,10 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
                 }
                 float eyeD = hypotf(obs5[1][0] - obs5[0][0], obs5[1][1] - obs5[0][1]);
                 if (eyeD > 8.f) {
-                    float Z = (float)rw * kEyeSpan5 / eyeD;
+                    // eyeD EWMA（α=0.25）：SCRFD kps 每 kDetEvery 帧才刷新，直接用会阶跃
+                    if (!trk->hasEyeD) { trk->eyeDS = eyeD; trk->hasEyeD = true; }
+                    else trk->eyeDS += 0.25f * (eyeD - trk->eyeDS);
+                    float Z = (float)rw * kEyeSpan5 / trk->eyeDS;
                     tt[0] = ((f.box[0] + f.box[2]) * 0.5f - rw * 0.5f) * Z / (float)rw;
                     tt[1] = ((f.box[1] + f.box[3]) * 0.5f - rh * 0.5f) * Z / (float)rh;
                     tt[2] = Z;
@@ -1247,7 +1361,9 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
                 eulerToR(hy2, hp2, hr2, R);
                 float eyeD = hypotf(obs5[1][0] - obs5[0][0], obs5[1][1] - obs5[0][1]);
                 if (eyeD > 8.f) {
-                    float Z = (float)rw * kEyeSpan5 / eyeD;
+                    if (!trk->hasEyeD) { trk->eyeDS = eyeD; trk->hasEyeD = true; }
+                    else trk->eyeDS += 0.25f * (eyeD - trk->eyeDS);
+                    float Z = (float)rw * kEyeSpan5 / trk->eyeDS;
                     tt[0] = ((f.box[0] + f.box[2]) * 0.5f - rw * 0.5f) * Z / (float)rw;
                     tt[1] = ((f.box[1] + f.box[3]) * 0.5f - rh * 0.5f) * Z / (float)rh;
                     tt[2] = Z;
@@ -1298,51 +1414,64 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
         }
         projectNormal(R, tt, rw, rh, f.normal);
         float ovD = 0;
-        // overlay 放置（法线始终指向人脸 + 尺寸稳定）：
-        //  - 平面中心 = 鼻尖 + N·D，N=-R 第 3 列；D 固定 12cm（钳到人脸距离 70%），
-        //    不随姿态伸缩——姿态死区方案会让平面沿法线大幅滑动，观感即「漂移变大」；
-        //    12cm 短杠杆下法线噪声的位移可忽略。
-        //  - 投影尺寸恒定：世界半宽 = 平滑框半宽(px) × zPlane / 焦距（针孔反算），
-        //    平滑框消除抬头时 SCRFD 框突变导致的尺寸暴涨；×1.25 略大于脸框。
+        // overlay 放置（法线跟随头部 + roll 跟随眼线 + 投影恒 1:1）：
+        //  - 平面中心 = 脸中心 t + N·D，N = -R 第 3 列：板随头部俯仰/偏航倾斜；
+        //    R 的 pitch 经模板去偏校准（正脸=0），姿态偏差不再带入板朝向。
+        //  - 横轴 = 观测眼线（33→263）投影，对 N 正交化——roll 不经 Kabsch 约定。
+        //  - 投影尺寸：宽 = 1.5×平滑包围盒宽（针孔反算）；高按内容纵横比给定，
+        //    (0,0,0) 姿态投影严格 1:1，其他姿态遵循正常透视关系。
         {
             const float cmU = 450.f / 9.5f;        // 模型单位/厘米（外眼角 450 单位 ≈ 9.5cm）
             const float cx = rw * 0.5f, cy = rh * 0.5f;
             const float fxf = (float)rw, fyf = (float)rh;
             const float Dcm = (float)g_ovCm;       // 距离固定（默认 20cm，debug.gscp.ovcm 可调）
             const float D = Dcm * cmU;
-            // 平面中心（模型系）：鼻尖 t + N·D
-            float C[3] = { -R[2]*D + tt[0], -R[5]*D + tt[1], -R[8]*D + tt[2] };
-            if (C[2] < 1.f) C[2] = 1.f;
-            // 平滑框（EWMA α=0.15）：抬头/低头时 SCRFD 框的突变不再直接进入尺寸
+            // 平滑框 EWMA（尺寸源稳定；rawW 未含 ROI 裕量）
             float bw = f.box[2] - f.box[0], bh = f.box[3] - f.box[1];
             if (!trk->hasDim) { trk->bwS = bw; trk->bhS = bh; trk->hasDim = true; }
             trk->bwS += (bw - trk->bwS) * 0.15f;
             trk->bhS += (bh - trk->bhS) * 0.15f;
-            // 锚点（模型系）：鼻尖 t + N·D，N=-R 第 3 行（朝相机）；投影到图像
-            const float ccx = cx + fxf * C[0] / C[2];
-            const float ccy = cy + fyf * C[1] / C[2];
-            // 四角 = 锚点 ± in-plane 轴·(±hw,±hh)：overlay 平面法线 = 锚点方向 n
-            // （≡ 人脸法线，pitch/yaw 保持）；面内 roll 取 φ=atan2(R[3],R[0]) 的
-            // 相反数——镜像帧的 Kabsch 面内 roll 与显示方向相反，实测确认后取反。
-            float nx = C[0] - tt[0], ny = C[1] - tt[1], nz = C[2] - tt[2];
+            // 板法线 = -R 第 3 列（朝相机，跟随头部俯仰/偏航，pitch 已校准）
+            float nx = -R[2], ny = -R[5], nz = -R[8];
             float nn = sqrtf(nx*nx + ny*ny + nz*nz);
             if (nn < 1e-6f) nn = 1.f;
             nx /= nn; ny /= nn; nz /= nn;
-            const float phi = atan2f(R[3], R[0]);
+            // 锚点 = 脸中心 + N·D：板沿法线悬浮于脸前（法线一致——板朝向与
+            // 位移方向一致，倾斜观感自然）；pitch 已由模板去偏校准
+            float C[3] = { nx*D + tt[0], ny*D + tt[1], nz*D + tt[2] };
+            if (C[2] < 1.f) C[2] = 1.f;
+            const float ccx = cx + fxf * C[0] / C[2];
+            const float ccy = cy + fyf * C[1] / C[2];
             const float zPlane = C[2];
-            // 世界尺寸：平滑框半宽高(px) × zPlane / 焦距（针孔反算，投影 ≈ 框×1.25）
-            const float hw = (trk->bwS * 0.5f * 1.25f) * zPlane / fxf;
-            const float hh = (trk->bhS * 0.5f * 1.25f) * zPlane / fyf;
-            float r1x = cosf(phi), r1y = -sinf(phi), r1z = 0.f;
+            // 横轴 = 眼线投影，对 N 正交化；退化沿用上帧（侧脸兜底）。
+            // 眼线与 R 第 0 列（模型 +x = 33→263）同向，无需 y 取反——
+            // 取反会让板倾斜方向与预览中人脸倾斜相反（实测 roll 反向）
+            float exd = trk->eyeDX, eyd = trk->eyeDY;
+            float elen = sqrtf(exd*exd + eyd*eyd);
+            if (elen < 1e-3f) { exd = 1.f; eyd = 0.f; elen = 1.f; }
+            float r1x = exd / elen, r1y = eyd / elen, r1z = 0.f;
             float dN = r1x*nx + r1y*ny + r1z*nz;
             r1x -= dN*nx; r1y -= dN*ny; r1z -= dN*nz;
             float l1 = sqrtf(r1x*r1x + r1y*r1y + r1z*r1z);
+            if (l1 < 0.15f && trk->hasR1) {
+                r1x = trk->r1L[0]; r1y = trk->r1L[1]; r1z = trk->r1L[2];
+                dN = r1x*nx + r1y*ny + r1z*nz;
+                r1x -= dN*nx; r1y -= dN*ny; r1z -= dN*nz;
+                l1 = sqrtf(r1x*r1x + r1y*r1y + r1z*r1z);
+            }
             if (l1 < 1e-6f) l1 = 1.f;
             r1x /= l1; r1y /= l1; r1z /= l1;
+            trk->r1L[0] = r1x; trk->r1L[1] = r1y; trk->r1L[2] = r1z; trk->hasR1 = true;
             float r2x = ny*r1z - nz*r1y;
             float r2y = nz*r1x - nx*r1z;
             float r2z = nx*r1y - ny*r1x;
-            // 背板 = 基面沿 -n（远离相机）平移 2mm：透视正确的薄片厚度
+            // 高度：世界尺寸按内容纵横比给定。(0,0,0) 姿态时 n=(0,0,-1)、r1 水平、
+            // r2 竖直且四角同深度 → 投影高 = fyf·2hh/z = fx·2hw/z = 投影宽，严格 1:1；
+            // 其他姿态按正常透视投影，随倾斜自然缩短（不人为补偿）
+            const float srcW = trk->rawW > 0.f ? trk->rawW : trk->bwS * 0.69f;
+            const float hw = (srcW * 0.5f * 1.5f) * zPlane / fxf;
+            const float hh = hw * ((float)g_ovH / (float)g_ovW) * (fxf / fyf);
+            // 背板 = 前板沿 -N 推 2mm（厚度暗示）
             const float thCm = 0.2f;
             const float Bx = C[0] + nx * thCm * cmU;
             const float By = C[1] + ny * thCm * cmU;
@@ -1363,8 +1492,7 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
                 f.ovB[i][0] = cx + fxf * Y[0] / Y[2];
                 f.ovB[i][1] = cy + fyf * Y[1] / Y[2];
             }
-            f.ovC[0] = cx + fxf * C[0] / C[2];
-            f.ovC[1] = cy + fyf * C[1] / C[2];
+            f.ovC[0] = ccx; f.ovC[1] = ccy;
             ovD = Dcm;
         }
         // overlay 像素 One-Euro：中心绝对滤波，四角只滤相对中心的偏移（形状刚性）
@@ -1402,7 +1530,9 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
         f.hasOv = true;
         static int rollDbg = 0;
         if (++rollDbg % 30 == 1)
-            LOGI("roll raw=%.1f filt=%.1f", rawRoll, f.ypr[2]);
+            LOGI("ovc=%.1f,%.1f dims=%.0fx%.0f det=%d roll=%.1f ypr=%.0f/%.0f/%.0f",
+                 f.ovC[0], f.ovC[1], f.box[2] - f.box[0], f.box[3] - f.box[1],
+                 (int)detRan, rawRoll, f.ypr[0], f.ypr[1], f.ypr[2]);
     }
 
     std::string j = std::string("{\"ok\":") + (ok ? "true" : "false");

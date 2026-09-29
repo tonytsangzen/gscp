@@ -26,3 +26,4 @@ __pycache__/
 # offline pose harness build output (javac/jar from tools/ncnn/harness/src)
 tools/ncnn/harness/classes/
 tools/ncnn/harness/*.jar
+.tmp/

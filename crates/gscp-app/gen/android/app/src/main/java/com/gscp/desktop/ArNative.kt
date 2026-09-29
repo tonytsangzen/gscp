@@ -38,4 +38,7 @@ object ArNative {
 
     /** 姿态算法：1=hopenet（对照） 3=融合（默认主路径）；其余一律回融合。 */
     external fun nativeFaceSetPoseAlgo(algo: Int)
+
+    /** overlay 显示位图尺寸（内容包围盒裁剪后）——quad 纵横比按实际内容锁定。 */
+    external fun nativeSetOverlaySize(w: Int, h: Int)
 }
