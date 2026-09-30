@@ -427,7 +427,7 @@ class ArActivity : Activity() {
         var g = frontGl
         if (g == null) {
             g = ArFrontGl(
-                resources.displayMetrics.density, w, h,
+                w, h,
                 overlays = { action ->
                     synchronized(overlayLock) {
                         action(overlayBmp, glowBmp, bloomFarBmp, overlayVersion)
@@ -1692,12 +1692,15 @@ class ArActivity : Activity() {
         player.connect(ip)
     }
 
-    /** 停后摄子系统（幂等）：断开管线、藏 GL 面。异步释放，不阻塞调用线程。 */
+    /** 停后摄子系统（幂等）：断开管线、藏 GL 面。异步释放，不阻塞调用线程。
+     *  GL 输出面同步摘除（不等 surfaceDestroyed），防收尾过渡帧串画面。 */
     private fun exitRearMode() {
         rearActive = false
         val old = rearPlayer
         rearPlayer = null
         if (old != null) Thread { try { old.stop() } catch (_: Exception) {} }.start()
+        glAttached?.let { rearMixer?.detachOutputSurface(it) }
+        glAttached = null
         glSurface.visibility = android.view.View.GONE
     }
 
@@ -1708,6 +1711,11 @@ class ArActivity : Activity() {
             overlayDecoder?.stop()
             overlayDecoder = null
             resetOverlay()
+            // 同步摘除前摄 GL 输出（不等 surfaceDestroyed 的滞后回调）：
+            // 否则过渡帧里旧 AR 画面/连接提示会叠在已显示的设置页上
+            frontGlAttached?.let { frontGl?.detachOutputSurface(it) }
+            frontGlAttached = null
+            frontGl?.setActive(false)
             exitRearMode()
             arPanel.visibility = android.view.View.GONE
             settingsPanel.visibility = android.view.View.VISIBLE
