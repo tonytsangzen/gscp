@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 前后摄切换按钮容器：相机 App 惯例的半透明圆盘（无描边），
-     白色 cameraswitch 字形居中，视觉重量低于左侧带环缩略图 -->
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="oval">
-    <solid android:color="#38FFFFFF" />
-</shape>
+<!-- 前后摄切换按钮容器：半透明灰圆盘 + 点击波纹 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#40FFFFFF">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#59808080" />
+        </shape>
+    </item>
+</ripple>

@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 最近录像缩略图容器：正圆 + 半透明底（相机 App 惯例），白色圆环由
-     foreground(bg_thumb_ring) 叠加在最上层，缩略图 bitmap 经 clipToOutline 裁圆 -->
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="oval">
-    <solid android:color="#50000000" />
-</shape>
+<!-- 最近录像缩略图容器：正圆 + 半透明灰底 + 点击波纹（ripple 裁在圆内），
+     白…灰圆环由 foreground(bg_thumb_ring) 叠加，bitmap 经 clipToOutline 裁圆 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#40FFFFFF">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#59808080" />
+        </shape>
+    </item>
+</ripple>
