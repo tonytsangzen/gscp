@@ -6,13 +6,9 @@ import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.PorterDuff
-import android.graphics.RectF
 import android.graphics.Rect
-import android.graphics.Typeface
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -62,10 +58,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * AR 模式（ncnn-benchmark CameraActivity 移植）：
- * Camera2 (YUV_420_888) → ArNative.nativeFaceDetect（det_10g + FaceMesh 融合姿态，
- * 全部在 native）→ SurfaceView Canvas 绘制：相机帧（前置镜像）+ 检测框 + 5 关键点 +
- * 法线 + 眼镜 overlay 屏（scrcpy 帧按 overlay 四角 drawBitmapMesh）+ 调试面板。
- * 显示与检测用同一份像素，叠加层与检测输入严格对应（所见即所测）。
+ * 前摄：Camera2 (YUV_420_888) → ArNative.nativeFaceDetect（det_10g + FaceMesh 融合姿态，
+ * 全部在 native）→ 检测直写的直立 RGBA 帧与 overlay 四角锚点交给 ArFrontGl(GLES2) 上屏：
+ * 相机纹理 + 背板 + overlay 单应网格 + bloom 全部 GPU 合成（与后摄 SurfaceMixer 同构，
+ * 录像编码器面直挂输出，同一份合成结果上屏与录制）。检测与上屏用同一份像素，
+ * 叠加层与检测输入严格对应（所见即所测）。
+ * 后摄：眼镜画面作基底，走 GlassesPlayer → SurfaceMixer GL 管线（普通模式管线复用）。
  */
 class ArActivity : Activity() {
 
@@ -73,7 +71,6 @@ class ArActivity : Activity() {
     private lateinit var settingsPanel: android.view.View
     private lateinit var arPanel: android.view.View
     private lateinit var cameraView: SurfaceView
-    private val MESH_N = 4                 // 内容透视网格密度
     private lateinit var statusText: TextView
     private lateinit var progressView: android.view.View
     private lateinit var ipEdit: EditText
@@ -89,14 +86,27 @@ class ArActivity : Activity() {
     private var uScr: ByteArray? = null
     private var vScr: ByteArray? = null
     private var overlayNew = false
+    // overlay 内容版本号：convertOverlayFrame/resetOverlay 递增，GL 合成器据此刷新纹理
+    @Volatile private var overlayVersion = 0
 
-    // ── 后摄子系统：完全复用普通模式（MainActivity）管线，独立于前摄 Canvas 管线 ──
+    // ── 后摄子系统：完全复用普通模式（MainActivity）管线 ──
     // GlassesPlayer 自持连接/双硬解/音频；rearMixer 输出到 ar_gl_surface 显示，
     // 录像时编码器面直接挂 mixer 输出。与前摄不共享任何连接/解码状态。
     private var rearPlayer: GlassesPlayer? = null
     private var rearMixer: SurfaceMixer? = null
     private lateinit var glSurface: SurfaceView
     private var glAttached: Surface? = null
+
+    // ── 前摄子系统 GL 合成器（ArFrontGl）：与后摄 SurfaceMixer 同构的多输出面合成 ──
+    // 相机帧（nativeFaceDetect 直写的直立 RGBA）+ overlay 键控/bloom 位图作纹理输入，
+    // 单应网格/背板/柔光 GPU 合成；输出到 ar_surface 显示，录像编码器面直挂输出。
+    private var frontGl: ArFrontGl? = null
+    private var frontGlAttached: Surface? = null
+    // 相机帧三缓冲轮转：det 线程写一块、交 GL 上传，避免 GL 读取期间被下一帧覆写
+    private val camBufLock = Any()
+    private var camBufs = arrayOfNulls<ByteBuffer>(3)
+    private var camBufIdx = 0
+    private var camBufBytes = 0
     // 子系统活动守卫：仅当对应子系统应处于活动态时，其断开事件才会触发退出预览
     @Volatile private var frontActive = false
     @Volatile private var rearActive = false
@@ -116,9 +126,6 @@ class ArActivity : Activity() {
     private var camHandler: Handler? = null
     private val det: ExecutorService = Executors.newSingleThreadExecutor()
     private val openExec: ExecutorService = Executors.newSingleThreadExecutor()
-    // 自定义合成绘制（相机+overlay 单应投影）专用渲染线程：从主线程彻底挪走，
-    // 避免每帧的绘制阻塞按钮/动画/触摸等 UI 响应；它与人脸检测(det)并行。
-    private val renderExec: ExecutorService = Executors.newSingleThreadExecutor()
     // 顶部录制指示：录象中→闪烁红点+时长(常驻)；非录像→信息 5s 后隐藏
     private lateinit var recOverlay: android.widget.TextView
     private val recTimerHandler = Handler(Looper.getMainLooper())
@@ -133,11 +140,6 @@ class ArActivity : Activity() {
     private var reader: ImageReader? = null
     private var surfaceReady = false
     private val busy = AtomicBoolean(false)
-
-    // 帧数据（生产者：det 线程；消费者：UI 线程绘制；bmp 并发访问用 frameLock 保护）
-    private val frameLock = Any()
-    private var bmp: Bitmap? = null
-    private var rgbaBuf: ByteBuffer? = null
 
     @Volatile private var debugLines = arrayOf<String>()
     @Volatile private var faceKps0: FloatArray? = null   // face0 五点（面板显示）
@@ -201,33 +203,10 @@ class ArActivity : Activity() {
     @Volatile private var lastConvMs = 0f
     @Volatile private var lastCopyMs = 0f
     @Volatile private var lastProcMs = 0f
-    @Volatile private var lastDrawMs = 0f
 
-    private lateinit var connPaint: Paint
-    private lateinit var meshPaint: Paint
-    private val camDimPaint = Paint().apply {
-        // 相机压暗 70%（ColorMatrix 缩放 RGB）：overlay 成为画面最亮处 → “比 camera 高很多”
-        colorFilter = android.graphics.ColorMatrixColorFilter(
-            android.graphics.ColorMatrix(floatArrayOf(
-                0.70f, 0f, 0f, 0f, 0f,
-                0f, 0.70f, 0f, 0f, 0f,
-                0f, 0f, 0.70f, 0f, 0f,
-                0f, 0f, 0f, 1f, 0f,
-            )))
-    }
-    // lazy：构造期 resources 未挂载，不能在字段初始化器里取密度
-    private val glowPaint: Paint by lazy {
-        // 背板边缘柔光（亮屏边框受光感）：纯绿
-        Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 6 * dp0()
-            color = 0x0A00FF00.toInt()
-            maskFilter = android.graphics.BlurMaskFilter(
-                5 * dp0(), android.graphics.BlurMaskFilter.Blur.NORMAL)
-        }
-    }
-    private val vertsBuf = FloatArray(8)   // 保留：背板/诊断备用
-    private lateinit var dimPaint: Paint
+    // ── 以下 Paint/Canvas 均为 overlay CPU 特效烘焙(convertOverlayFrame)专用；
+    //    合成上屏的画笔(相机压暗/内容提亮/背板/柔光/连接提示)已随 Canvas 路径移入
+    //    ArFrontGl shader，相关 Paint 与渲染线程已删除。
 
     // 黑键 LUT（= PC 合成器 blackKeyAlpha）：luma < keyLow-feather → 全透明，
     // > keyHigh+feather → 不透明，中间按 pow(t,1.2) 羽化。褐色/暗背景即被抠透。
@@ -240,32 +219,10 @@ class ArActivity : Activity() {
         }
     }
 
-    // overlay 发光（真实发光感，金字塔 bloom）：
-    //  远距光晕 ob 1/16、中距光晕 ob 1/4，都为模糊副本 + ADDITIVE 加光（只加光不叠字形）；
-    //  内容本身保持普通 SRC_OVER 只画一次（文字不再叠亮重影）。
-    private fun Paint.addBlend() {
-        if (android.os.Build.VERSION.SDK_INT >= 29) {
-            blendMode = android.graphics.BlendMode.PLUS
-        } else {
-            @Suppress("DEPRECATION")
-            xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.ADD)
-        }
-    }
-    // overlay 发光（均匀化）：与旧实现同构（1/4 + 1/16 内容降采样、内容网格投影），
-    // 均匀化手段不依赖任何 Paint 特效——剪影统一着色（不透明像素平均色 + alpha 饱和，
-    // 任意字符贡献相同光源）+ 金字塔多级降/升采样烘焙平滑（纯双线性缩放，必定生效）
-    private val bloomMidPaint: Paint by lazy {
-        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            alpha = 200
-            addBlend()
-        }
-    }
-    private val bloomFarPaint: Paint by lazy {
-        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            alpha = 150
-            addBlend()
-        }
-    }
+    // overlay 发光（均匀化）烘焙：与旧实现同构（1/4 + 1/16 内容降采样），
+    // 剪影统一着色（不透明像素平均色 + alpha 饱和，任意字符贡献相同光源）+ 金字塔
+    // 多级降/升采样烘焙平滑（纯双线性缩放，必定生效）。三张产物位图（内容 / 1/4 光晕 /
+    // 1/16 光晕）由 ArFrontGl 作为纹理上传，合成阶段 GPU 完成 ADD 光晕 + SRC_OVER 内容。
     private val glowCm = android.graphics.ColorMatrix()
     private val glowAlphaPaint = Paint(Paint.FILTER_BITMAP_FLAG)   // 剪影绘制（每帧设平均色 + alpha 饱和）
     private val glowSmoothPaint = Paint(Paint.FILTER_BITMAP_FLAG)  // 金字塔缩放（纯双线性低通）
@@ -328,8 +285,24 @@ class ArActivity : Activity() {
 
         cameraView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) { surfaceReady = true; tryStart() }
-            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
-            override fun surfaceDestroyed(h: SurfaceHolder) { surfaceReady = false; stopCamera() }
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
+                // 前摄 GL 合成输出面：与后摄 glSurface 同样的挂载/摘除模式
+                val g = ensureFrontGl(w, ht)
+                val s = h.surface
+                if (frontGlAttached !== s) {
+                    frontGlAttached?.let { g.detachOutputSurface(it) }
+                    frontGlAttached = s
+                    g.attachOutputSurface(s)
+                }
+                g.setActive(frontCamera)
+            }
+
+            override fun surfaceDestroyed(h: SurfaceHolder) {
+                surfaceReady = false
+                stopCamera()
+                frontGlAttached?.let { frontGl?.detachOutputSurface(it) }
+                frontGlAttached = null
+            }
         })
 
         findViewById<Button>(R.id.button_connect).setOnClickListener { startAr() }
@@ -357,8 +330,6 @@ class ArActivity : Activity() {
         }
         ipEdit.setText(prefs.getString("ip", ""))
         loadRecentLastVideo()            // 左侧显示上次录像缩略图（跨会话）
-
-        initPaints()
 
         camThread = HandlerThread("cam-bg").also { it.start() }
         camHandler = Handler(camThread!!.looper)
@@ -395,34 +366,6 @@ class ArActivity : Activity() {
     private fun micGranted(): Boolean =
         checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-
-    private fun initPaints() {
-        val dp = resources.displayMetrics.density
-        // 锚点处"连接中..."：绿色等宽 16dp（人脸已锚定、overlay 内容未到时提示）
-        connPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFF90EE90.toInt()
-            typeface = Typeface.MONOSPACE
-            textSize = 16 * dp
-        }
-        meshPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
-            // overlay 内容提亮（发光体感）：RGB ×1.4 + 12，透明区/alpha 不受影响
-            colorFilter = android.graphics.ColorMatrixColorFilter(
-                android.graphics.ColorMatrix(floatArrayOf(
-                    1.40f, 0f, 0f, 0f, 12f,
-                    0f, 1.40f, 0f, 0f, 12f,
-                    0f, 0f, 1.40f, 0f, 12f,
-                    0f, 0f, 0f, 1f, 0f,
-                )))
-            if (android.os.Build.VERSION.SDK_INT >= 29) {
-                blendMode = android.graphics.BlendMode.SRC_OVER
-            } else {
-                @Suppress("DEPRECATION")
-                xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_OVER)
-            }
-        }
-        // 背板（亮屏面板）投影区衬底：微绿低透明压暗
-        dimPaint = Paint().apply { color = 0x0800FF00.toInt() }
-    }
 
     private fun tryStart() {
         if (surfaceReady &&
@@ -492,6 +435,26 @@ class ArActivity : Activity() {
             applySettingsToMixer(mx)
         }
         return mx
+    }
+
+    /** 前摄首次显示时建 GL 合成器（尺寸取显示面实际大小，保证 1:1 输出）。
+     *  overlay 快照经 overlayLock 提供给 GL 线程，位图在回调持锁期间有效。 */
+    private fun ensureFrontGl(w: Int, h: Int): ArFrontGl {
+        var g = frontGl
+        if (g == null) {
+            g = ArFrontGl(
+                resources.displayMetrics.density, w, h,
+                overlays = { action ->
+                    synchronized(overlayLock) {
+                        action(overlayBmp, glowBmp, bloomFarBmp, overlayVersion)
+                    }
+                },
+            )
+            // 每拍唤醒录像编码线程取包（编码帧率≈GL 帧率，与旧 Canvas 路径的 tick 等价）
+            g.frameCallback = { recorder?.tick() }
+            frontGl = g
+        }
+        return g
     }
 
     /** 首次加载实时检测网：默认 Vulkan FP16（自动调优），失败自动回退 CPU FP32。 */
@@ -722,15 +685,17 @@ class ArActivity : Activity() {
             val rw = if (rot == 90 || rot == 270) frameH else frameW
             val rh = if (rot == 90 || rot == 270) frameW else frameH
 
-            val rb: ByteBuffer = synchronized(frameLock) {
-                val cur = rgbaBuf
-                if (cur == null || cur.capacity() != rw * rh * 4) {
-                    val nb = ByteBuffer.allocateDirect(rw * rh * 4).order(ByteOrder.nativeOrder())
-                    rgbaBuf = nb
-                    bmp?.recycle()
-                    bmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888)
-                    nb
-                } else cur
+            val rb: ByteBuffer = synchronized(camBufLock) {
+                val need = rw * rh * 4
+                if (camBufBytes != need) {
+                    for (i in camBufs.indices) {
+                        camBufs[i] = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder())
+                    }
+                    camBufBytes = need
+                }
+                val b = camBufs[camBufIdx]!!
+                camBufIdx = (camBufIdx + 1) % camBufs.size
+                b
             }
 
             val tn = System.nanoTime()
@@ -745,15 +710,13 @@ class ArActivity : Activity() {
             parseResult(j, rw, rh)
             lastProcMs = ((System.nanoTime() - tn) / 1e6).toFloat()
 
-            synchronized(frameLock) {
-                val b0 = bmp
-                if (b0 != null) {
-                    rb.rewind()
-                    b0.copyPixelsFromBuffer(rb)
-                }
+            // GL 合成：相机帧纹理上传 + 人脸锚点状态（检测直写的 RGBA 原样上屏，所见即所测；
+            // 旧 copyPixelsFromBuffer + Canvas 软件绘制路径已整体移除）
+            frontGl?.let { g ->
+                rb.rewind()
+                g.postCameraFrame(rb, rw, rh)
+                g.setFace(faceOv.firstOrNull(), rw, rh)
             }
-            // 后台渲染线程合成绘制（SurfaceView 可从任意线程 lockCanvas），主线程不再被拖慢
-            renderExec.execute { render() }
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "帧处理异常", t)
         } finally {
@@ -770,11 +733,10 @@ class ArActivity : Activity() {
             val o = JSONObject(j)
             lastConvMs = o.optDouble("convMs", 0.0).toFloat()
             lastInferMs = o.optDouble("ms", 0.0).toFloat()
-            val total = lastCopyMs + lastProcMs + lastDrawMs
+            val total = lastCopyMs + lastProcMs
             lines.add(String.format(Locale.ROOT, "FPS %.1f · 帧耗时 %.1fms", fpsEma[0], total))
             lines.add(String.format(Locale.ROOT, "耗时: 拷贝 %.1f · 转换 %.1f · 推理 %.1f ms",
                 lastCopyMs, lastConvMs, lastInferMs))
-            lines.add(String.format(Locale.ROOT, "绘制 %.1f ms", lastDrawMs))
             lines.add(String.format(Locale.ROOT, "后端 %s%s · 输入 %d×%d",
                 o.optString("backend", backendName), threadInfo,
                 o.optInt("input", 0), o.optInt("input", 0)))
@@ -846,197 +808,9 @@ class ArActivity : Activity() {
         if (anchored != anchorLayerReady) { anchorLayerReady = anchored; updateRecBtnVisible() }
     }
 
-    // ── 绘制 ──────────────────────────────────────────────────
-
-    private fun render() {
-        if (!surfaceReady) return
-        val td = System.nanoTime()
-        var sc: Canvas? = null
-        try { sc = cameraView.holder.lockCanvas() } catch (_: Exception) {}
-        if (sc == null) return
-        try {
-            // 直接画到 Surface（硬件加速、SurfaceFlinger 帧同步交换 → 不撕裂、不卡顿）。
-            paintFrame(sc, sc.width.toFloat(), sc.height.toFloat())
-            // 通知编码线程取一帧（其自身按 live 状态渲染，卡顿不会阻塞本线程）
-            try { recorder?.tick() } catch (_: Exception) {}
-        } finally {
-            try { cameraView.holder.unlockCanvasAndPost(sc) } catch (_: Exception) {}
-            lastDrawMs = ((System.nanoTime() - td) / 1e6).toFloat()
-        }
-    }
-
-    /** 画一帧（相机 + 背板 + overlay + 发光）。UI 显示与录像编码线程均调用。
-     *  可变 scratch（Matrix/Path/顶点数组）均为局部，避免两线程互踩 */
-    private fun paintFrame(c: Canvas, vw: Float, vh: Float) {
-        c.drawColor(Color.BLACK)
-        // 后摄模式（frontCamera=false）：显示与录像均走 GL 合成（SurfaceMixer 直出，同第一页
-        // 连接模式的渲染管线）；此 Canvas 路径仅在 GL 面未就绪时兜底提示连接状态。
-        if (!frontCamera) {
-            // 后摄显示走 GL 合成（ar_gl_surface）；此 Canvas 兜底仅保持黑屏
-            return
-        }
-        val b: Bitmap? = synchronized(frameLock) { bmp }
-            var sc = 1f; var dx = 0f; var dy = 0f
-            if (b != null) {
-                // 等比例缩放完整显示相机画面（letterbox 居中，不裁剪）；
-                // 标注（框/关键点/法线/overlay）共用同一变换，自动跟随
-                sc = minOf(vw / b.width, vh / b.height)
-                dx = (vw - b.width * sc) / 2f
-                dy = (vh - b.height * sc) / 2f
-                val m = Matrix()
-                m.reset()
-                if (frontCamera) {
-                    // 前置预览镜像，坐标随变换同步镜像
-                    m.setScale(-1f, 1f)
-                    m.postTranslate(b.width.toFloat(), 0f)
-                    m.postScale(sc, sc)
-                    m.postTranslate(dx, dy)
-                } else {
-                    m.setScale(sc, sc)
-                    m.postTranslate(dx, dy)
-                }
-                c.drawBitmap(b, m, camDimPaint)
-            }
-            val fSc = sc; val fDx = dx; val fDy = dy
-            val fImgW = (bmp?.width ?: 1).toFloat()
-            fun mapX(x: Float) = (if (frontCamera) (fImgW - x) else x) * fSc + fDx
-            fun mapY(y: Float) = y * fSc + fDy
-
-            // 眼镜屏：有解码帧 → 真实屏幕 drawBitmapMesh 投影到锚点四角（透视近似）；
-            // 没有帧/未连接 → 在锚点处显示连接状态。四角描边 + 距离标签为调试信息。
-            val ovs = faceOv
-            val ob: Bitmap? = synchronized(overlayLock) { overlayBmp }
-            if (ovs.isNotEmpty()) {
-                val ov = ovs[0]
-                // 背景平面：沿 overlay 中心子四边形描出（内容中心 480×480，上下净空 80px；
-                // 法线/旋转与人脸同步），圆角用顶点内插实现（二次贝塞尔连接）。
-                val qx = floatArrayOf(mapX(ov[0]), mapX(ov[2]), mapX(ov[4]), mapX(ov[6]))
-                val qy = floatArrayOf(mapY(ov[1]), mapY(ov[3]), mapY(ov[5]), mapY(ov[7]))
-                var ccx2 = 0f; var ccy2 = 0f
-                for (q in 0 until 4) { ccx2 += qx[q] / 4f; ccy2 += qy[q] / 4f }
-                // 背景板与 overlay 内容 quad 完全重合：overlay 位图已是裁好的
-                // 480×480 正方形（convertOverlayFrame 裁掉了上下 80px 空带），
-                // 并铺满整个 quad（bt=0 不再按旧全屏 640 内缩）。正脸时 quad=1:1。
-                val bt = 0f
-                val bb = 1f - bt
-                val bgx = FloatArray(4); val bgy = FloatArray(4)
-                bgx[0] = bt * qx[3] + bb * qx[0]; bgy[0] = bt * qy[3] + bb * qy[0]   // 左下'
-                bgx[1] = bt * qx[2] + bb * qx[1]; bgy[1] = bt * qy[2] + bb * qy[1]   // 右下'
-                bgx[2] = bb * qx[2] + bt * qx[1]; bgy[2] = bb * qy[2] + bt * qy[1]   // 右上'
-                bgx[3] = bb * qx[3] + bt * qx[0]; bgy[3] = bb * qy[3] + bt * qy[0]   // 左上'
-                // 角点顺序（实测）：c0=左下 c1=右下 c2=右上 c3=左上；
-                // 屏幕顺时针 TL→TR→BR→BL = c3→c2→c1→c0
-                val ord = intArrayOf(3, 2, 1, 0)
-                // 圆角四边形：沿两条邻边各退边长的 18%（同一比例 → 切角均匀），
-                // quadTo(控制=角点) 圆滑过渡。背板与边框共用同一条路径，边缘完全重合。
-                fun roundedQuad(): Path {
-                    val p = Path()
-                    val ox = FloatArray(4); val oy = FloatArray(4)   // 各角沿入边方向的退点
-                    val ix = FloatArray(4); val iy = FloatArray(4)   // 各角沿出边方向的退点
-                    for (q in 0 until 4) {
-                        val kp = ord[q]
-                        // 入边：kp ← 上一角；出边：kp → 下一角（各退边长 10%，小圆角）
-                        val prevIdx = ord[(q + 3) % 4]
-                        val nextIdx = ord[(q + 1) % 4]
-                        ox[q] = (bgx[kp] + (bgx[prevIdx] - bgx[kp]) * 0.10f)
-                        oy[q] = (bgy[kp] + (bgy[prevIdx] - bgy[kp]) * 0.10f)
-                        ix[q] = (bgx[kp] + (bgx[nextIdx] - bgx[kp]) * 0.10f)
-                        iy[q] = (bgy[kp] + (bgy[nextIdx] - bgy[kp]) * 0.10f)
-                    }
-                    p.moveTo(ox[0], oy[0])
-                    for (q in 0 until 4) {
-                        val kp = ord[q]
-                        // 圆角 q：入点 A_q --(控制=角点)--> 出点 B_q
-                        p.quadTo(bgx[kp], bgy[kp], ix[q], iy[q])
-                        // 边：出点 B_q --直线--> 下一角入点 A_{q+1}
-                        val n = (q + 1) % 4
-                        p.lineTo(ox[n], oy[n])
-                    }
-                    p.close()
-                    return p
-                }
-                val platePath = roundedQuad()
-                // 发光（无边线）：模糊光晕画在背板之下，沿轮廓向外溢出形成柔光
-                c.drawPath(platePath, glowPaint)
-                // 半透明背板（与 overlay 平面同姿态、同圆角轮廓）：浅绿低透明
-                c.drawPath(platePath, dimPaint)
-                if (ob != null) {
-                    // drawBitmapMesh 顶点序：(0,0),(w,0),(0,h),(w,h) → 四角 TL,TR,BL,BR；
-                    // 内容去除全部特效，普通 SRC_OVER 贴到四角（键控透明区透出相机）
-                    // 实测角点布局：c0=左下 c1=右下 c2=右上 c3=左上
-                    // mesh 槽位 TL,TR,BL,BR ← c3,c2,c0,c1
-                    // 透视校正网格：1×1 drawBitmapMesh 是双线性映射，强透视（躺看/低头）
-                    // 时四边形内区按双线性变形 → 内容被拉伸。单应映射内容角点到屏幕四角，
-                    // 4×4 网格顶点取单应像（Heckbert square→quad），逐格双线性即可精确复现透视。
-                    val tlX = mapX(ov[6]); val tlY = mapY(ov[7])   // 位图 TL ← c3
-                    val trX = mapX(ov[4]); val trY = mapY(ov[5])   // TR ← c2
-                    val brX = mapX(ov[2]); val brY = mapY(ov[3])   // BR ← c1
-                    val blX = mapX(ov[0]); val blY = mapY(ov[1])   // BL ← c0
-                    val d1x = trX - brX; val d1y = trY - brY
-                    val d2x = blX - brX; val d2y = blY - brY
-                    val sxq = tlX - trX + brX - blX
-                    val syq = tlY - trY + brY - blY
-                    val den = d1x * d2y - d1y * d2x
-                    val vn = FloatArray((MESH_N + 1) * (MESH_N + 1) * 2)
-                    if (kotlin.math.abs(den) > 1e-6f) {
-                        val gh = (sxq * d2y - syq * d2x) / den
-                        val hv = (d1x * syq - d1y * sxq) / den
-                        val av = trX - tlX + gh * trX
-                        val bv = blX - tlX + hv * blX
-                        val dv = trY - tlY + gh * trY
-                        val ev = blY - tlY + hv * blY
-                        var k2 = 0
-                        for (j in 0..MESH_N) {
-                            val vv = j.toFloat() / MESH_N
-                            for (i in 0..MESH_N) {
-                                val uu = i.toFloat() / MESH_N
-                                val wq = gh * uu + hv * vv + 1f
-                                vn[k2++] = (av * uu + bv * vv + tlX) / wq
-                                vn[k2++] = (dv * uu + ev * vv + tlY) / wq
-                            }
-                        }
-                    } else {
-                        // 退化（近似仿射）：回退四角双线性
-                        var k2 = 0
-                        for (j in 0..MESH_N) {
-                            val vv = j.toFloat() / MESH_N
-                            val ly0 = blX + (brX - blX) * vv; val ly1 = tlX + (trX - tlX) * vv
-                            val lx0 = blY + (brY - blY) * vv; val lx1 = tlY + (trY - tlY) * vv
-                            for (i in 0..MESH_N) {
-                                val uu = i.toFloat() / MESH_N
-                                vn[k2++] = ly0 + (ly1 - ly0) * uu
-                                vn[k2++] = lx0 + (lx1 - lx0) * uu
-                            }
-                        }
-                    }
-                    // 金字塔 bloom：远距光晕（1/16，ADD）→ 中距光晕（1/4，ADD）→ 内容（普通合成）。
-                    // 只加光不叠字形；与内容同一 mesh 投影、完全重合，随姿态同步。
-                    // 光晕已在构建期剪影化 + 金字塔低通烘焙 → 任意字符均匀、无块状边界
-                    val fb = synchronized(overlayLock) { bloomFarBmp }
-                    val gb = synchronized(overlayLock) { glowBmp }
-                    if (fb != null) {
-                        c.drawBitmapMesh(fb, MESH_N, MESH_N, vn, 0, null, 0, bloomFarPaint)
-                    }
-                    if (gb != null) {
-                        c.drawBitmapMesh(gb, MESH_N, MESH_N, vn, 0, null, 0, bloomMidPaint)
-                    }
-                    // overlay 内容：普通合成贴到四角（键控透明区透出相机；meshPaint 已提亮）
-                    c.drawBitmapMesh(ob, MESH_N, MESH_N, vn, 0, null, 0, meshPaint)
-                }
-                // 无内容/未连接：在 overlay 四角形心处显示绿色"连接中..."
-                if (ob == null) {
-                    val t = "连接中..."
-                    c.drawText(t, ccx2 - connPaint.measureText(t) / 2f,
-                        ccy2 + connPaint.textSize / 3f, connPaint)
-                }
-            }
-    }
-
-    private fun dp0(): Float = resources.displayMetrics.density
-
     private fun startRec() {
         android.util.Log.i(TAG, "rec: startRec called, cameraView=${cameraView.width}x${cameraView.height}")
-        // 录像分辨率取显示面：前摄=全屏 Canvas 面；后摄=3:4 GL 面（与 mixer 输出一致）
+        // 录像分辨率取显示面：前摄=全屏 GL 面；后摄=3:4 GL 面（与合成器输出一致）
         val sw: Int; val sh: Int
         if (frontCamera) { sw = cameraView.width; sh = cameraView.height }
         else { sw = glSurface.width; sh = glSurface.height }
@@ -1069,11 +843,12 @@ class ArActivity : Activity() {
                 r.start(sw, sh, preC, preS)
                 ok = r.recording
                 recorder = r
-                // 后摄 GL 合成：编码器面直接挂后摄 mixer 输出（合成结果 GPU 直喂编码器，免 Canvas 重画）
-                val mx = rearMixer
+                // GL 合成：编码器面直接挂当前模式合成器输出（前摄=frontGl，后摄=rearMixer），
+                // 合成结果 GPU 直喂编码器，免 CPU 重画
                 val inSurf = r.inputSurface
-                if (ok && !frontCamera && mx != null && inSurf != null) {
-                    mx.attachOutputSurface(inSurf)
+                if (ok && inSurf != null) {
+                    if (frontCamera) frontGl?.attachOutputSurface(inSurf)
+                    else rearMixer?.attachOutputSurface(inSurf)
                 }
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "rec start fail", e)
@@ -1116,17 +891,19 @@ class ArActivity : Activity() {
             .setBackgroundResource(R.drawable.ic_record_idle)   // 停止时切回红点再旋转
         setRecAnim(true)                 // 旋转动画 = 停止中，且忽略点击
         val btn = findViewById<ImageButton>(R.id.button_record)
-        // 预热尺寸与录像面一致：前摄=全屏 Canvas 面；后摄=3:4 GL 面
+        // 预热尺寸与录像面一致：前摄=全屏 GL 面；后摄=3:4 GL 面
         val ws = if (frontCamera) cameraView.width else glSurface.width
         val hs = if (frontCamera) cameraView.height else glSurface.height
         Thread {
             var name: String? = null
             try {
-                // 后摄 GL 模式：先把编码器面从后摄 mixer 摘掉（同步、不 release），再停编码器，
+                // GL 模式：先把编码器面从当前模式合成器摘掉（同步、不 release），再停编码器，
                 // 避免 GL 线程向已失效的编码器面 swap
-                val mx = rearMixer
                 val inSurf = r.inputSurface
-                if (mx != null && inSurf != null) mx.detachOutputSurface(inSurf, releaseSurface = false)
+                if (inSurf != null) {
+                    if (frontCamera) frontGl?.detachOutputSurface(inSurf, releaseSurface = false)
+                    else rearMixer?.detachOutputSurface(inSurf, releaseSurface = false)
+                }
                 r.stop()
                 name = r.displayName
             } catch (e: Exception) {
@@ -1318,7 +1095,6 @@ class ArActivity : Activity() {
         private var lastPtsUs = Long.MIN_VALUE
         private var pendingPtsUs = 0L
         private var startMs = 0L
-        private var w = 0; private var h = 0
         private var encThread: Thread? = null
         private val tickLock = Object()
 
@@ -1429,7 +1205,6 @@ class ArActivity : Activity() {
             pt("muxer", t0)
             displayName = name
             track = -1; muxStarted = false
-            this.w = w; this.h = h
             lastPtsUs = Long.MIN_VALUE
             startMs = SystemClock.elapsedRealtime()
             recording = true
@@ -1507,31 +1282,17 @@ class ArActivity : Activity() {
             }
         }
 
-        /** 每帧由 render() 调用：唤醒编码线程采一帧（自身卡顿不会阻塞显示线程） */
+        /** 每帧由 GL 合成器 frameCallback 调用：唤醒编码线程取包（自身卡顿不会阻塞 GL 线程） */
         fun tick() {
             if (!recording) return
             synchronized(tickLock) { tickLock.notifyAll() }
         }
 
-        /** 编码线程：>15fps 采样 live 画面 → 编码器输入 Surface（GPU 加速）→ muxer。
-         *  后摄 GL 模式下合成结果由 SurfaceMixer 直接推到编码器面，本线程只做取包+PTS。 */
+        /** 编码线程：前后摄合成结果均由 GL 合成器（前摄 frontGl / 后摄 rearMixer）直接推到
+         *  编码器输入面，本线程只做取包 + PTS；GL 每拍 frameCallback 会唤醒本线程提前取包。 */
         private fun encLoop() {
             while (recording) {
-                val s = inSurf
-                if (s == null) { sleepTick(); continue }
-                val glFeed = !frontCamera && rearMixer != null
-                if (!glFeed) {
-                    var cv: Canvas? = null
-                    try {
-                        cv = if (Build.VERSION.SDK_INT >= 26) s.lockHardwareCanvas()
-                            else @Suppress("DEPRECATION") s.lockCanvas(Rect(0, 0, 0, 0))
-                        // 直接重画合成画面（局部 scratch，可与显示线程并发）
-                        paintFrame(cv, w.toFloat(), h.toFloat())
-                    } catch (_: Exception) {
-                    } finally {
-                        try { s.unlockCanvasAndPost(cv) } catch (_: Exception) {}
-                    }
-                }
+                if (inSurf == null) { sleepTick(); continue }
                 // 每帧取真实墙钟作为该帧 PTS（单调），时长=真实录制时长
                 pendingPtsUs = (SystemClock.elapsedRealtime() - startMs) * 1000L
                 try { drain(false) } catch (_: Exception) {}
@@ -1924,6 +1685,7 @@ class ArActivity : Activity() {
                     bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                 }
                 overlayNew = true
+                overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
                 if (!overLayerReady) { overLayerReady = true; updateRecBtnVisible() }   // 第二层：overlay 首帧解码
             }
         } catch (t: Throwable) {
@@ -1955,7 +1717,7 @@ class ArActivity : Activity() {
         showStatusText(statusTextFor())
         // 预览就绪后后台预热录像编码器，避免首次点录像时偶发 1~5s 初始化
         camHandler?.postDelayed({
-            // 预热尺寸与录像面一致：前摄=全屏 Canvas 面；后摄=3:4 GL 面
+            // 预热尺寸与录像面一致：前摄=全屏 GL 面；后摄=3:4 GL 面
         val ws = if (frontCamera) cameraView.width else glSurface.width
         val hs = if (frontCamera) cameraView.height else glSurface.height
             if (ws > 0 && hs > 0) armWarmVideo(ws, hs)
@@ -1982,6 +1744,7 @@ class ArActivity : Activity() {
         glassesState = 1
         camHandler?.post { closeCameraNow(); startCamera() }
         glSurface.visibility = android.view.View.GONE
+        frontGl?.setActive(true)   // 前摄 GL 合成恢复上屏
         startFrontConnection()
         showStatusText(statusTextFor())
         val old = rearPlayer
@@ -1996,6 +1759,7 @@ class ArActivity : Activity() {
         glassesState = 1
         camHandler?.post { closeCameraNow() }   // 后摄基底=眼镜视频，手机相机整体停掉省电
         glSurface.visibility = android.view.View.VISIBLE   // surfaceChanged → ensureRearMixer → startRearPlayerIfReady
+        frontGl?.setActive(false)   // 前摄 GL 合成停画（只清黑，垫在 3:4 GL 面之下）
         startRearPlayerIfReady()
         showStatusText("后摄：连接眼镜画面…")
         val oldConn = connection
@@ -2061,6 +1825,7 @@ class ArActivity : Activity() {
             overlayBmp?.recycle()
             overlayBmp = null
             overlayNew = false
+            overlayVersion++   // 通知 GL 合成器清空 overlay/光晕纹理
         }
     }
 
@@ -2079,6 +1844,7 @@ class ArActivity : Activity() {
     private fun restoreFrontMode() {
         frontCamera = true
         glSurface.visibility = android.view.View.GONE
+        frontGl?.setActive(true)
         camHandler?.post {
             closeCameraNow()
             startCamera()
@@ -2236,7 +2002,8 @@ class ArActivity : Activity() {
         }
         try { rearMixer?.release() } catch (_: Exception) {}
         rearMixer = null
-        renderExec.shutdown()
+        frontGl?.release()
+        frontGl = null
         super.onDestroy()
     }
 
