@@ -12,12 +12,12 @@ package com.gscp.desktop
  */
 class GlassesPlayer(
     private val context: android.content.Context,
-    private val mixer: SurfaceMixer,
+    private val mixer: RearComposer,
     private val audioEnabled: Boolean,
     private val bottomRotationDeg: Int,
     private val bottomMirror: Boolean,
     /** 连接成功时下发合成参数（普通模式 = applySettingsToMixer）。 */
-    private val applySettings: (SurfaceMixer) -> Unit,
+    private val applySettings: (RearComposer) -> Unit,
     private val events: Events,
     /** stop() 时是否 reset() 合成器输入面。普通模式 true（handleStopped 语义）；
      *  AR 后摄必须传 false——mixer 跨会话复用，异步 stop 的 reset 若晚于新会话

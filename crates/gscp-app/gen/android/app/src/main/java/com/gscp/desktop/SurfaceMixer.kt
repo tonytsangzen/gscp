@@ -27,7 +27,7 @@ import java.nio.FloatBuffer
  *   overlay 区域内底图按 dim_strength 圆角蒙版压暗，2 秒无帧自动隐藏；
  * - 输出可同时挂多个 Surface（屏幕 + 录制）。
  */
-class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
+class SurfaceMixer(val context: Context, val width: Int, val height: Int) : RearComposer {
     // 底层配置
     private var bottomRotation = 90f
     private var bottomMirror = false
@@ -288,9 +288,9 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         try { latch.await(1, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) {}
     }
 
-    fun getTopSurface(): Surface = topSurface
+    override fun getTopSurface(): Surface = topSurface
 
-    fun getBottomSurface(): Surface = bottomSurface
+    override fun getBottomSurface(): Surface = bottomSurface
 
     private fun renderFrame() {
         GLES20.glUseProgram(program)
@@ -368,7 +368,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     }
 
     /** 断开后重建两路输入 Surface（旧 SurfaceTexture 随会话失效）。 */
-    fun reset() {
+    override fun reset() {
         Log.i("ar-ui", "mixer reset")
         diagTop = 0; diagBottom = 0
         handler.post {
@@ -457,7 +457,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         Matrix.translateM(matrix, 0, offsetX.toFloat(), offsetY.toFloat(), 0f)
     }
 
-    fun setBottomRotation(rotation: Float, mirror: Boolean) {
+    override fun setBottomRotation(rotation: Float, mirror: Boolean) {
         bottomRotation = rotation
         bottomMirror = mirror
         runAfterGlReady(Runnable { refreshMatrices() })
@@ -469,27 +469,27 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         runAfterGlReady(Runnable { refreshMatrices() })
     }
 
-    fun setBottomAspectRatio(ratio: Float) {
+    override fun setBottomAspectRatio(ratio: Float) {
         bottomAspectRatio = ratio
         runAfterGlReady(Runnable { refreshMatrices() })
     }
 
-    fun setTopRotation(rotationDeg: Int, mirror: Boolean) {
+    override fun setTopRotation(rotationDeg: Int, mirror: Boolean) {
         topRotationDeg = rotationDeg
         topMirror = mirror
     }
 
-    fun setTopAspectRatio(ratio: Float) {
+    override fun setTopAspectRatio(ratio: Float) {
         topAspectRatio = ratio
     }
 
     /** overlay 相对 contain 铺放的缩放（1.0 = 铺满 contain 矩形）。 */
-    fun setOverlayScale(scale: Float) {
+    override fun setOverlayScale(scale: Float) {
         overlayScale = scale.coerceIn(0.1f, 8.0f)
     }
 
     /** 效果参数批量下发（与桌面 EffectParams 同名同语义）。 */
-    fun setOverlayParams(
+    override fun setOverlayParams(
         alpha: Float,
         brightness: Float,
         saturation: Float,
@@ -510,7 +510,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     }
 
     /** 底图亮度（与桌面 base_brightness 同语义）。 */
-    fun setBaseBrightness(value: Float) {
+    override fun setBaseBrightness(value: Float) {
         baseBrightness = value.coerceIn(0f, 4f)
     }
 

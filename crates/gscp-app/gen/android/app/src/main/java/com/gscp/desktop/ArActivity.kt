@@ -90,10 +90,10 @@ class ArActivity : Activity() {
     @Volatile var diagOverlayPkg = 0L   // 诊断：overlay 网络帧计数
 
     // ── 后摄子系统：完全复用普通模式（MainActivity）管线 ──
-    // GlassesPlayer 自持连接/双硬解/音频；rearMixer 输出到 ar_gl_surface 显示，
+    // GlassesPlayer 自持连接/双硬解/音频；rearGl 输出到 ar_gl_surface 显示，
     // 录像时编码器面直接挂 mixer 输出。与前摄不共享任何连接/解码状态。
     private var rearPlayer: GlassesPlayer? = null
-    private var rearMixer: SurfaceMixer? = null
+    private var rearGl: ArRearGl? = null
     private lateinit var glSurface: SurfaceView
     private var glAttached: Surface? = null
 
@@ -247,18 +247,18 @@ class ArActivity : Activity() {
         glSurface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {}
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
-                val mx = ensureRearMixer(w, ht)
+                val g = ensureRearGl(w, ht)
                 val s = h.surface
                 if (glAttached !== s) {
-                    glAttached?.let { mx.detachOutputSurface(it) }
+                    glAttached?.let { g.detachOutputSurface(it) }
                     glAttached = s
-                    mx.attachOutputSurface(s)
+                    g.attachOutputSurface(s)
                 }
                 startRearPlayerIfReady()
             }
 
             override fun surfaceDestroyed(h: SurfaceHolder) {
-                glAttached?.let { rearMixer?.detachOutputSurface(it) }
+                glAttached?.let { rearGl?.detachOutputSurface(it) }
                 glAttached = null
             }
         })
@@ -388,12 +388,10 @@ class ArActivity : Activity() {
         audioEnabled = prefs.getBoolean("audioEnabled", true)
     }
 
-    /** 与 MainActivity.applySettingsToMixer 同一套参数下发；仅黑边抠像特殊：
-     *  页一未启用抠像（keyHigh ≤ keyLow）时回退到 AR 原校准值——旧 CPU 路径 keyLut
-     *  恒为 lo=0.08-0.06、hi=0.28+0.06、pow1.2（暗色底即抠透）。否则 shader 直接关闭
-     *  抠像，overlay 的褐色底会不透明盖在基底上（表现为颜色不对）。 */
-    private fun applySettingsToMixer(mx: SurfaceMixer) {
-        mx.setOverlayScale(overlayScalePct / 100f)
+    /** 与 MainActivity 同一套参数下发到后摄合成器；仅黑边抠像特殊：
+     *  未启用抠像（keyHigh ≤ keyLow）时回退 AR 原校准值（暗色底即抠透）。 */
+    private fun applyComposerSettings(c: RearComposer) {
+        c.setOverlayScale(overlayScalePct / 100f)
         var keyLow = keyLowPct / 100f
         var keyHigh = keyHighPct / 100f
         var featherPower = featherPowerPct / 100f
@@ -401,7 +399,7 @@ class ArActivity : Activity() {
         if (keyHigh <= keyLow) {
             keyLow = 0.08f; keyHigh = 0.28f; featherPower = 1.2f; featherRadius = 15
         }
-        mx.setOverlayParams(
+        c.setOverlayParams(
             overlayAlphaPct / 100f,
             overlayBrightnessPct / 100f,
             overlaySaturationPct / 100f,
@@ -411,22 +409,21 @@ class ArActivity : Activity() {
             featherPower,
             featherRadius,
         )
-        mx.setBaseBrightness(baseBrightnessPct / 100f)
-        mx.setBottomRotation(bottomRotationDeg.toFloat(), bottomMirror)
-        mx.setTopRotation(topRotationDeg, topMirror)
+        c.setBaseBrightness(baseBrightnessPct / 100f)
+        c.setBottomRotation(bottomRotationDeg.toFloat(), bottomMirror)
+        c.setTopRotation(topRotationDeg, topMirror)
     }
 
-    /** 后摄首次切入时建 GL 合成器（尺寸取 GL 面实际大小，保证 1:1 输出）。 */
-    private fun ensureRearMixer(w: Int, h: Int): SurfaceMixer {
-        var mx = rearMixer
-        if (mx == null) {
-            mx = SurfaceMixer(this, w, h)
-            rearMixer = mx
-            applySettingsToMixer(mx)
-            // 同前摄 letterbox 语义：眼镜画面完整显示不裁切（普通模式保持 cover）
-            mx.setBottomFit(true)
+    /** 后摄首次切入时建 GL 合成器（尺寸取 GL 面实际大小，保证 1:1 输出）。
+     *  ArRearGl = 前摄处理架构移植：contain 完整显示 + 前摄口径的 overlay 渲染。 */
+    private fun ensureRearGl(w: Int, h: Int): ArRearGl {
+        var g = rearGl
+        if (g == null) {
+            g = ArRearGl(w, h)
+            rearGl = g
+            applyComposerSettings(g)
         }
-        return mx
+        return g
     }
 
     /** 前摄首次显示时建 GL 合成器（尺寸取显示面实际大小，保证 1:1 输出）。
@@ -788,11 +785,11 @@ class ArActivity : Activity() {
                 ok = r.recording
                 recorder = r
                 // GL 合成：编码器面直接挂当前模式合成器输出（前摄=frontGl 裁剪 camera
-                // 有效区域，后摄=rearMixer 全画面），合成结果 GPU 直喂编码器，免 CPU 重画
+                // 有效区域，后摄=rearGl 全画面），合成结果 GPU 直喂编码器，免 CPU 重画
                 val inSurf = r.inputSurface
                 if (ok && inSurf != null) {
                     if (frontCamera) frontGl?.attachOutputSurface(inSurf, crop = true)
-                    else rearMixer?.attachOutputSurface(inSurf)
+                    else rearGl?.attachOutputSurface(inSurf)
                 }
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "rec start fail", e)
@@ -847,7 +844,7 @@ class ArActivity : Activity() {
                 val inSurf = r.inputSurface
                 if (inSurf != null) {
                     if (frontCamera) frontGl?.detachOutputSurface(inSurf, releaseSurface = false)
-                    else rearMixer?.detachOutputSurface(inSurf, releaseSurface = false)
+                    else rearGl?.detachOutputSurface(inSurf, releaseSurface = false)
                 }
                 r.stop()
                 name = r.displayName
@@ -1225,7 +1222,7 @@ class ArActivity : Activity() {
             synchronized(tickLock) { tickLock.notifyAll() }
         }
 
-        /** 编码线程：前后摄合成结果均由 GL 合成器（前摄 frontGl / 后摄 rearMixer）直接推到
+        /** 编码线程：前后摄合成结果均由 GL 合成器（前摄 frontGl / 后摄 rearGl）直接推到
          *  编码器输入面，本线程只做取包 + PTS；GL 每拍 frameCallback 会唤醒本线程提前取包。 */
         private fun encLoop() {
             while (recording) {
@@ -1713,7 +1710,7 @@ class ArActivity : Activity() {
         rearActive = true
         glassesState = 1
         camHandler?.post { closeCameraNow() }   // 后摄基底=眼镜视频，手机相机整体停掉省电
-        glSurface.visibility = android.view.View.VISIBLE   // surfaceChanged → ensureRearMixer → startRearPlayerIfReady
+        glSurface.visibility = android.view.View.VISIBLE   // surfaceChanged → ensureRearGl → startRearPlayerIfReady
         frontGl?.setActive(false)   // 前摄 GL 合成停画（只清黑，垫在 3:4 GL 面之下）
         showStatusText("后摄：连接眼镜画面…")
         val oldConn = connection
@@ -1737,15 +1734,15 @@ class ArActivity : Activity() {
      *  connect 挪到工作线程，先等旧会话收尾完成。 */
     private fun startRearPlayerIfReady() {
         if (!rearActive || rearPlayer != null) return
-        val mx = rearMixer ?: return
+        val g = rearGl ?: return
         val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
-        mx.reset()   // 重建两路输入面，清掉上一会话残留帧
+        g.reset()   // 重建两路输入面，清掉上一会话残留帧
         val player = GlassesPlayer(
-            this, mx, audioEnabled, bottomRotationDeg, bottomMirror,
-            applySettings = { applySettingsToMixer(it) },
+            this, g, audioEnabled, bottomRotationDeg, bottomMirror,
+            applySettings = { applyComposerSettings(it) },
             events = rearEvents,
-            resetMixerOnStop = false,   // mixer 跨会话复用：reset 统一在新会话开始时做，防异步 stop 竞态
+            resetMixerOnStop = false,   // 合成器跨会话复用：reset 统一在新会话开始时做，防异步 stop 竞态
         )
         rearPlayer = player
         val waiter = scrcpyShutdown
@@ -1765,7 +1762,7 @@ class ArActivity : Activity() {
         if (old != null) {
             scrcpyShutdown = Thread { try { old.stop() } catch (_: Exception) {} }.also { it.start() }
         }
-        glAttached?.let { rearMixer?.detachOutputSurface(it) }
+        glAttached?.let { rearGl?.detachOutputSurface(it) }
         glAttached = null
         glSurface.visibility = android.view.View.GONE
     }
@@ -1995,8 +1992,8 @@ class ArActivity : Activity() {
             try { warmCodec?.release() } catch (_: Exception) {}
             warmCodec = null; warmSurf = null
         }
-        try { rearMixer?.release() } catch (_: Exception) {}
-        rearMixer = null
+        try { rearGl?.release() } catch (_: Exception) {}
+        rearGl = null
         frontGl?.release()
         frontGl = null
         super.onDestroy()
