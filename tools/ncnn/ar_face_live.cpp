@@ -64,16 +64,48 @@ std::mutex g_mutex;      // 串行化 open/detect/close
 ncnn::Net* g_net = nullptr;
 
 // overlay 平面距离（cm）：属性 debug.gscp.ovcm（真机免重编译调参）/ 环境变量
-// GSCP_OV_CM（host）可覆盖，默认 20，钳制 [5,200]。
-static int g_ovCm = 20;
+// GSCP_OV_CM（host）可覆盖，默认 25，钳制 [5,200]。
+static int g_ovCm = 25;
 static int g_ovPropCnt = 0;
 static void nc_ov_prop() {
     if (g_ovPropCnt++ % 30) return;
     char s[8] = {0};
     __system_property_get("debug.gscp.ovcm", s);
     const char* e = getenv("GSCP_OV_CM");
-    int v = e && *e ? atoi(e) : (s[0] ? atoi(s) : 20);
+    int v = e && *e ? atoi(e) : (s[0] ? atoi(s) : 25);
     g_ovCm = v < 5 ? 5 : (v > 200 ? 200 : v);
+}
+
+// overlay 投影大小倍数（投影宽 = 倍数 × 脸宽）：属性 debug.gscp.ovscale /
+// 环境变量 GSCP_OV_SCALE 可覆盖，默认 3（脸宽 3 倍，钳制上限），钳制 [0.5,3]。
+// 距离只挪位置不改大小，大小由本倍数唯一决定（投影恒 1:1）。
+static float g_ovScale = 3.f;
+static int g_ovScaleCnt = 0;
+static void nc_ov_scale_prop() {
+    if (g_ovScaleCnt++ % 30) return;
+    char s[16] = {0};
+    __system_property_get("debug.gscp.ovscale", s);
+    const char* e = getenv("GSCP_OV_SCALE");
+    float v = e && *e ? (float)atof(e) : (s[0] ? (float)atof(s) : 3.f);
+    g_ovScale = v < 0.5f ? 0.5f : (v > 3.f ? 3.f : v);
+}
+
+// overlay 平移（cm，板平面内沿横轴/竖轴）：属性 debug.gscp.ovpanx / ovpany
+// （环境变量 GSCP_OV_PAN_X/Y 可覆盖），默认水平 0 / 垂直 5，钳制 [-10,10]。
+// 沿板轴平移随头部姿态自然移动；正值方向以真机实测为准（横轴 = 眼线方向）。
+static float g_ovPanX = 0.f, g_ovPanY = 5.f;
+static int g_ovPanCnt = 0;
+static void nc_ov_pan_prop() {
+    if (g_ovPanCnt++ % 30) return;
+    char sx[16] = {0}, sy[16] = {0};
+    __system_property_get("debug.gscp.ovpanx", sx);
+    __system_property_get("debug.gscp.ovpany", sy);
+    const char* ex = getenv("GSCP_OV_PAN_X");
+    const char* ey = getenv("GSCP_OV_PAN_Y");
+    float vx = ex && *ex ? (float)atof(ex) : (sx[0] ? (float)atof(sx) : 0.f);
+    float vy = ey && *ey ? (float)atof(ey) : (sy[0] ? (float)atof(sy) : 5.f);
+    g_ovPanX = vx < -10.f ? -10.f : (vx > 10.f ? 10.f : vx);
+    g_ovPanY = vy < -10.f ? -10.f : (vy > 10.f ? 10.f : vy);
 }
 int g_backend = -1;
 int g_input = 0;
@@ -1053,6 +1085,8 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     std::lock_guard<std::mutex> lk(g_mutex);
 
     nc_ov_prop();
+    nc_ov_scale_prop();
+    nc_ov_pan_prop();
 
     jbyte* yp = env->GetByteArrayElements(yArr, nullptr);
     jbyte* up = env->GetByteArrayElements(uArr, nullptr);
@@ -1246,6 +1280,8 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
         bool hopeOn = false;           // hopenet 接入滞回（38 开/30 关），防边界反复开关
         float rawW = 0;                // 未膨胀 mesh 包围盒宽 EWMA（板尺寸用，与 ROI 裕量解耦）
         float eyeDX = 1.f, eyeDY = 0.f;  // 观测眼线 33→263（相机系，板横轴用）
+        bool hasRollE = false;           // 眼线角 One-Euro（板 roll 阻尼）
+        float rollPrev = 0, rollDPrev = 0;
     };
     static PoseTrack s_tracks[3];
     float wtmp3[3];
@@ -1437,16 +1473,39 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
             if (nn < 1e-6f) nn = 1.f;
             nx /= nn; ny /= nn; nz /= nn;
             // 锚点 = 脸中心 + N·D：板沿法线悬浮于脸前（法线一致——板朝向与
-            // 位移方向一致，倾斜观感自然）；pitch 已由模板去偏校准
+            // 位移方向一致，倾斜观感自然）；pitch 已由模板去偏校准。
+            // 板轴 r1/r2 备好后沿板平面平移（ovpanx/ovpany），再投影中心。
             float C[3] = { nx*D + tt[0], ny*D + tt[1], nz*D + tt[2] };
-            if (C[2] < 1.f) C[2] = 1.f;
-            const float ccx = cx + fxf * C[0] / C[2];
-            const float ccy = cy + fyf * C[1] / C[2];
-            const float zPlane = C[2];
             // 横轴 = 眼线投影，对 N 正交化；退化沿用上帧（侧脸兜底）。
             // 眼线与 R 第 0 列（模型 +x = 33→263）同向，无需 y 取反——
             // 取反会让板倾斜方向与预览中人脸倾斜相反（实测 roll 反向）
             float exd = trk->eyeDX, eyd = trk->eyeDY;
+            // 板 roll 直接取眼线方向（33→263 raw 地标差，无滤波），地标逐帧噪声
+            // 直通为板左右晃动。对眼线角做 One-Euro（环绕安全，±π wrap）：
+            // 静止强平滑压抖动、快速转头经 beta 提截止保持跟随。
+            if (!trk->hasRollE) {
+                trk->rollPrev = atan2f(eyd, exd);
+                trk->rollDPrev = 0.f;
+                trk->hasRollE = true;
+            } else {
+                const float ang = atan2f(eyd, exd);
+                float dA = ang - trk->rollPrev;
+                if (dA > 3.14159265f) dA -= 2.f * 3.14159265f;
+                if (dA < -3.14159265f) dA += 2.f * 3.14159265f;
+                const float dCut = 1.0f, minCut = 0.3f, beta = 0.15f;
+                const float dx = dA * fps;
+                const float ad = 1.f / (1.f + (1.f / (2.f * 3.14159265f * dCut)) * fps);
+                float dhat = trk->rollDPrev + ad * (dx - trk->rollDPrev);
+                trk->rollDPrev = dhat;
+                const float a = 1.f / (1.f +
+                    (1.f / (2.f * 3.14159265f * (minCut + beta * fabsf(dhat)))) * fps);
+                float xh = trk->rollPrev + a * dA;
+                if (xh > 3.14159265f) xh -= 2.f * 3.14159265f;
+                if (xh < -3.14159265f) xh += 2.f * 3.14159265f;
+                trk->rollPrev = xh;
+                exd = cosf(xh);
+                eyd = sinf(xh);
+            }
             float elen = sqrtf(exd*exd + eyd*eyd);
             if (elen < 1e-3f) { exd = 1.f; eyd = 0.f; elen = 1.f; }
             float r1x = exd / elen, r1y = eyd / elen, r1z = 0.f;
@@ -1465,11 +1524,20 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
             float r2x = ny*r1z - nz*r1y;
             float r2y = nz*r1x - nx*r1z;
             float r2z = nx*r1y - ny*r1x;
+            // 板平面内平移（cm→模型单位）：水平沿 r1（眼线方向）、竖直沿 r2
+            const float panU = g_ovPanX * cmU, panV = g_ovPanY * cmU;
+            C[0] += r1x*panU + r2x*panV;
+            C[1] += r1y*panU + r2y*panV;
+            C[2] += r1z*panU + r2z*panV;
+            if (C[2] < 1.f) C[2] = 1.f;
+            const float ccx = cx + fxf * C[0] / C[2];
+            const float ccy = cy + fyf * C[1] / C[2];
+            const float zPlane = C[2];
             // 高度：世界尺寸按内容纵横比给定。(0,0,0) 姿态时 n=(0,0,-1)、r1 水平、
             // r2 竖直且四角同深度 → 投影高 = fyf·2hh/z = fx·2hw/z = 投影宽，严格 1:1；
             // 其他姿态按正常透视投影，随倾斜自然缩短（不人为补偿）
             const float srcW = trk->rawW > 0.f ? trk->rawW : trk->bwS * 0.69f;
-            const float hw = (srcW * 0.5f * 1.5f) * zPlane / fxf;
+            const float hw = (srcW * 0.5f * g_ovScale) * zPlane / fxf;
             const float hh = hw * ((float)g_ovH / (float)g_ovW) * (fxf / fyf);
             // 背板 = 前板沿 -N 推 2mm（厚度暗示）
             const float thCm = 0.2f;

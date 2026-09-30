@@ -9,10 +9,11 @@ import android.util.Log
  * 眼镜端音频播放：opus 帧 —— Rust(`gscp-app::opus_jni`)软解 —— PCM —— AudioTrack。
  * （本机 MediaCodec `c2.android.opus.decoder` 组件不可用，故与 PC gscp-player 同源走软件解码。）
  *
- * 解码出的 PCM(统一立体声) 通过 [onPcm] 同时喂给录像混音器（`recorder.feedGlassesPcm`）。
+ * 解码出的 PCM(统一立体声) 通过 [onPcm] 供外部按需取用（当前无人接线：
+ * 录像只录手机麦克风，眼镜外放由麦克风自然拾音）。
  */
 class AudioPlayer {
-    /** 解码出的 PCM(i16 LE 立体声交织) 回调：录像混音用。 */
+    /** 解码出的 PCM(i16 LE 立体声交织) 回调（可选钩子，当前无人接线）。 */
     var onPcm: ((ByteArray) -> Unit)? = null
 
     companion object {

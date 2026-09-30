@@ -76,7 +76,7 @@ class ArActivity : Activity() {
     private lateinit var ipEdit: EditText
 
     private var connection: ScrcpyConnection? = null
-    // 眼镜端音频：Opus 解码 → AudioTrack 播放；解码出的 PCM 经 onPcm 转发给录像混音
+    // 眼镜端音频：Opus 解码 → AudioTrack 外放（录像只录手机麦克风，不接解码 PCM）
     private var glassesAudio: AudioPlayer? = null
     private var overlayDecoder: VideoDecoder? = null
     private val overlayLock = Any()
@@ -145,11 +145,6 @@ class ArActivity : Activity() {
     @Volatile private var faceKps0: FloatArray? = null   // face0 五点（面板显示）
     @Volatile private var faceYpr0: FloatArray? = null   // face0 姿态角（面板显示）
     @Volatile private var faceOv = arrayOf<FloatArray>()       // 每脸 17 值：四角 8 + 背板 8 + 距离 cm
-
-    // ── 录像按钮出现条件：三层画面（相机 / 眼镜overlay首帧 / 人脸锚点）都就绪才显示 ──
-    @Volatile private var camLayerReady = false
-    @Volatile private var overLayerReady = false
-    @Volatile private var anchorLayerReady = false
     private var lastRecBtnShow = false   // bottom_controls 上次可见态（布局初始 hidden），避免每帧重复更新 View
 
     // 眼镜连接状态：0=未连接 1=连接中 2=已连接
@@ -671,7 +666,6 @@ class ArActivity : Activity() {
 
     private fun processFrame() {
         try {
-            if (!camLayerReady) { camLayerReady = true; updateRecBtnVisible() }   // 相机帧到达 → 第一层就绪
             val now = System.nanoTime() / 1e6
             if (lastFrameT[0] > 0) {
                 val inst = 1000.0 / maxOf(1e-3, now - lastFrameT[0])
@@ -804,16 +798,34 @@ class ArActivity : Activity() {
         faceKps0 = k0
         faceYpr0 = p0
         faceOv = ovList.toTypedArray()
-        val anchored = ovList.isNotEmpty()          // 第三层：人脸追到 overlay 四角锚点
-        if (anchored != anchorLayerReady) { anchorLayerReady = anchored; updateRecBtnVisible() }
+    }
+
+    /** 前摄录像尺寸 = camera 有效区域（GL 面上 letterbox 内容矩形，偶数对齐）。
+     *  相机/显示面未就绪返回 null。与 ArFrontGl 裁剪映射同一矩形公式。 */
+    private fun frontRecordSize(): IntArray? {
+        val fw = frameW; val fh = frameH
+        val vw = cameraView.width; val vh = cameraView.height
+        if (fw <= 0 || fh <= 0 || vw <= 0 || vh <= 0) return null
+        val dispRot = (windowManager.defaultDisplay?.rotation ?: 0) * 90
+        val rot = (sensorOrientation - dispRot + 360) % 360
+        val cw = if (rot == 90 || rot == 270) fh else fw
+        val ch = if (rot == 90 || rot == 270) fw else fh
+        val sc = minOf(vw.toFloat() / cw, vh.toFloat() / ch)
+        fun even(v: Float): Int { val i = v.toInt(); return if (i and 1 == 1) i - 1 else i }
+        val w = even(cw * sc); val h = even(ch * sc)
+        return if (w > 0 && h > 0) intArrayOf(w, h) else null
     }
 
     private fun startRec() {
         android.util.Log.i(TAG, "rec: startRec called, cameraView=${cameraView.width}x${cameraView.height}")
-        // 录像分辨率取显示面：前摄=全屏 GL 面；后摄=3:4 GL 面（与合成器输出一致）
+        // 录像分辨率：前摄=camera 有效区域（letterbox 内容矩形，无黑边）；
+        // 后摄=3:4 GL 面（与合成器输出一致）
         val sw: Int; val sh: Int
-        if (frontCamera) { sw = cameraView.width; sh = cameraView.height }
-        else { sw = glSurface.width; sh = glSurface.height }
+        if (frontCamera) {
+            val s = frontRecordSize()
+            if (s == null) { showStatusText("画面未就绪，无法录像"); return }
+            sw = s[0]; sh = s[1]
+        } else { sw = glSurface.width; sh = glSurface.height }
         if (sw <= 0 || sh <= 0) { showStatusText("画面未就绪，无法录像"); return }
         // 录像音轨需要麦克风权限（眼镜音频不依赖此权限，但混音需要手机录音）
         if (!micGranted()) {
@@ -843,11 +855,11 @@ class ArActivity : Activity() {
                 r.start(sw, sh, preC, preS)
                 ok = r.recording
                 recorder = r
-                // GL 合成：编码器面直接挂当前模式合成器输出（前摄=frontGl，后摄=rearMixer），
-                // 合成结果 GPU 直喂编码器，免 CPU 重画
+                // GL 合成：编码器面直接挂当前模式合成器输出（前摄=frontGl 裁剪 camera
+                // 有效区域，后摄=rearMixer 全画面），合成结果 GPU 直喂编码器，免 CPU 重画
                 val inSurf = r.inputSurface
                 if (ok && inSurf != null) {
-                    if (frontCamera) frontGl?.attachOutputSurface(inSurf)
+                    if (frontCamera) frontGl?.attachOutputSurface(inSurf, crop = true)
                     else rearMixer?.attachOutputSurface(inSurf)
                 }
             } catch (e: Exception) {
@@ -891,9 +903,10 @@ class ArActivity : Activity() {
             .setBackgroundResource(R.drawable.ic_record_idle)   // 停止时切回红点再旋转
         setRecAnim(true)                 // 旋转动画 = 停止中，且忽略点击
         val btn = findViewById<ImageButton>(R.id.button_record)
-        // 预热尺寸与录像面一致：前摄=全屏 GL 面；后摄=3:4 GL 面
-        val ws = if (frontCamera) cameraView.width else glSurface.width
-        val hs = if (frontCamera) cameraView.height else glSurface.height
+        // 预热尺寸与录像面一致：前摄=camera 有效区域；后摄=3:4 GL 面
+        val s = if (frontCamera) frontRecordSize() else null
+        val ws = s?.get(0) ?: glSurface.width
+        val hs = s?.get(1) ?: glSurface.height
         Thread {
             var name: String? = null
             try {
@@ -932,8 +945,12 @@ class ArActivity : Activity() {
                 val fmt = MediaFormat.createVideoFormat("video/avc", w, h)
                 fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                fmt.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
-                fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 15)
+                // 与 ArRecorder.start 同参（高质量：VBR 20Mbps + 30fps，分辨率不缩放），
+                // 否则预热编码器被复用时参数不一致
+                fmt.setInteger(MediaFormat.KEY_BIT_RATE, 20_000_000)
+                fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
                 fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 s = c.createInputSurface()
@@ -960,7 +977,7 @@ class ArActivity : Activity() {
         hideRunnable = null
     }
 
-    /** 底部相机控件条可见性：录像中始终显示（可停止）；否则仅当三层画面都就绪才显示。
+    /** 底部相机控件条可见性：进入预览（playing）即显示、退出预览隐藏。
      *  录像按钮/缩略图/切换钮在同一个 bottom_controls 容器里，一起显示/隐藏。主线程安全。 */
     private fun updateRecBtnVisible() {
         val show = playing   // 进入预览状态显示、退出预览隐藏（与录像按钮一起）
@@ -1098,67 +1115,15 @@ class ArActivity : Activity() {
         private var encThread: Thread? = null
         private val tickLock = Object()
 
-        // ---- 混音（眼镜端 PCM + 手机麦克风 → AAC 音轨）----
-        // 主视频编码线程在 rec-encoder；音频混音编码在 audio-mix 线程，二者共享 muxer。
+        // ---- 音轨（仅手机麦克风 → AAC；眼镜外放由麦克风自然拾音，不混解码 PCM）----
+        // 主视频编码线程在 rec-encoder；音频编码在 audio-mix 线程，二者共享 muxer。
         private val muxerLock = Object()   // mediaMuxer 非线程安全，写样本需互斥
         private var wantsAudio = false       // 本路是否拥有音轨（麦克风权限 OK 且 AAC 就绪）
         private var audioTrack = -1           // 音频轨
-        private var glassBytes = ByteArray(1 shl 16) // 眼镜 PCM 累积缓冲（交织 i16）
-        private var glassLen = 0
         private var mic: AudioRecord? = null
         private var aac: MediaCodec? = null
         private var audioThread: Thread? = null
         private var audioPtsUs = 0L
-        // 手机麦克风三段式增益查表：噪声底压低 → 语音电平处 10 倍 → 对数衰减到 1 倍；
-        // 混音和值再过软限幅，防削峰破音
-        private val micLut = ShortArray(65536)
-
-        init {
-            // 三段式麦克风增益（对 |x| 单调且 C1 连续，无波形折点 → 不产生谐波破音）：
-            //  1) |x|≤噪声门限：f = a·x —— 底噪压低 ~16dB，不再被增益放大
-            //  2) 门限..满增益电平：三次 Hermite 平滑爬升 —— 10 倍增益作用在语音电平上
-            //  3) 满增益电平以上：f = P·ln(1+q·x) 对数衰减，f(M)=10M、f(32767)=32767
-            //     （满幅映射满幅，最大音量保持不变）
-            val nFloor = MIC_NOISE_FLOOR.toDouble()
-            val mLevel = MIC_FULL_GAIN_LEVEL.toDouble()
-            val xMax = 32767.0
-            // 第 3 段参数：P·ln(1+q·M)=gainPeak·M，P·ln(1+q·X)=X；两式相除后对 q 二分求根
-            // （ln(1+qM)/ln(1+qX) 随 q 单调递增，比值域 (M/X, 1)）
-            val target = MIC_PEAK_GAIN * mLevel / xMax
-            var lo = 1e-7; var hi = 1.0
-            repeat(60) {
-                val mid = (lo + hi) / 2
-                if (Math.log1p(mid * mLevel) / Math.log1p(mid * xMax) < target) lo = mid else hi = mid
-            }
-            val q3 = (lo + hi) / 2
-            val p3 = xMax / Math.log1p(q3 * xMax)
-            val y1 = MIC_PEAK_GAIN * mLevel                        // 第 2 段终点值
-            val slopeEnd = p3 * q3 / (1 + q3 * mLevel)             // 与第 3 段 C1 衔接的斜率
-            val d = mLevel - nFloor
-            fun curve(ax: Double): Double = when {
-                ax <= nFloor -> MIC_NOISE_ATTEN * ax
-                ax <= mLevel -> {
-                    val u = (ax - nFloor) / d
-                    val h00 = 2 * u * u * u - 3 * u * u + 1
-                    val h10 = u * u * u - 2 * u * u + u
-                    val h01 = -2 * u * u * u + 3 * u * u
-                    val h11 = u * u * u - u * u
-                    h00 * (MIC_NOISE_ATTEN * nFloor) + h10 * d * MIC_NOISE_ATTEN +
-                        h01 * y1 + h11 * d * slopeEnd
-                }
-                else -> p3 * Math.log1p(q3 * ax)
-            }
-            for (idx in 0 until 65536) {
-                val v = idx - 32768
-                val ax = (if (v < 0) -v else v).toDouble()
-                val y = if (v > 0) curve(ax) else -curve(ax)
-                micLut[idx] = when {
-                    y > 32767.0 -> 32767.toShort()
-                    y < -32768.0 -> (-32768).toShort()
-                    else -> y.toInt().toShort()
-                }
-            }
-        }
 
         fun start(w: Int, h: Int, preC: MediaCodec? = null, preS: android.view.Surface? = null) {
             val t0 = SystemClock.elapsedRealtime()
@@ -1192,8 +1157,12 @@ class ArActivity : Activity() {
                 val fmt = MediaFormat.createVideoFormat("video/avc", w, h)
                 fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                fmt.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000)
-                fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 15)
+                // 高质量：VBR 20Mbps + 30fps；分辨率=录像面原始尺寸（前摄=全屏 GL 面，
+                // 后摄=3:4 GL 面），不缩放
+                fmt.setInteger(MediaFormat.KEY_BIT_RATE, 20_000_000)
+                fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                fmt.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
                 fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 s = c.createInputSurface()
@@ -1209,24 +1178,10 @@ class ArActivity : Activity() {
             startMs = SystemClock.elapsedRealtime()
             recording = true
             android.util.Log.i(TAG, "rec: start e(${w}x${h}) name=$name")
-            // 麦克风权限 OK 则开混音音轨（眼镜 PCM 由 onAudioPackage→feedGlassesPcm 持续喂入）
+            // 麦克风权限 OK 则开音轨（仅手机麦克风；眼镜外放由麦克风自然拾音）
             wantsAudio = micGranted() && initMicAndAac()
             pt("audio", t0)
             encThread = Thread({ encLoop() }, "rec-encoder").apply { start() }
-        }
-
-        /** Apple 帧级喂入眼镜端 PCM（decode 线程直投；仅录像时）。与 [onAudioPackage] 同路线。 */
-        @Synchronized
-        fun feedGlassesPcm(pcm: ByteArray) {
-            if (!recording || pcm.isEmpty()) return
-            val cap = glassBytes.size
-            val keep = cap - glassLen
-            if (keep > 0) {
-                val n = minOf(pcm.size, keep)
-                System.arraycopy(pcm, 0, glassBytes, glassLen, n)
-                glassLen += n
-            }
-            // keep==0 表示混音线程消费不及，丢弃最旧（实时混音可接受）
         }
 
         /** 初始化麦克风(48k 单声道)+AAC(48k 立体声)编码器；失败返回 false（退化为无音轨）。 */
@@ -1270,7 +1225,6 @@ class ArActivity : Activity() {
                 aac = ac
                 audioTrack = -1
                 audioPtsUs = 0L
-                glassLen = 0
                 try { mr?.startRecording() } catch (_: Exception) {}
                 android.util.Log.i(TAG, "rec: t mic-start ${SystemClock.elapsedRealtime() - tA}ms")
                 audioThread = Thread({ mixLoop() }, "audio-mix").apply { start() }
@@ -1352,38 +1306,26 @@ class ArActivity : Activity() {
             }
         }
 
-        /** 混音线程：麦克风(单声道) + 眼镜PCM(立体声) → 立体声 → AAC → muxer 音轨。 */
+        /** 音轨线程：仅手机麦克风(单声道 ×MIC_GAIN) → 复制为双声道 → AAC → muxer。
+         *  眼镜端声音不进音轨：外放会被麦克风自然拾音，混入解码 PCM 会双重采录。 */
         private fun mixLoop() {
             val frameSamples = 960          // 20ms @48k
             val ac = aac ?: return
             val micRec = mic
             val micShort = ShortArray(frameSamples)
-            val glass = ByteArray(frameSamples * 4) // 本帧眼镜立体声 i16 交织（L0 R0 L1 R1…）
             val outBi = ByteBuffer.allocateDirect(frameSamples * 4).order(ByteOrder.LITTLE_ENDIAN)
             val bf = MediaCodec.BufferInfo()
             while (recording) {
                 val samplesGot = if (micRec != null) {
                     val got = micRec.read(micShort, 0, frameSamples); if (got > 0) got else 0
                 } else 0
-                // 取一帧眼镜 PCM（交错 i16），不足空隙补零
-                val consumed = synchronized(this) {
-                    val n = minOf(glassLen, glass.size)
-                    if (n > 0) System.arraycopy(glassBytes, 0, glass, 0, n)
-                    shiftGlass(n)
-                    n
-                }
                 outBi.clear()
-                var k = 0
                 for (i in 0 until frameSamples) {
-                    val l: Int; val r: Int
-                    if (k + 4 <= consumed) {
-                        l = (glass[k].toInt() and 0xFF) or (glass[k + 1].toInt() shl 8)
-                        r = (glass[k + 2].toInt() and 0xFF) or (glass[k + 3].toInt() shl 8)
-                        k += 4
-                    } else { l = 0; r = 0 }
-                    val m = if (i < samplesGot) micLut[(micShort[i].toInt() and 0xFFFF)].toInt() else 0
-                    outBi.putShort(limitSoft(l + m))
-                    outBi.putShort(limitSoft(r + m))
+                    // 统一固定增益（无分段/曲线）；饱和截断到 i16，单声道复制到 L/R
+                    val s = (if (i < samplesGot) micShort[i].toInt() * MIC_GAIN else 0)
+                        .coerceIn(-32768, 32767).toShort()
+                    outBi.putShort(s)
+                    outBi.putShort(s)
                 }
                 outBi.rewind()
                 val idx = ac.dequeueInputBuffer(10000)
@@ -1400,25 +1342,6 @@ class ArActivity : Activity() {
                     synchronized(tickLock) { try { tickLock.wait(20) } catch (_: InterruptedException) {} }
                 }
             }
-        }
-
-        /** 把已消费的眼镜 PCM 字节从累积缓冲移除（前移剩余）。调用方须持 synchronized(this)。 */
-        private fun shiftGlass(consumed: Int) {
-            if (consumed <= 0) return
-            val remain = glassLen - consumed
-            if (remain > 0) System.arraycopy(glassBytes, consumed, glassBytes, 0, remain)
-            glassLen = remain
-            java.util.Arrays.fill(glassBytes, remain, glassBytes.size, (0).toByte())
-        }
-
-        /** 软限幅防削峰：|v|≤拐点原样通过；超出部分 tanh 平滑压向满幅——连续可导、
-         *  永不越过满幅且无硬剪角，替代会产生方波破音的硬 clamp。 */
-        private fun limitSoft(v: Int): Short {
-            val av = if (v < 0) -v else v
-            if (av <= LIMIT_KNEE) return v.toShort()
-            val over = (av - LIMIT_KNEE).toDouble() / (32767.0 - LIMIT_KNEE)
-            val limited = LIMIT_KNEE + (32767.0 - LIMIT_KNEE) * Math.tanh(over)
-            return (if (v < 0) -limited else limited).toInt().toShort()
         }
 
         private fun drainAac(ac: MediaCodec, bi: MediaCodec.BufferInfo) {
@@ -1633,8 +1556,10 @@ class ArActivity : Activity() {
                 // 剪影让任意字符贡献相同的发光源；多级降/升采样（纯双线性缩放）等效大半径
                 // 低通，不依赖 maskFilter——光晕均匀、无块状明暗边界
                 val gw = maxOf(8, w shr 2); val gh = maxOf(8, h shr 2)
-                val hw = maxOf(4, w shr 3); val hh = maxOf(4, h shr 3)
-                val fw = maxOf(4, w shr 4); val fh = maxOf(4, h shr 4)
+                // 低通中间层降到 1/16（旧 1/8）、远距层降到 1/32（旧 1/16）：
+                // 光晕扩散面积更大，单位面积亮度更低
+                val hw = maxOf(4, w shr 4); val hh = maxOf(4, h shr 4)
+                val fw = maxOf(2, w shr 5); val fh = maxOf(2, h shr 5)
                 if (glowBmp == null || glowBmp!!.width != gw || glowBmp!!.height != gh) {
                     glowBmp?.recycle()
                     glowBmp = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
@@ -1686,7 +1611,6 @@ class ArActivity : Activity() {
                 }
                 overlayNew = true
                 overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
-                if (!overLayerReady) { overLayerReady = true; updateRecBtnVisible() }   // 第二层：overlay 首帧解码
             }
         } catch (t: Throwable) {
             // Throwable：JNI 方法不匹配等 Error 也不得杀死解码线程
@@ -1717,9 +1641,10 @@ class ArActivity : Activity() {
         showStatusText(statusTextFor())
         // 预览就绪后后台预热录像编码器，避免首次点录像时偶发 1~5s 初始化
         camHandler?.postDelayed({
-            // 预热尺寸与录像面一致：前摄=全屏 GL 面；后摄=3:4 GL 面
-        val ws = if (frontCamera) cameraView.width else glSurface.width
-        val hs = if (frontCamera) cameraView.height else glSurface.height
+            // 预热尺寸与录像面一致：前摄=camera 有效区域；后摄=3:4 GL 面
+            val s = if (frontCamera) frontRecordSize() else null
+            val ws = s?.get(0) ?: glSurface.width
+            val hs = s?.get(1) ?: glSurface.height
             if (ws > 0 && hs > 0) armWarmVideo(ws, hs)
         }, 1800)
     }
@@ -1813,7 +1738,6 @@ class ArActivity : Activity() {
             settingsPanel.visibility = android.view.View.VISIBLE
             findViewById<android.view.View>(R.id.bottom_controls).visibility = android.view.View.GONE
             lastRecBtnShow = false
-            camLayerReady = false; overLayerReady = false; anchorLayerReady = false
             glassesState = 0
             showStatusText(msg)
             restoreFrontMode()
@@ -1870,10 +1794,7 @@ class ArActivity : Activity() {
             try {
                 val prev = glassesAudio
                 try { prev?.stop() } catch (_: Exception) {}
-                val ap = AudioPlayer()
-                // 解码出的眼镜 PCM（统一立体声）同时喂给录像混音
-                ap.onPcm = { pcm -> recorder?.feedGlassesPcm(pcm) }
-                glassesAudio = ap
+                glassesAudio = AudioPlayer()
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "眼镜音频就绪失败", e)
             }
@@ -2014,11 +1935,7 @@ class ArActivity : Activity() {
         // det_10g 图内写死了 448 输入的 FPN 上采样尺寸，实时检测同样固定 448
         private const val LIVE_INPUT = 448
         private const val SCORE_THRESH = 0.50f
-        // 麦克风三段式增益 + 软限幅参数
-        private const val MIC_NOISE_FLOOR = 300      // 噪声门限：以下视为底噪，按 0.15 倍压低
-        private const val MIC_FULL_GAIN_LEVEL = 1200 // 满增益电平：语音起始区，此处增益 10 倍
-        private const val MIC_NOISE_ATTEN = 0.15     // 噪声段衰减斜率
-        private const val MIC_PEAK_GAIN = 10.0       // 满增益倍数
-        private const val LIMIT_KNEE = 26214         // 软限幅拐点（0.8 满幅）
+        // 麦克风混音：统一固定增益（无分段/曲线处理），和值饱和截断到 i16
+        private const val MIC_GAIN = 10
     }
 }

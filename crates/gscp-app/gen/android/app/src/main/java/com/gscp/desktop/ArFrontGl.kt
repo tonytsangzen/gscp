@@ -53,6 +53,13 @@ class ArFrontGl(
     @Volatile private var camW = 0
     @Volatile private var camH = 0
 
+    // 背板颜色/透明度（系统属性轮询，真机 setprop 免编译调参）：
+    //   debug.gscp.platecolor  RRGGBB / #RRGGBB（默认 004000 暗绿）
+    //   debug.gscp.platealpha  衬底不透明度 0..1（默认 0.1）
+    private val plateColor = floatArrayOf(0f, 0x40 / 255f, 0f)
+    private var plateAlpha = 0.1f
+    private var propTick = 0
+
     private val renderSurfaces = mutableListOf<RenderSurface>()
 
     // EGL
@@ -63,12 +70,19 @@ class ArFrontGl(
     private val handlerThread: HandlerThread = HandlerThread("ar-front-gl")
     private val handler: Handler
 
-    private inner class RenderSurface(val surface: Surface) {
+    private inner class RenderSurface(val surface: Surface, val crop: Boolean) {
         val eglSurface: EGLSurface
+        val surfW: Int
+        val surfH: Int
 
         init {
             val surfaceAttributes = intArrayOf(EGL14.EGL_NONE)
             eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, surface, surfaceAttributes, 0)
+            val v = IntArray(1)
+            EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, v, 0)
+            surfW = v[0]
+            EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, v, 0)
+            surfH = v[0]
         }
 
         fun release() {
@@ -85,6 +99,8 @@ class ArFrontGl(
     private var uPlateSize = 0
     private var uPlateRadius = 0
     private var uPlateGlowSigma = 0
+    private var uPlateColor = 0
+    private var uPlateAlpha = 0
     private var uMeshTex = 0
     private var uMeshAlpha = 0
     private var uMeshMul = 0
@@ -156,6 +172,8 @@ class ArFrontGl(
         uPlateSize = GLES20.glGetUniformLocation(pPlate, "uSize")
         uPlateRadius = GLES20.glGetUniformLocation(pPlate, "uRadius")
         uPlateGlowSigma = GLES20.glGetUniformLocation(pPlate, "uGlowSigma")
+        uPlateColor = GLES20.glGetUniformLocation(pPlate, "uPlateColor")
+        uPlateAlpha = GLES20.glGetUniformLocation(pPlate, "uPlateAlpha")
         uMeshTex = GLES20.glGetUniformLocation(pMesh, "uTex")
         uMeshAlpha = GLES20.glGetUniformLocation(pMesh, "uAlpha")
         uMeshMul = GLES20.glGetUniformLocation(pMesh, "uMul")
@@ -200,11 +218,13 @@ class ArFrontGl(
         camH = h
     }
 
-    fun attachOutputSurface(surface: Surface) {
+    /** 挂输出面。crop=true：只输出 camera 有效区域（letterbox 内容矩形，
+     *  拉伸铺满该面）——录像编码器用，画面不含屏幕黑边。 */
+    fun attachOutputSurface(surface: Surface, crop: Boolean = false) {
         handler.post {
             if (released) return@post
             synchronized(renderSurfaces) {
-                renderSurfaces.add(RenderSurface(surface))
+                renderSurfaces.add(RenderSurface(surface, crop))
             }
         }
     }
@@ -263,6 +283,7 @@ class ArFrontGl(
     }
 
     private fun tick() {
+        pollPlateProps()
         // overlay 内容快照 → 纹理（版本号变化才重新上传；位图在 provider 持锁期间有效）
         overlays.snapshot { content, glow, bloom, ver ->
             if (ver != overlayVersionSeen) {
@@ -276,9 +297,27 @@ class ArFrontGl(
         synchronized(renderSurfaces) {
             for (rs in renderSurfaces) {
                 EGL14.eglMakeCurrent(eglDisplay, rs.eglSurface, rs.eglSurface, eglContext)
-                GLES20.glViewport(0, 0, width, height)
+                if (rs.crop && camW > 0 && camH > 0) {
+                    // 裁剪映射（视口技巧，几何不变）：把 canvas 上的 camera letterbox
+                    // 矩形 (x0,y0,dw,dh) 映射到整个编码器面。顶点仍是 canvas px→clip，
+                    // 视口选 (vp0,vp) 使 window = k*(p - rectOffset)：
+                    //   x: window = kx*(px-x0)        → vpw=W*kx, vp0x=-kx*x0
+                    //   y: window = Eh-ky*(py-y0)（GL y 向上）→ vph=H*ky, vp0y=Eh+ky*y0-H*ky
+                    // 相机未就绪（camW=0）保持黑场，避免首帧前全屏画面被压进编码器。
+                    val sc = minOf(width.toFloat() / camW, height.toFloat() / camH)
+                    val dw = camW * sc
+                    val dh = camH * sc
+                    val x0 = (width - dw) / 2f
+                    val y0 = (height - dh) / 2f
+                    val kx = rs.surfW / dw
+                    val ky = rs.surfH / dh
+                    GLES20.glViewport((-kx * x0).toInt(), (rs.surfH + ky * y0 - height * ky).toInt(),
+                        (width * kx).toInt(), (height * ky).toInt())
+                } else {
+                    GLES20.glViewport(0, 0, width, height)
+                }
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                if (active) drawScene()
+                if (active && !(rs.crop && camW <= 0)) drawScene()
                 EGL14.eglSwapBuffers(eglDisplay, rs.eglSurface)
             }
         }
@@ -324,6 +363,8 @@ class ArFrontGl(
         GLES20.glUniform2f(uPlateSize, ex, ey)
         GLES20.glUniform1f(uPlateRadius, PLATE_CORNER * minOf(ex, ey))
         GLES20.glUniform1f(uPlateGlowSigma, GLOW_SIGMA_DP * density)
+        GLES20.glUniform3f(uPlateColor, plateColor[0], plateColor[1], plateColor[2])
+        GLES20.glUniform1f(uPlateAlpha, plateAlpha)
         putQuad4(tlX, tlY, trX, trY, brX, brY, blX, blY)
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
@@ -332,8 +373,8 @@ class ArFrontGl(
         computeHomography(tlX, tlY, trX, trY, brX, brY, blX, blY)
         if (hasContent) {
             packMesh()
-            drawPackedMesh(bloomTex, additive = true, alpha = 150f / 255f, mul = MUL_UNIT, add = 0f)
-            drawPackedMesh(glowTex, additive = true, alpha = 200f / 255f, mul = MUL_UNIT, add = 0f)
+            drawPackedMesh(bloomTex, additive = true, alpha = BLOOM_FAR_ALPHA, mul = MUL_BLOOM, add = 0f)
+            drawPackedMesh(glowTex, additive = true, alpha = BLOOM_MID_ALPHA, mul = MUL_BLOOM, add = 0f)
             drawPackedMesh(contentTex, additive = false, alpha = 1f, mul = MUL_CONTENT, add = 12f / 255f)
         } else {
             drawHint((tlX + trX + brX + blX) / 4f, (tlY + trY + brY + blY) / 4f)
@@ -502,6 +543,28 @@ class ArFrontGl(
 
     // ── 纹理与 GL 状态 ─────────────────────────────────────────
 
+    /** 背板颜色/透明度属性轮询（GL 线程，每 30 拍一次，SystemProperties 反射读取）。 */
+    private fun pollPlateProps() {
+        if (++propTick % 30 != 1) return
+        try {
+            val sp = Class.forName("android.os.SystemProperties")
+            val get = sp.getMethod("get", String::class.java, String::class.java)
+            val hex = (get.invoke(null, "debug.gscp.platecolor", "004000") as String)
+                .trim().removePrefix("#").removePrefix("0x")
+            if (hex.length >= 6) {
+                val rgb = hex.takeLast(6).toLongOrNull(16)
+                if (rgb != null) {
+                    plateColor[0] = ((rgb shr 16) and 0xFF) / 255f
+                    plateColor[1] = ((rgb shr 8) and 0xFF) / 255f
+                    plateColor[2] = (rgb and 0xFF) / 255f
+                }
+            }
+            val a = (get.invoke(null, "debug.gscp.platealpha", "") as String).trim()
+            if (a.isNotEmpty()) a.toFloatOrNull()?.let { plateAlpha = it.coerceIn(0f, 1f) }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun ensureCameraTex(w: Int, h: Int) {
         if (camTex != 0 && camTexW == w && camTexH == h) return
         if (camTex != 0) GLES20.glDeleteTextures(1, intArrayOf(camTex), 0)
@@ -590,8 +653,15 @@ class ArFrontGl(
         private const val CAM_DIM = 0.70f         // 相机压暗（同旧 camDimPaint）
         private const val PLATE_CORNER = 0.10f    // 背板圆角（边长比例，同旧 10% 切角）
         private const val GLOW_SIGMA_DP = 5f      // 背板柔光 σ（同旧 BlurMaskFilter 5dp）
+        // 光晕（bloom）参数：透明度较旧值（150/200）下调 —— 减轻加色光晕渗入文字笔画
+        // 间隙造成的发雾；扩散后单位面积能量下降，提亮倍数回落到 1.0（需要更亮再调）
+        private const val BLOOM_FAR_ALPHA = 90f / 255f    // 远距光晕层透明度
+        private const val BLOOM_MID_ALPHA = 120f / 255f   // 中距光晕层透明度
+        private const val BLOOM_BRIGHTNESS = 1.0f         // 光晕颜色提亮倍数
         private val MUL_UNIT = floatArrayOf(1f, 1f, 1f)
         private val MUL_CONTENT = floatArrayOf(1.40f, 1.40f, 1.40f)   // 内容提亮（同旧 meshPaint）
+        private val MUL_BLOOM = floatArrayOf(
+            BLOOM_BRIGHTNESS, BLOOM_BRIGHTNESS, BLOOM_BRIGHTNESS)
 
         /** 顶点：xy = clip 坐标，zw = uv（纹理 v=0 为位图首行/顶部）。 */
         private const val VERT_SRC = """
@@ -613,21 +683,24 @@ class ArFrontGl(
             }
         """
 
-        /** 背板：局部 px 空间圆角矩形 SDF；内部 0x08 绿衬底 + 外缘 0x0A 高斯柔光。 */
+        /** 背板：局部 px 空间圆角矩形 SDF；内部 uPlateColor×uPlateAlpha 衬底 +
+         *  外缘同色高斯柔光（premultiplied 输出，blend 为 ONE/ONE_MINUS_SRC_ALPHA）。 */
         private const val FRAG_PLATE = """
             precision mediump float;
             varying vec2 vUv;
             uniform vec2 uSize;
             uniform float uRadius;
             uniform float uGlowSigma;
+            uniform vec3 uPlateColor;
+            uniform float uPlateAlpha;
             void main() {
                 vec2 p = (vUv - 0.5) * uSize;
                 vec2 q = abs(p) - (uSize * 0.5 - uRadius);
                 float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - uRadius;
-                float fill = clamp(0.5 - d, 0.0, 1.0) * (8.0 / 255.0);
+                float fill = clamp(0.5 - d, 0.0, 1.0) * uPlateAlpha;
                 float glow = (10.0 / 255.0) * exp(-pow(max(d, 0.0) / uGlowSigma, 2.0));
                 float a = clamp(fill + glow, 0.0, 1.0);
-                gl_FragColor = vec4(0.0, a, 0.0, a);
+                gl_FragColor = vec4(uPlateColor * a, a);
             }
         """
 
