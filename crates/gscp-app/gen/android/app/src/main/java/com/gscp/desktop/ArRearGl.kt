@@ -80,6 +80,7 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     private var uKeyHigh = 0
     private var uKeyFeather = 0
     private var uBlitTex = 0
+    private var uContentTex = 0
     private var uBloomTex = 0
     private var uBloomGain = 0
 
@@ -168,11 +169,20 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         uKeyHigh = GLES20.glGetUniformLocation(pKey, "uKeyHigh")
         uKeyFeather = GLES20.glGetUniformLocation(pKey, "uFeather")
         uBlitTex = GLES20.glGetUniformLocation(pBlit, "uTex")
+        uContentTex = GLES20.glGetUniformLocation(pContent, "uTex")
         uBloomTex = GLES20.glGetUniformLocation(pBloom, "uTex")
         uBloomGain = GLES20.glGetUniformLocation(pBloom, "uGain")
         fbQuarter = Fbo(width / 4, height / 4)
         fbEighth = Fbo(width / 8, height / 8)
         fbFar = Fbo(width / 16, height / 16)
+        for (f in listOf(fbQuarter, fbEighth, fbFar)) {
+            f.ensure()
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, f.fbo[0])
+            val st = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+            if (st != GLES20.GL_FRAMEBUFFER_COMPLETE)
+                Log.e("ar-rear-gl", "FBO incomplete: $st (${f.w}x${f.h})")
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         quadBuf = ByteBuffer.allocateDirect(quadArr.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
         GLES20.glEnableVertexAttribArray(0)
@@ -322,6 +332,7 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
 
     /** 键控 → 1/4 FBO → 金字塔低通(1/4→1/8→1/4 ×2,前摄同款口径)→ 远距 1/16。 */
     private fun renderTopFbos() {
+        fbQuarter.ensure(); fbEighth.ensure(); fbFar.ensure()
         GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbQuarter.fbo[0])
         GLES20.glViewport(0, 0, fbQuarter.w, fbQuarter.h)
@@ -419,7 +430,7 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         GLES20.glUseProgram(pContent)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbQuarter.tex[0])
-        GLES20.glUniform1i(uBlitTex, 0)
+        GLES20.glUniform1i(uContentTex, 0)
         drawTopRectQuad()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
         GLES20.glDisable(GLES20.GL_BLEND)
