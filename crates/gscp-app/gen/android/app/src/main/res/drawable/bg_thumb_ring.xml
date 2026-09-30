@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 缩略图白色圆环（foreground 层）：与快门键同族的 2.5dp 白环，压在裁圆的
+     bitmap 之上，是相机 App 缩略图键的标志样式 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <stroke android:width="2.5dp" android:color="#FFFFFFFF" />
+</shape>

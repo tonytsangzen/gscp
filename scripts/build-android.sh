@@ -80,6 +80,6 @@ APK=app/build/outputs/apk/arm64/release/app-arm64-release.apk
 echo "✓ APK: $(pwd)/$APK"
 
 if [[ $INSTALL -eq 1 ]]; then
-  adb install -d -r "$APK"
+  adb install  -r -t -d -g  "$APK"
   echo "✓ 已安装到已连接设备"
 fi

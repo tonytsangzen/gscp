@@ -289,6 +289,9 @@ class ArActivity : Activity() {
         findViewById<Button>(R.id.button_connect).setOnClickListener { startAr() }
         recOverlay = findViewById(R.id.rec_overlay)
         val lastThumb = findViewById<ImageView>(R.id.last_thumb)
+        // 相机 App 缩略图键惯例：bitmap 裁圆（outline 来自 bg_thumb 正圆），
+        // 白色圆环由 foreground 叠加不被裁
+        lastThumb.clipToOutline = true
         lastThumb.setOnClickListener {
             val u = lastVideoUri ?: return@setOnClickListener
             try {
