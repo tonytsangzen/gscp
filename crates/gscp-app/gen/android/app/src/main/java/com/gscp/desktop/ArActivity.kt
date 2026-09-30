@@ -88,6 +88,7 @@ class ArActivity : Activity() {
     // overlay 内容版本号：convertOverlayFrame/resetOverlay 递增，GL 合成器据此刷新纹理
     @Volatile private var overlayVersion = 0
     @Volatile var diagOverlayPkg = 0L   // 诊断：overlay 网络帧计数
+    private var dumpCount = 0
 
     // ── 后摄子系统：完全复用普通模式（MainActivity）管线 ──
     // GlassesPlayer 自持连接/双硬解/音频；rearGl 输出到 ar_gl_surface 显示，
@@ -415,11 +416,16 @@ class ArActivity : Activity() {
     }
 
     /** 后摄首次切入时建 GL 合成器（尺寸取 GL 面实际大小，保证 1:1 输出）。
-     *  ArRearGl = 前摄处理架构移植：contain 完整显示 + 前摄口径的 overlay 渲染。 */
+     *  ArRearGl = 复用前摄 CPU 烘焙位图（convertOverlayFrame：黑键抠像 + 光晕剪影），
+     *  contain 完整显示；overlays 快照与 ensureFrontGl 同一份 overlayLock 数据。 */
     private fun ensureRearGl(w: Int, h: Int): ArRearGl {
         var g = rearGl
         if (g == null) {
-            g = ArRearGl(w, h)
+            g = ArRearGl(w, h, overlays = { action ->
+                synchronized(overlayLock) {
+                    action(overlayBmp, glowBmp, bloomFarBmp, overlayVersion)
+                }
+            })
             rearGl = g
             applyComposerSettings(g)
         }
@@ -1591,6 +1597,19 @@ class ArActivity : Activity() {
                 }
                 overlayNew = true
                 overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
+                // debug.gscp.dumpoverlay=1:在 100/200/300 包时各转储一张解码位图
+                // (首帧为空帧,需等 UI 渲染后的包)
+                if (diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
+                    dumpCount++
+                    try {
+                        val f = java.io.File(getExternalFilesDir(null), "overlay_dump_${dumpCount}.png")
+                        java.io.FileOutputStream(f).use { overlayBmp!!.compress(
+                            Bitmap.CompressFormat.PNG, 100, it) }
+                        android.util.Log.i(TAG, "overlay dump#${dumpCount}: ${f.absolutePath}")
+                    } catch (e: Exception) {
+                        android.util.Log.w(TAG, "overlay dump fail", e)
+                    }
+                }
             }
         } catch (t: Throwable) {
             // Throwable：JNI 方法不匹配等 Error 也不得杀死解码线程
@@ -1744,6 +1763,10 @@ class ArActivity : Activity() {
             applySettings = { applyComposerSettings(it) },
             events = rearEvents,
             resetMixerOnStop = false,   // 合成器跨会话复用：reset 统一在新会话开始时做，防异步 stop 竞态
+            // 后摄 overlay 复用前摄 CPU 烘焙（convertOverlayFrame：keyLut 黑键抠像 +
+            // 饱和度 + 内容/光晕剪影），ArRearGl 只做纹理合成。旧路径硬解直写 OES 后
+            // GLSL 现场键控，羽化区间的暗色像素 premult 合成会压暗底层 = 抠图残留黑边。
+            overlayImageCallback = { img -> convertOverlayFrame(img) },
         )
         rearPlayer = player
         val waiter = scrcpyShutdown

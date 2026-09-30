@@ -24,6 +24,10 @@ class GlassesPlayer(
      *  绑定解码器落地，会把新 SurfaceTexture 拆掉 = overlay/视频永远不更新。
      *  AR 在 startRearPlayerIfReady 里新会话开始时自行 reset。 */
     private val resetMixerOnStop: Boolean = true,
+    /** 非空：overlay 解码不落 Surface，改为无 Surface 解码 + I420 Image 回调
+     *  （AR 后摄复用前摄 convertOverlayFrame CPU 烘焙，消 GLSL 现场键控的黑残留；
+     *  此时 mixer.getTopSurface() 不再被消费）。 */
+    private val overlayImageCallback: ((android.media.Image) -> Unit)? = null,
 ) {
     interface Events {
         fun onConnect()
@@ -96,7 +100,13 @@ class GlassesPlayer(
             android.util.Log.i("ar-ui", "rear overlayPrepare $codec ${width}x$height")
             synchronized(platformLock) {
                 mixer.setTopAspectRatio(width.toFloat() / height)
-                overlayDecoder?.start(width, height, mixer.getTopSurface())
+                if (overlayImageCallback != null) {
+                    // 无 Surface 解码：getOutputImage 给出 CPU 可读 I420（同前摄路径）
+                    overlayDecoder?.frameCallback = overlayImageCallback
+                    overlayDecoder?.start(width, height, null)
+                } else {
+                    overlayDecoder?.start(width, height, mixer.getTopSurface())
+                }
             }
         }
 

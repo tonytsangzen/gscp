@@ -5,7 +5,8 @@ import android.view.Surface
 /**
  * 后摄流合成器抽象：GlassesPlayer 只依赖此接口取输入面/下发参数。
  * 实现一：[SurfaceMixer]（普通播放页，矩阵缩放管线）；
- * 实现二：[ArRearGl]（AR 后摄，前摄架构移植，contain 完整显示）。
+ * 实现二：[ArRearGl]（AR 后摄，复用前摄 CPU 烘焙位图，contain 完整显示；
+ * GlassesPlayer 传 overlayImageCallback 时 getTopSurface 不被消费）。
  */
 interface RearComposer {
     fun getBottomSurface(): Surface
