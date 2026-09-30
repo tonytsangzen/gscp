@@ -408,8 +408,8 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
 
         /** 底层：OES 直采 + 镜像 + 亮度。 */
         private const val FRAG_BOTTOM = """
-            precision mediump float;
             #extension GL_OES_EGL_image_external : require
+            precision mediump float;
             varying vec2 vUv;
             uniform samplerExternalOES uTex;
             uniform int uMirror;
@@ -424,8 +424,8 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         /** 顶层：luma 黑键抠像（pow 羽化）+ 饱和度 ×1.12 + 亮度增益，
          *  premultiplied 输出（blend ONE / ONE_MINUS_SRC_ALPHA）。 */
         private const val FRAG_TOP = """
-            precision mediump float;
             #extension GL_OES_EGL_image_external : require
+            precision mediump float;
             varying vec2 vUv;
             uniform samplerExternalOES uTex;
             uniform float uKeyLow;
