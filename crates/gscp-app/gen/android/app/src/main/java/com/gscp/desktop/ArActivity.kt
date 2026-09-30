@@ -51,7 +51,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -141,9 +140,6 @@ class ArActivity : Activity() {
     private var surfaceReady = false
     private val busy = AtomicBoolean(false)
 
-    @Volatile private var debugLines = arrayOf<String>()
-    @Volatile private var faceKps0: FloatArray? = null   // face0 五点（面板显示）
-    @Volatile private var faceYpr0: FloatArray? = null   // face0 姿态角（面板显示）
     @Volatile private var faceOv = arrayOf<FloatArray>()       // 每脸 17 值：四角 8 + 背板 8 + 距离 cm
     private var lastRecBtnShow = false   // bottom_controls 上次可见态（布局初始 hidden），避免每帧重复更新 View
 
@@ -187,17 +183,7 @@ class ArActivity : Activity() {
     private val backendIdx = 2      // Vulkan FP16（自动调优，失败回退 CPU FP32）
     private var playing = false
     private var openSent = false
-    private var openErr: String? = null
-    private var backendName = "…"
-    private var cornerDbg = 0
-    private var threadInfo = ""
     private var dbgFrames = 0
-    private val fpsEma = doubleArrayOf(0.0)
-    private val lastFrameT = doubleArrayOf(0.0)
-    @Volatile private var lastInferMs = 0f
-    @Volatile private var lastConvMs = 0f
-    @Volatile private var lastCopyMs = 0f
-    @Volatile private var lastProcMs = 0f
 
     // ── 以下 Paint/Canvas 均为 overlay CPU 特效烘焙(convertOverlayFrame)专用；
     //    合成上屏的画笔(相机压暗/内容提亮/背板/柔光/连接提示)已随 Canvas 路径移入
@@ -470,14 +456,7 @@ class ArActivity : Activity() {
         return try {
             val o = JSONObject(j)
             val ok = o.optBoolean("ok")
-            if (ok) {
-                backendName = o.optString("backend", "?")
-                val t = o.optInt("threads", 0)
-                threadInfo = if (t > 0) " · 线程 $t" else ""
-            } else {
-                openErr = o.optString("err", "open_failed")
-                android.util.Log.w(TAG, "det net open failed: $j")
-            }
+            if (!ok) android.util.Log.w(TAG, "det net open failed: $j")
             ok
         } catch (e: Exception) {
             false
@@ -603,10 +582,8 @@ class ArActivity : Activity() {
         try { img = r.acquireLatestImage() } catch (_: Exception) {}
         if (img == null) return
         if (busy.getAndSet(true)) { img.close(); return }
-        val t0 = System.nanoTime()
         try {
             val okCopy = copyPlanes(img)
-            lastCopyMs = ((System.nanoTime() - t0) / 1e6).toFloat()
             if (!okCopy) {
                 android.util.Log.e(TAG, "copyPlanes failed")
                 busy.set(false)
@@ -666,13 +643,6 @@ class ArActivity : Activity() {
 
     private fun processFrame() {
         try {
-            val now = System.nanoTime() / 1e6
-            if (lastFrameT[0] > 0) {
-                val inst = 1000.0 / maxOf(1e-3, now - lastFrameT[0])
-                fpsEma[0] = if (fpsEma[0] == 0.0) inst else fpsEma[0] * 0.9 + inst * 0.1
-            }
-            lastFrameT[0] = now
-
             val disp = windowManager.defaultDisplay
             val displayRot = (disp?.rotation ?: 0) * 90
             val rot = (sensorOrientation - displayRot + 360) % 360
@@ -692,7 +662,6 @@ class ArActivity : Activity() {
                 b
             }
 
-            val tn = System.nanoTime()
             val j = ArNative.nativeFaceDetect(
                 yBuf!!, uBuf!!, vBuf!!, frameW, frameH,
                 yStride, uStride, vStride, uPix, vPix, rot, detectOn, rb)
@@ -701,8 +670,7 @@ class ArActivity : Activity() {
                 android.util.Log.i(TAG, "frame#$dbgFrames rot=$rot upright=${rw}x$rh json=" +
                     (if (j.length > 160) j.substring(0, 160) else j))
 
-            parseResult(j, rw, rh)
-            lastProcMs = ((System.nanoTime() - tn) / 1e6).toFloat()
+            parseResult(j)
 
             // GL 合成：相机帧纹理上传 + 人脸锚点状态（检测直写的 RGBA 原样上屏，所见即所测；
             // 旧 copyPixelsFromBuffer + Canvas 软件绘制路径已整体移除）
@@ -718,85 +686,38 @@ class ArActivity : Activity() {
         }
     }
 
-    /** 提取面板数据（face0 关键点/姿态）与 overlay 四角锚点；人脸丢失时 faceOv 为空。 */
-    private fun parseResult(j: String, rw: Int, rh: Int) {        val lines = ArrayList<String>()
+    /** 提取 face0 overlay 四角锚点；人脸丢失时 faceOv 为空。
+     *  （旧调试面板文本/fps 统计已随 Canvas 路径废弃移除，native 异常走日志） */
+    private fun parseResult(j: String) {
         val ovList = ArrayList<FloatArray>()
-        var k0: FloatArray? = null
-        var p0: FloatArray? = null
         try {
             val o = JSONObject(j)
-            lastConvMs = o.optDouble("convMs", 0.0).toFloat()
-            lastInferMs = o.optDouble("ms", 0.0).toFloat()
-            val total = lastCopyMs + lastProcMs
-            lines.add(String.format(Locale.ROOT, "FPS %.1f · 帧耗时 %.1fms", fpsEma[0], total))
-            lines.add(String.format(Locale.ROOT, "耗时: 拷贝 %.1f · 转换 %.1f · 推理 %.1f ms",
-                lastCopyMs, lastConvMs, lastInferMs))
-            lines.add(String.format(Locale.ROOT, "后端 %s%s · 输入 %d×%d",
-                o.optString("backend", backendName), threadInfo,
-                o.optInt("input", 0), o.optInt("input", 0)))
-            lines.add(String.format(Locale.ROOT, "相机 %d×%d · 直立 %d×%d · 旋转 %d°",
-                frameW, frameH, o.optInt("w", rw), o.optInt("h", rh), o.optInt("rot", 0)))
-            if (!o.optBoolean("ok", true)) {
-                lines.add("错误: " + o.optString("err", "?") + (if (detectOn) "" else "（检测关）"))
-            } else {
+            if (o.optBoolean("ok", true)) {
                 val fs = o.optJSONArray("faces")
-                val n = fs?.length() ?: 0
-                val mx = o.optDouble("maxScore", -1.0).toFloat()
-                val mxStr = if (mx >= 0) String.format(Locale.ROOT, " · 最高分 %.2f", mx) else ""
-                lines.add(String.format(Locale.ROOT, "人脸 %d · 阈值 %.2f%s%s",
-                    n, SCORE_THRESH, if (detectOn) "" else " · 检测:关", mxStr))
-                if (n > 0) {
-                    val f = fs?.optJSONObject(0)
-                    if (f != null) {
-                        val k = f.optJSONArray("kps")
-                        if (k != null && k.length() >= 10)
-                            k0 = FloatArray(10) { q -> k.optDouble(q, 0.0).toFloat() }
-                        val po = f.optJSONArray("pose")
-                        if (po != null && po.length() == 3)
-                            p0 = FloatArray(3) { q -> po.optDouble(q, 0.0).toFloat() }
-                        val ovArr = f.optJSONArray("overlay")
-                        val bkArr = f.optJSONArray("back")
-                        if (ovArr != null && ovArr.length() == 4 && bkArr != null && bkArr.length() == 4) {
-                            val ov = FloatArray(17)   // 前四角 8 + 背板四角 8 + 距离 cm
-                            for (q in 0 until 4) {
-                                val pt = ovArr.optJSONArray(q)
-                                ov[2 * q] = pt?.optDouble(0, 0.0)?.toFloat() ?: 0f
-                                ov[2 * q + 1] = pt?.optDouble(1, 0.0)?.toFloat() ?: 0f
-                            }
-                            for (q in 0 until 4) {
-                                val pt = bkArr.optJSONArray(q)
-                                ov[8 + 2 * q] = pt?.optDouble(0, 0.0)?.toFloat() ?: 0f
-                                ov[9 + 2 * q] = pt?.optDouble(1, 0.0)?.toFloat() ?: 0f
-                            }
-                            ov[16] = f.optDouble("ovD", 30.0).toFloat()
-                            ovList.add(ov)
-                        }
+                val f = if (fs != null && fs.length() > 0) fs.optJSONObject(0) else null
+                val ovArr = f?.optJSONArray("overlay")
+                val bkArr = f?.optJSONArray("back")
+                if (ovArr != null && ovArr.length() == 4 && bkArr != null && bkArr.length() == 4) {
+                    val ov = FloatArray(17)   // 前四角 8 + 背板四角 8 + 距离 cm
+                    for (q in 0 until 4) {
+                        val pt = ovArr.optJSONArray(q)
+                        ov[2 * q] = pt?.optDouble(0, 0.0)?.toFloat() ?: 0f
+                        ov[2 * q + 1] = pt?.optDouble(1, 0.0)?.toFloat() ?: 0f
                     }
-                    val kf = k0
-                    if (kf != null) {
-                        val sb = StringBuilder("face0 点: ")
-                        val names = arrayOf("眼", "眼", "鼻", "嘴角", "嘴角")
-                        for (q in 0 until 5)
-                            sb.append(names[q]).append(q).append("(")
-                                .append(Math.round(kf[2 * q])).append(",")
-                                .append(Math.round(kf[2 * q + 1])).append(") ")
-                        lines.add(sb.toString())
-                        val pf = p0
-                        if (pf != null) {
-                            lines.add(String.format(Locale.ROOT,
-                                "face0 姿态: yaw %.0f° pitch %.0f° roll %.0f°", pf[1], pf[0], pf[2]))
-                        }
+                    for (q in 0 until 4) {
+                        val pt = bkArr.optJSONArray(q)
+                        ov[8 + 2 * q] = pt?.optDouble(0, 0.0)?.toFloat() ?: 0f
+                        ov[9 + 2 * q] = pt?.optDouble(1, 0.0)?.toFloat() ?: 0f
                     }
+                    ov[16] = f!!.optDouble("ovD", 30.0).toFloat()
+                    ovList.add(ov)
                 }
-                lines.add("算法:" + o.optString("algo", "fusion"))
+            } else {
+                android.util.Log.w(TAG, "detect err: " + o.optString("err", "?"))
             }
         } catch (e: Exception) {
-            lines.add("JSON 解析失败: $e")
+            android.util.Log.w(TAG, "JSON 解析失败", e)
         }
-        if (openErr != null) lines.add("网络加载失败: $openErr")
-        debugLines = lines.toTypedArray()
-        faceKps0 = k0
-        faceYpr0 = p0
         faceOv = ovList.toTypedArray()
     }
 
@@ -1984,8 +1905,7 @@ class ArActivity : Activity() {
         private const val REQ_CAM = 1
         private const val REQ_MIC = 2
         // det_10g 图内写死了 448 输入的 FPN 上采样尺寸，实时检测同样固定 448
-        private const val LIVE_INPUT = 448
-        private const val SCORE_THRESH = 0.50f
+        private const val LIVE_INPUT = 448   // det_10g 图内写死 448 输入的 FPN 上采样尺寸
         private const val CONTROLS_IDLE_MS = 10_000L   // 无触屏 10s 后控件条下滑隐藏
         // 麦克风混音：统一固定增益（无分段/曲线处理），和值饱和截断到 i16
         private const val MIC_GAIN = 10
