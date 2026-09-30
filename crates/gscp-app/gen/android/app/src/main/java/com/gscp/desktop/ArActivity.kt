@@ -265,8 +265,12 @@ class ArActivity : Activity() {
         loadSettings()   // 与第一页同一组合成参数（同名 prefs key）
 
         cameraView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(h: SurfaceHolder) { surfaceReady = true; tryStart() }
+            override fun surfaceCreated(h: SurfaceHolder) {
+                android.util.Log.i("ar-ui", "surfaceCreated")
+                surfaceReady = true; tryStart()
+            }
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {
+                android.util.Log.i("ar-ui", "surfaceChanged ${w}x$ht")
                 // 前摄 GL 合成输出面：与后摄 glSurface 同样的挂载/摘除模式
                 val g = ensureFrontGl(w, ht)
                 val s = h.surface
@@ -279,6 +283,7 @@ class ArActivity : Activity() {
             }
 
             override fun surfaceDestroyed(h: SurfaceHolder) {
+                android.util.Log.i("ar-ui", "surfaceDestroyed")
                 surfaceReady = false
                 stopCamera()
                 frontGlAttached?.let { frontGl?.detachOutputSurface(it) }
@@ -1600,6 +1605,7 @@ class ArActivity : Activity() {
     // ── scrcpy overlay 连接 ───────────────────────────────────
 
     private fun startAr() {
+        android.util.Log.i("ar-ui", "startAr")
         val ip = ipEdit.text.toString().trim()
         if (!Patterns.IP_ADDRESS.matcher(ip).matches()) {
             Toast.makeText(this, "请输入有效的 IP 地址", Toast.LENGTH_SHORT).show()
@@ -1625,19 +1631,32 @@ class ArActivity : Activity() {
         }, 1800)
     }
 
-    /** 补挂前摄 GL 输出面（幂等）。teardown 会同步摘除输出面；同 Activity 内
-     *  再次连接时 ar_surface 若未经历 destroy/create（快速重连，部分机型
-     *  surfaceChanged 也不重发），仅靠 surface 回调永远挂不回去——相机与
-     *  眼镜流照常运行却无输出，画面卡死在最后一帧。凡 attached 为空且
-     *  holder surface 仍有效，立即挂回。 */
+    /** 补挂前摄 GL 输出面（幂等）。teardown 会同步摘除输出面；实测部分机型
+     *  ar_panel GONE 时 surfaceDestroyed/Create/Changed 全部不重发，holder
+     *  surface 保持 invalid —— 仅靠 surface 回调永远挂不回去，相机与眼镜流
+     *  照常运行却无输出，画面卡死在最后一帧。
+     *  surface 有效 → 直接挂；已失效 → 强制 SurfaceView 重建表面（GONE→VISIBLE）
+     *  触发完整回调，并短重试兜底（挂载幂等，与回调路径互斥）。 */
     private fun attachFrontGlIfLive() {
-        val g = frontGl ?: return
+        val g = frontGl
+        val s = cameraView.holder.surface
+        android.util.Log.i("ar-ui", "attachFrontGlIfLive: gl=${g != null} attached=${frontGlAttached != null} surf=${s != null} valid=${s?.isValid}")
+        if (g == null) return
         if (frontGlAttached != null) return
-        val s = cameraView.holder.surface ?: return
-        if (!s.isValid) return
-        frontGlAttached = s
-        g.attachOutputSurface(s)
-        g.setActive(frontCamera)
+        if (s != null && s.isValid) {
+            frontGlAttached = s
+            g.attachOutputSurface(s)
+            g.setActive(frontCamera)
+            return
+        }
+        // 表面已失效且回调不会重发：强制重建
+        android.util.Log.i("ar-ui", "surface invalid -> force recreate")
+        cameraView.visibility = android.view.View.GONE
+        cameraView.post { cameraView.visibility = android.view.View.VISIBLE }
+        // 重建回调若仍未到，短重试兜底（每次都幂等检查）
+        for (delay in longArrayOf(400, 1000, 2000)) {
+            recTimerHandler.postDelayed({ attachFrontGlIfLive() }, delay)
+        }
     }
 
     // ── 子系统切换：前摄（overlay-only + Canvas AR）与后摄（普通模式管线 + GL）互相独立 ──
@@ -1650,6 +1669,7 @@ class ArActivity : Activity() {
     /** 起前摄 overlay-only 连接（CPU overlay 帧供人脸锚点投影）。
      *  connectAsync 挪到工作线程，先等旧会话收尾完成。 */
     private fun startFrontConnection() {
+        android.util.Log.i("ar-ui", "startFrontConnection")
         val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
         frontActive = true
@@ -1748,7 +1768,9 @@ class ArActivity : Activity() {
 
     /** 断开/出错后收尾：停录像、复位两个子系统、回到设置面板。可在任意线程调用。 */
     private fun teardownToSettings(msg: String) {
+        android.util.Log.i("ar-ui", "teardown: $msg")
         runOnUiThread {
+            watchdogRunnable?.let { recTimerHandler.removeCallbacks(it) }
             if (recorder?.recording == true) stopRec()
             overlayDecoder?.stop()
             overlayDecoder = null
@@ -1781,6 +1803,7 @@ class ArActivity : Activity() {
     }
 
     private fun exitAr() {
+        android.util.Log.i("ar-ui", "exitAr")
         playing = false
         frontActive = false
         val c = connection
@@ -1807,8 +1830,10 @@ class ArActivity : Activity() {
 
     // ── 前摄子系统回调：overlay-only 连接（无视频流），overlay CPU 帧供人脸投影 ──
     @Volatile private var frontOverlaySeen = false   // 流看门狗：onOverlayPrepare 已到
+    private var watchdogRunnable: Runnable? = null   // 看门狗句柄：换连接/收尾时必须撤销
     private val callback = object : ScrcpyConnection.EventCallback {
         override fun onConnect() {
+            android.util.Log.i("ar-ui", "front onConnect")
             glassesState = 2
             runOnUiThread {
                 progressView.visibility = android.view.View.GONE
@@ -1816,12 +1841,17 @@ class ArActivity : Activity() {
             }
             // 流看门狗：连接成功但 server 被杀/挂死时不会有任何错误回调，
             // 界面会永久卡在"已连接无画面"。8s 内没等到 overlay 流就按失败收尾。
-            recTimerHandler.postDelayed({
+            // （runnable 存句柄：teardown/新连接时撤销，否则旧定时器会误杀下一次连接）
+            watchdogRunnable?.let { recTimerHandler.removeCallbacks(it) }
+            val wd = Runnable {
                 if (playing && frontActive && !frontOverlaySeen) {
+                    android.util.Log.i("ar-ui", "watchdog fire")
                     playing = false
                     teardownToSettings("连接超时，未收到眼镜画面")
                 }
-            }, 8000)
+            }
+            watchdogRunnable = wd
+            recTimerHandler.postDelayed(wd, 8000)
         }
 
         override fun onVideoPrepare(codec: String, width: Int, height: Int) {}
@@ -1857,6 +1887,7 @@ class ArActivity : Activity() {
         }
 
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
+            android.util.Log.i("ar-ui", "overlayPrepare")
             frontOverlaySeen = true   // 流看门狗：overlay 流已到达
             runOnUiThread {
                 showStatusText("overlay ${width}×${height}，请正对手机摄像头")

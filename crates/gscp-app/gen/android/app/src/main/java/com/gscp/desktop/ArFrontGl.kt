@@ -223,6 +223,7 @@ class ArFrontGl(
     /** 挂输出面。crop=true：只输出 camera 有效区域（letterbox 内容矩形，
      *  拉伸铺满该面）——录像编码器用，画面不含屏幕黑边。 */
     fun attachOutputSurface(surface: Surface, crop: Boolean = false) {
+        android.util.Log.i("ar-front-gl", "attachOutputSurface crop=$crop count=${renderSurfaces.size + 1}")
         handler.post {
             if (released) return@post
             synchronized(renderSurfaces) {
@@ -234,6 +235,7 @@ class ArFrontGl(
     /** 摘除一个输出面。同步等待 GL 线程完成（防后续仍向已失效面 swap）；
      *  releaseSurface=false 用于编码器输入 Surface（生命周期归编码器管）。 */
     fun detachOutputSurface(surface: Surface, releaseSurface: Boolean = true) {
+        android.util.Log.i("ar-front-gl", "detachOutputSurface")
         val latch = java.util.concurrent.CountDownLatch(1)
         handler.post {
             synchronized(renderSurfaces) {
