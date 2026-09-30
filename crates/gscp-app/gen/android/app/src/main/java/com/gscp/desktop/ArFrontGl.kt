@@ -23,12 +23,14 @@ import kotlin.math.abs
  * （编码器面直挂输出，与后摄 SurfaceMixer 一致）：
  *  - 相机层：检测线程产出的直立 RGBA（Camera2 → nativeFaceDetect 直写，所见即所测）
  *    glTexSubImage2D 上传，前置镜像 + letterbox 居中，RGB×0.70 压暗（同旧 camDimPaint）；
+ *  - 背板层：overlay quad 上 SDF 圆角矩形衬底 + 外缘柔光（颜色/透明度可 setprop 调参）；
  *  - overlay 层：只渲染眼镜画面本身——内容单应 5×5 网格（同旧 drawBitmapMesh 顶点算法）
  *    + 其派生的两级 bloom 光晕（远 ADD α90 → 中 ADD α120 → 内容 SRC_OVER，RGB×1.4+12）。
- *    不叠加任何非眼镜来源的 UI（背板/提示文字已移除）：无内容时 overlay 区域不画。
+ *    不叠加任何非眼镜来源的 UI（"连接中..."提示文字已移除）：无内容时只有背板。
  * 33ms 定时推帧到全部挂载输出；active=false（后摄模式）只输出黑场。
  */
 class ArFrontGl(
+    private val density: Float,
     val width: Int,
     val height: Int,
     /** 每拍取 overlay 内容快照（GL 线程调用；实现方持锁回调，位图仅在回调内有效）。 */
@@ -47,6 +49,13 @@ class ArFrontGl(
     @Volatile private var face: FloatArray? = null
     @Volatile private var camW = 0
     @Volatile private var camH = 0
+
+    // 背板颜色/透明度（系统属性轮询，真机 setprop 免编译调参）：
+    //   debug.gscp.platecolor  RRGGBB / #RRGGBB（默认 004000 暗绿）
+    //   debug.gscp.platealpha  衬底不透明度 0..1（默认 0.1）
+    private val plateColor = floatArrayOf(0f, 0x40 / 255f, 0f)
+    private var plateAlpha = 0.1f
+    private var propTick = 0
 
 
     private val renderSurfaces = mutableListOf<RenderSurface>()
@@ -81,9 +90,15 @@ class ArFrontGl(
 
     // GL：三个 pass（相机纹理 / 背板 SDF / 网格贴图）
     private var pCamera = 0
+    private var pPlate = 0
     private var pMesh = 0
     private var uCamTex = 0
     private var uCamDim = 0
+    private var uPlateSize = 0
+    private var uPlateRadius = 0
+    private var uPlateGlowSigma = 0
+    private var uPlateColor = 0
+    private var uPlateAlpha = 0
     private var uMeshTex = 0
     private var uMeshAlpha = 0
     private var uMeshMul = 0
@@ -145,9 +160,15 @@ class ArFrontGl(
     private fun initGl() {
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         pCamera = buildProgram(FRAG_CAMERA)
+        pPlate = buildProgram(FRAG_PLATE)
         pMesh = buildProgram(FRAG_MESH)
         uCamTex = GLES20.glGetUniformLocation(pCamera, "uTex")
         uCamDim = GLES20.glGetUniformLocation(pCamera, "uDim")
+        uPlateSize = GLES20.glGetUniformLocation(pPlate, "uSize")
+        uPlateRadius = GLES20.glGetUniformLocation(pPlate, "uRadius")
+        uPlateGlowSigma = GLES20.glGetUniformLocation(pPlate, "uGlowSigma")
+        uPlateColor = GLES20.glGetUniformLocation(pPlate, "uPlateColor")
+        uPlateAlpha = GLES20.glGetUniformLocation(pPlate, "uPlateAlpha")
         uMeshTex = GLES20.glGetUniformLocation(pMesh, "uTex")
         uMeshAlpha = GLES20.glGetUniformLocation(pMesh, "uAlpha")
         uMeshMul = GLES20.glGetUniformLocation(pMesh, "uMul")
@@ -257,6 +278,7 @@ class ArFrontGl(
     }
 
     private fun tick() {
+        pollPlateProps()
         // overlay 内容快照 → 纹理（版本号变化才重新上传；位图在 provider 持锁期间有效）
         overlays.snapshot { content, glow, bloom, ver ->
             if (ver != overlayVersionSeen) {
@@ -328,8 +350,22 @@ class ArFrontGl(
         val brX = (w - ov[2]) * sc + x0; val brY = ov[3] * sc + y0
         val blX = (w - ov[0]) * sc + x0; val blY = ov[1] * sc + y0
 
+        // ── 背板：圆角矩形衬底 + 外缘柔光（SDF；仅人脸锚定即画，属显示背景）──
+        val ex = (dist(trX, trY, tlX, tlY) + dist(brX, brY, blX, blY)) / 2f
+        val ey = (dist(blX, blY, tlX, tlY) + dist(brX, brY, trX, trY)) / 2f
+        GLES20.glUseProgram(pPlate)
+        blendPremult()
+        GLES20.glUniform2f(uPlateSize, ex, ey)
+        GLES20.glUniform1f(uPlateRadius, PLATE_CORNER * minOf(ex, ey))
+        GLES20.glUniform1f(uPlateGlowSigma, GLOW_SIGMA_DP * density)
+        GLES20.glUniform3f(uPlateColor, plateColor[0], plateColor[1], plateColor[2])
+        GLES20.glUniform1f(uPlateAlpha, plateAlpha)
+        putQuad4(tlX, tlY, trX, trY, brX, brY, blX, blY)
+        GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+
         // ── overlay：只渲染眼镜画面（单应网格投影 + 派生 bloom）；
-        //    无内容时不画任何东西（背板/连接提示等自有 UI 已移除）──
+        //    无内容时不画内容（"连接中..."提示等自有 UI 已移除）──
         if (hasContent) {
             computeHomography(tlX, tlY, trX, trY, brX, brY, blX, blY)
             packMesh()
@@ -441,6 +477,56 @@ class ArFrontGl(
         quadBuf.position(0)
     }
 
+    /** 四角任意的 quad（canvas px，序 TL,TR,BR,BL）→ 两三角形写入 [quadBuf]。 */
+    private fun putQuad4(
+        tlX: Float, tlY: Float, trX: Float, trY: Float,
+        brX: Float, brY: Float, blX: Float, blY: Float,
+    ) {
+        val a = quadArr
+        var k = 0
+        fun put(px: Float, py: Float, u: Float, v: Float) {
+            a[k++] = px / width.toFloat() * 2f - 1f
+            a[k++] = 1f - py / height.toFloat() * 2f
+            a[k++] = u
+            a[k++] = v
+        }
+        put(tlX, tlY, 0f, 0f); put(trX, trY, 1f, 0f); put(blX, blY, 0f, 1f)
+        put(trX, trY, 1f, 0f); put(brX, brY, 1f, 1f); put(blX, blY, 0f, 1f)
+        quadBuf.position(0)
+        quadBuf.put(a)
+        quadBuf.position(0)
+    }
+
+    private fun dist(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = (x2 - x1).toDouble()
+        val dy = (y2 - y1).toDouble()
+        return kotlin.math.sqrt(dx * dx + dy * dy).toFloat()
+    }
+
+    // ── 纹理与 GL 状态 ─────────────────────────────────────────
+
+    /** 背板颜色/透明度属性轮询（GL 线程，每 30 拍一次，SystemProperties 反射读取）。 */
+    private fun pollPlateProps() {
+        if (++propTick % 30 != 1) return
+        try {
+            val sp = Class.forName("android.os.SystemProperties")
+            val get = sp.getMethod("get", String::class.java, String::class.java)
+            val hex = (get.invoke(null, "debug.gscp.platecolor", "004000") as String)
+                .trim().removePrefix("#").removePrefix("0x")
+            if (hex.length >= 6) {
+                val rgb = hex.takeLast(6).toLongOrNull(16)
+                if (rgb != null) {
+                    plateColor[0] = ((rgb shr 16) and 0xFF) / 255f
+                    plateColor[1] = ((rgb shr 8) and 0xFF) / 255f
+                    plateColor[2] = (rgb and 0xFF) / 255f
+                }
+            }
+            val a = (get.invoke(null, "debug.gscp.platealpha", "") as String).trim()
+            if (a.isNotEmpty()) a.toFloatOrNull()?.let { plateAlpha = it.coerceIn(0f, 1f) }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun ensureCameraTex(w: Int, h: Int) {
         if (camTex != 0 && camTexW == w && camTexH == h) return
         if (camTex != 0) GLES20.glDeleteTextures(1, intArrayOf(camTex), 0)
@@ -521,6 +607,8 @@ class ArFrontGl(
         private const val TAG = "ar-front-gl"
         private const val MESH_N = 4              // 内容透视网格密度（与旧 drawBitmapMesh 一致）
         private const val CAM_DIM = 0.70f         // 相机压暗（同旧 camDimPaint）
+        private const val PLATE_CORNER = 0.10f    // 背板圆角（边长比例，同旧 10% 切角）
+        private const val GLOW_SIGMA_DP = 5f      // 背板柔光 σ（同旧 BlurMaskFilter 5dp）
         // 光晕（bloom）参数：透明度较旧值（150/200）下调 —— 减轻加色光晕渗入文字笔画
         // 间隙造成的发雾；扩散后单位面积能量下降，提亮倍数回落到 1.0（需要更亮再调）
         private const val BLOOM_FAR_ALPHA = 90f / 255f    // 远距光晕层透明度
@@ -548,6 +636,27 @@ class ArFrontGl(
             uniform float uDim;
             void main() {
                 gl_FragColor = vec4(texture2D(uTex, vUv).rgb * uDim, 1.0);
+            }
+        """
+
+        /** 背板：局部 px 空间圆角矩形 SDF；内部 uPlateColor×uPlateAlpha 衬底 +
+         *  外缘同色高斯柔光（premultiplied 输出，blend 为 ONE/ONE_MINUS_SRC_ALPHA）。 */
+        private const val FRAG_PLATE = """
+            precision mediump float;
+            varying vec2 vUv;
+            uniform vec2 uSize;
+            uniform float uRadius;
+            uniform float uGlowSigma;
+            uniform vec3 uPlateColor;
+            uniform float uPlateAlpha;
+            void main() {
+                vec2 p = (vUv - 0.5) * uSize;
+                vec2 q = abs(p) - (uSize * 0.5 - uRadius);
+                float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - uRadius;
+                float fill = clamp(0.5 - d, 0.0, 1.0) * uPlateAlpha;
+                float glow = (10.0 / 255.0) * exp(-pow(max(d, 0.0) / uGlowSigma, 2.0));
+                float a = clamp(fill + glow, 0.0, 1.0);
+                gl_FragColor = vec4(uPlateColor * a, a);
             }
         """
 

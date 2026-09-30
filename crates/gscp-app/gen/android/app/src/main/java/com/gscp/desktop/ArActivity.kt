@@ -427,7 +427,7 @@ class ArActivity : Activity() {
         var g = frontGl
         if (g == null) {
             g = ArFrontGl(
-                w, h,
+                resources.displayMetrics.density, w, h,
                 overlays = { action ->
                     synchronized(overlayLock) {
                         action(overlayBmp, glowBmp, bloomFarBmp, overlayVersion)
