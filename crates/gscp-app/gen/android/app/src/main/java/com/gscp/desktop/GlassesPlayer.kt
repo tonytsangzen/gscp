@@ -36,11 +36,15 @@ class GlassesPlayer(
     private var overlayDecoder: VideoDecoder? = null
     private var audioPlayer: AudioPlayer? = null
     private val platformLock = Object()
+    private var overlayPkg = 0L   // 诊断:overlay 网络包计数
 
     fun connect(ip: String, port: Int = 5555) {
         videoDecoder = VideoDecoder().also { it.diagTag = "rear-video" }
         overlayDecoder = VideoDecoder().also { it.diagTag = "rear-overlay" }
         audioPlayer = AudioPlayer()
+        // 单连接完整流（Rokid 眼镜实测无法并存两个 server：视频 server 开相机后
+        // overlay server 的采集流会被关闭）。overlay 流为按需帧（UI 变化才发），
+        // 显示端保留最后一帧即可（前摄语义）。
         connection = ScrcpyConnection(context, audioEnabled)
         connection!!.connectAsync(ip, port, callback)
     }
@@ -87,7 +91,9 @@ class GlassesPlayer(
             if (audioEnabled) audioPlayer?.play(buffer, offset, length)
         }
 
+        private var overlayPkg = 0L
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
+            android.util.Log.i("ar-ui", "rear overlayPrepare $codec ${width}x$height")
             synchronized(platformLock) {
                 mixer.setTopAspectRatio(width.toFloat() / height)
                 overlayDecoder?.start(width, height, mixer.getTopSurface())
@@ -95,6 +101,7 @@ class GlassesPlayer(
         }
 
         override fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int) {
+            if (++overlayPkg % 50L == 1L) android.util.Log.i("ar-ui", "rear overlayPkg #$overlayPkg ${length}B")
             overlayDecoder?.decode(buffer, offset, length)
         }
 

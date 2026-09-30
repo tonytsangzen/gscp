@@ -1694,14 +1694,15 @@ class ArActivity : Activity() {
         camHandler?.post { closeCameraNow(); startCamera() }
         glSurface.visibility = android.view.View.GONE
         frontGl?.setActive(true)   // 前摄 GL 合成恢复上屏
-        startFrontConnection()
-        showStatusText(statusTextFor())
+        // 先登记后摄收尾再起新连接：新连接等 killall 完成才发起（防误杀）
         val old = rearPlayer
         rearPlayer = null
         rearActive = false
         if (old != null) {
             scrcpyShutdown = Thread { try { old.stop() } catch (_: Exception) {} }.also { it.start() }
         }
+        startFrontConnection()
+        showStatusText(statusTextFor())
     }
 
     /** 切后摄：停前摄子系统（登记收尾），起完全复用普通模式的 GlassesPlayer

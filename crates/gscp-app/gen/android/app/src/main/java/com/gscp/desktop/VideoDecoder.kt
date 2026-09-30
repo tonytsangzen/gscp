@@ -71,6 +71,7 @@ class VideoDecoder {
     }
 
     var diagOut = 0L   // 诊断：已渲染输出帧计数
+    var diagIn = 0L    // 诊断：已入队输入包计数
     var diagTag = "vdec"
 
     @Synchronized

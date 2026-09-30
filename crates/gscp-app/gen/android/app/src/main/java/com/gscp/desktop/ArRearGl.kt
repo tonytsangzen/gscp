@@ -68,21 +68,27 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     }
 
     private var pBottom = 0
-    private var pKey = 0
+    private var pBlitOes = 0
     private var pBloom = 0
-    private var pContent = 0
     private var pBlit = 0
+    private var pTopDirect = 0
     private var uBTex = 0
     private var uBMirror = 0
     private var uBBright = 0
-    private var uKTex = 0
+    private var uBlitOesTex = 0
     private var uKeyLow = 0
     private var uKeyHigh = 0
     private var uKeyFeather = 0
+    private var uTopDirectTex = 0
+    private var uTopDirectKeyLow = 0
+    private var uTopDirectKeyHigh = 0
+    private var uTopDirectFeather = 0
     private var uBlitTex = 0
-    private var uContentTex = 0
     private var uBloomTex = 0
     private var uBloomGain = 0
+    private var uBloomKeyLow = 0
+    private var uBloomKeyHigh = 0
+    private var uBloomFeather = 0
 
     // 发光金字塔 FBO(前摄 bloom 的 GPU 等价):1/4(中距,金字塔低通)与 1/16(远距)
     private class Fbo(val w: Int, val h: Int) {
@@ -108,6 +114,7 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     private lateinit var fbEighth: Fbo    // 1/8:低通中间层
     private lateinit var fbFar: Fbo       // 1/16:远距光晕
     private var lastKeyTs = 0L            // 顶层无新帧则跳过 FBO 重建
+    private var diagTick = 0              // 诊断节流(每 ~1s 一条)
 
     private var bottomTexture = 0
     private var topTexture = 0
@@ -119,6 +126,20 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     private var topTs = 0L
     private var diagBottom = 0L
     private var diagTop = 0L
+    // debug.gscp.reardirect=1:顶层跳过 FBO/发光,OES 直采键控上屏(链路对比开关)
+    @Volatile private var directTop = false
+    private var propTick = 0
+
+    private fun pollProps() {
+        if (++propTick % 30 != 1) return
+        try {
+            val sp = Class.forName("android.os.SystemProperties")
+            val get = sp.getMethod("get", String::class.java, String::class.java)
+            val rd = (get.invoke(null, "debug.gscp.reardirect", "") as String).trim()
+            if (rd.isNotEmpty()) directTop = rd == "1"
+        } catch (_: Throwable) {
+        }
+    }
 
     private lateinit var quadBuf: FloatBuffer
     private val quadArr = FloatArray(6 * 4)
@@ -157,32 +178,17 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     private fun initGl() {
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         pBottom = buildProgram(FRAG_BOTTOM)
-        pKey = buildProgram(FRAG_KEY)
+        pBlitOes = buildProgram(FRAG_BLIT_OES)
         pBloom = buildProgram(FRAG_BLOOM)
-        pContent = buildProgram(FRAG_CONTENT)
         pBlit = buildProgram(FRAG_BLIT)
+        pTopDirect = buildProgram(FRAG_TOP_DIRECT)
         uBTex = GLES20.glGetUniformLocation(pBottom, "uTex")
         uBMirror = GLES20.glGetUniformLocation(pBottom, "uMirror")
         uBBright = GLES20.glGetUniformLocation(pBottom, "uBright")
-        uKTex = GLES20.glGetUniformLocation(pKey, "uTex")
-        uKeyLow = GLES20.glGetUniformLocation(pKey, "uKeyLow")
-        uKeyHigh = GLES20.glGetUniformLocation(pKey, "uKeyHigh")
-        uKeyFeather = GLES20.glGetUniformLocation(pKey, "uFeather")
-        uBlitTex = GLES20.glGetUniformLocation(pBlit, "uTex")
-        uContentTex = GLES20.glGetUniformLocation(pContent, "uTex")
-        uBloomTex = GLES20.glGetUniformLocation(pBloom, "uTex")
-        uBloomGain = GLES20.glGetUniformLocation(pBloom, "uGain")
-        fbQuarter = Fbo(width / 4, height / 4)
-        fbEighth = Fbo(width / 8, height / 8)
-        fbFar = Fbo(width / 16, height / 16)
-        for (f in listOf(fbQuarter, fbEighth, fbFar)) {
-            f.ensure()
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, f.fbo[0])
-            val st = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
-            if (st != GLES20.GL_FRAMEBUFFER_COMPLETE)
-                Log.e("ar-rear-gl", "FBO incomplete: $st (${f.w}x${f.h})")
-        }
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        uBlitOesTex = GLES20.glGetUniformLocation(pBlitOes, "uTex")
+        uKeyLow = GLES20.glGetUniformLocation(pTopDirect, "uKeyLow")
+        uKeyHigh = GLES20.glGetUniformLocation(pTopDirect, "uKeyHigh")
+        uKeyFeather = GLES20.glGetUniformLocation(pTopDirect, "uFeather")
         quadBuf = ByteBuffer.allocateDirect(quadArr.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
         GLES20.glEnableVertexAttribArray(0)
@@ -316,15 +322,16 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
     }
 
     private fun tick() {
-        val topAlive = System.currentTimeMillis() - topTs < 2000
-        // 键控 + 发光金字塔每帧只算一次(输出面之间共享)
-        if (topAlive && topTs != lastKeyTs) { renderTopFbos(); lastKeyTs = topTs }
+        pollProps()
+        // 顶层不按 2s 无帧隐匿(前摄语义:保留最后一帧)——overlay 流按需发帧,
+        // UI 无变化时静默,收到首帧后持续显示即可。首帧为空时等后续 UI 帧覆盖。
+        if (!directTop && topTs > 0 && topTs != lastKeyTs) { renderTopFbos(); lastKeyTs = topTs }
         synchronized(renderSurfaces) {
             for (rs in renderSurfaces) {
                 EGL14.eglMakeCurrent(eglDisplay, rs.eglSurface, rs.eglSurface, eglContext)
                 GLES20.glViewport(0, 0, width, height)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                drawScene(topAlive)
+                drawScene()
                 EGL14.eglSwapBuffers(eglDisplay, rs.eglSurface)
             }
         }
@@ -338,14 +345,14 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         GLES20.glViewport(0, 0, fbQuarter.w, fbQuarter.h)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        GLES20.glUseProgram(pKey)
+        // 先整帧平拷进 FBO(OES→FBO 在本机 GPU 上不可用,这里只做 2D→2D;
+        // 键控延后到内容/光晕采样阶段)
+        GLES20.glUseProgram(pBlitOes)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, topTexture)
-        GLES20.glUniform1i(uKTex, 0)
-        GLES20.glUniform1f(uKeyLow, keyLow)
-        GLES20.glUniform1f(uKeyHigh, keyHigh)
-        GLES20.glUniform1f(uKeyFeather, featherPower)
-        drawTopRectQuad()
+        GLES20.glUniform1i(uBlitOesTex, 0)
+        putQuad(0f, 0f, width.toFloat(), height.toFloat(), 0f, 0f, 1f, 1f)
+        GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
         for (round in 0 until 2) {
             blit(fbQuarter, fbEighth)
             blit(fbEighth, fbQuarter)
@@ -353,6 +360,21 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         blit(fbQuarter, fbFar)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
+        // 诊断:回读 1/4 FBO 的 alpha 统计(键控结果非空 → 内容/bloom 才有得画)
+        if (++diagTick % 30 == 1) {
+            val w = fbQuarter.w; val h = fbQuarter.h
+            val buf = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbQuarter.fbo[0])
+            GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+            buf.rewind()
+            var maxA = 0; var nonZero = 0
+            while (buf.hasRemaining()) {
+                val a = buf.getInt() shr 24 and 0xFF
+                if (a > maxA) maxA = a
+                if (a > 16) nonZero++
+            }
+            Log.i("ar-ui", "rear fboA maxA=$maxA nonZero=$nonZero/${w * h}")
+        }
     }
 
     private fun blit(src: Fbo, dst: Fbo) {
@@ -380,12 +402,13 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         if (disp >= canvasAspect) { rw = cw; rh = cw / disp } else { rh = ch; rw = ch * disp }
         rw *= overlayScale; rh *= overlayScale
         val tx0 = (cw - rw) / 2f; val ty0 = (ch - rh) / 2f
+        if (++diagTick % 60 == 1) Log.i("ar-ui", "rear topRect topAspect=$topAspect band=$band rw=$rw rh=$rh scale=$overlayScale key=$keyLow/$keyHigh/$featherPower")
         val q = (topRotationDeg / 90) % 4
         putQuad(tx0, ty0, tx0 + rw, ty0 + rh, 0f, 0f, 1f, 1f, q, topMirror, band)
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
     }
 
-    private fun drawScene(topAlive: Boolean) {
+    private fun drawScene() {
         // ── 底层：眼镜视频 contain letterbox（前摄相机层同款数学，完整不裁切）──
         val cw = width.toFloat(); val ch = height.toFloat()
         val rot90 = (bottomRotation.toInt() / 90) % 2 == 1
@@ -408,13 +431,34 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
 
         // ── 顶层：眼镜 overlay,前摄同款发光(远 ADD α90 → 中 ADD α120 → 内容 ×1.4+12)──
-        if (!topAlive) return
+        if (topTs <= 0L) return   // 尚未收到任何 overlay 帧
+        if (directTop) {
+            // 对比模式:OES 直采 + luma 键控,无 FBO/发光
+            GLES20.glEnable(GLES20.GL_BLEND)
+            GLES20.glBlendFuncSeparate(
+                GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
+                GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+            GLES20.glUseProgram(pTopDirect)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, topTexture)
+            GLES20.glUniform1i(uTopDirectTex, 0)
+            GLES20.glUniform1f(uTopDirectKeyLow, keyLow)
+            GLES20.glUniform1f(uTopDirectKeyHigh, keyHigh)
+            GLES20.glUniform1f(uTopDirectFeather, featherPower)
+            drawTopRectQuad()
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            return
+        }
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)   // 加色:premult 光晕
         GLES20.glUseProgram(pBloom)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glUniform1i(uBloomTex, 0)
         GLES20.glUniform1f(uBloomGain, BLOOM_FAR_ALPHA)
+        GLES20.glUniform1f(uBloomKeyLow, keyLow)
+        GLES20.glUniform1f(uBloomKeyHigh, keyHigh)
+        GLES20.glUniform1f(uBloomFeather, featherPower)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbFar.tex[0])
         putQuad(0f, 0f, width.toFloat(), height.toFloat(), 0f, 0f, 1f, 1f)
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
@@ -423,14 +467,17 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbQuarter.tex[0])
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
 
-        // 内容:SRC_OVER,RGB ×1.4 + 12 提亮(前摄 MUL_CONTENT 口径)
+        // 内容:SRC_OVER,OES 直采键控 + RGB ×1.4 + 12 提亮(前摄 MUL_CONTENT 口径)
         GLES20.glBlendFuncSeparate(
             GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA,
             GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        GLES20.glUseProgram(pContent)
+        GLES20.glUseProgram(pTopDirect)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fbQuarter.tex[0])
-        GLES20.glUniform1i(uContentTex, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, topTexture)
+        GLES20.glUniform1i(uTopDirectTex, 0)
+        GLES20.glUniform1f(uTopDirectKeyLow, keyLow)
+        GLES20.glUniform1f(uTopDirectKeyHigh, keyHigh)
+        GLES20.glUniform1f(uTopDirectFeather, featherPower)
         drawTopRectQuad()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
         GLES20.glDisable(GLES20.GL_BLEND)
@@ -530,8 +577,9 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
             }
         """
 
-        /** 键控 pass:luma 黑键 alpha(pow 羽化),premultiplied 写入 1/4 FBO。 */
-        private const val FRAG_KEY = """
+
+        /** 直通顶层:OES 直采 + luma 键控(对比模式,无 FBO)。 */
+        private const val FRAG_TOP_DIRECT = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             varying vec2 vUv;
@@ -545,8 +593,20 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
                 float lo = max(uKeyLow - uFeather, 0.0);
                 float hi = min(uKeyHigh + uFeather, 1.0);
                 float t = clamp((luma - lo) / max(hi - lo, 0.0001), 0.0, 1.0);
-                float a = s.a * pow(t, uFeather);
-                gl_FragColor = vec4(s.rgb * a, a);
+                float a = pow(t, uFeather);
+                vec3 straight = clamp(s.rgb * 1.4 + 12.0 / 255.0, 0.0, 1.0);
+                gl_FragColor = vec4(straight * a, a);
+            }
+        """
+
+        /** OES 平拷进 FBO(仅 2D→FBO;OES→FBO 在本机 GPU 上不可用)。 */
+        private const val FRAG_BLIT_OES = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vUv;
+            uniform samplerExternalOES uTex;
+            void main() {
+                gl_FragColor = texture2D(uTex, vUv);
             }
         """
 
@@ -566,22 +626,18 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
             varying vec2 vUv;
             uniform sampler2D uTex;
             uniform float uGain;
+            uniform float uKeyLow;
+            uniform float uKeyHigh;
+            uniform float uFeather;
             void main() {
-                gl_FragColor = texture2D(uTex, vUv) * uGain;
+                vec4 s = texture2D(uTex, vUv);
+                float luma = dot(s.rgb, vec3(0.299, 0.587, 0.114));
+                float lo = max(uKeyLow - uFeather, 0.0);
+                float hi = min(uKeyHigh + uFeather, 1.0);
+                float t = clamp((luma - lo) / max(hi - lo, 0.0001), 0.0, 1.0);
+                gl_FragColor = s * pow(t, uFeather) * uGain;
             }
         """
 
-        /** 内容 pass:SRC_OVER,非预乘域 RGB ×1.4 + 12 提亮(前摄 MUL_CONTENT 口径)。 */
-        private const val FRAG_CONTENT = """
-            precision mediump float;
-            varying vec2 vUv;
-            uniform sampler2D uTex;
-            void main() {
-                vec4 s = texture2D(uTex, vUv);
-                vec3 straight = s.a > 0.003 ? s.rgb / s.a : vec3(0.0);
-                vec3 rgb = clamp(straight * 1.4 + 12.0 / 255.0, 0.0, 1.0) * s.a;
-                gl_FragColor = vec4(rgb, s.a);
-            }
-        """
     }
 }
