@@ -423,6 +423,8 @@ class ArActivity : Activity() {
             mx = SurfaceMixer(this, w, h)
             rearMixer = mx
             applySettingsToMixer(mx)
+            // 同前摄 letterbox 语义：眼镜画面完整显示不裁切（普通模式保持 cover）
+            mx.setBottomFit(true)
         }
         return mx
     }

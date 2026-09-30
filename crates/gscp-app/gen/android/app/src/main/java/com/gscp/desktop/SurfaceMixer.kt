@@ -32,6 +32,8 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private var bottomRotation = 90f
     private var bottomMirror = false
     private var bottomAspectRatio = 4f / 3f
+    // true=contain（letterbox 完整显示，出界黑场）；false=cover（铺满裁边，普通模式）
+    private var bottomFit = false
     private var baseBrightness = 1.0f
 
     // 顶层配置
@@ -76,6 +78,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private var uTopTexture = 0
     private var uBottomViewMatrix = 0
     private var uBottomMirror = 0
+    private var uBottomFit = 0
     private var uBaseBrightness = 0
     private var uTopRect = 0
     private var uTopRotation = 0
@@ -218,6 +221,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         uTopTexture = GLES20.glGetUniformLocation(program, "uTopTexture")
         uBottomViewMatrix = GLES20.glGetUniformLocation(program, "uBottomViewMatrix")
         uBottomMirror = GLES20.glGetUniformLocation(program, "uBottomMirror")
+        uBottomFit = GLES20.glGetUniformLocation(program, "uBottomFit")
         uBaseBrightness = GLES20.glGetUniformLocation(program, "uBaseBrightness")
         uTopRect = GLES20.glGetUniformLocation(program, "uTopRect")
         uTopRotation = GLES20.glGetUniformLocation(program, "uTopRotation")
@@ -301,6 +305,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
 
         GLES20.glUniformMatrix4fv(uBottomViewMatrix, 1, false, bottomViewMatrix, 0)
         GLES20.glUniform1i(uBottomMirror, if (bottomMirror) 1 else 0)
+        GLES20.glUniform1i(uBottomFit, if (bottomFit) 1 else 0)
         GLES20.glUniform1f(uBaseBrightness, baseBrightness)
 
         // overlay 几何：contain 铺放 × overlay_scale（rect 不超出画布）
@@ -418,11 +423,18 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private fun updateMatrix(matrix: FloatArray, aspectRatio: Float, rotation: Float) {
         Matrix.setIdentityM(matrix, 0)
 
-        // cover：铺满画布（宽高比不匹配时短边对齐，长边裁剪）
+        // cover：铺满画布（宽高比不匹配时短边对齐，长边裁剪）；
+        // fit：contain 完整显示（出界部分由 shader 涂黑 = letterbox）
         val canvasAspect = width.toFloat() / height
         var scaleX = 1.0f
         var scaleY = 1.0f
-        if (aspectRatio > canvasAspect) {
+        if (bottomFit) {
+            if (aspectRatio > canvasAspect) {
+                scaleY = aspectRatio / canvasAspect
+            } else {
+                scaleX = aspectRatio / canvasAspect
+            }
+        } else if (aspectRatio > canvasAspect) {
             scaleX = canvasAspect / aspectRatio
         } else {
             scaleY = aspectRatio / canvasAspect
@@ -445,6 +457,12 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     fun setBottomRotation(rotation: Float, mirror: Boolean) {
         bottomRotation = rotation
         bottomMirror = mirror
+        runAfterGlReady(Runnable { refreshMatrices() })
+    }
+
+    /** 底层显示模式：fit=true 完整显示不裁切（AR 后摄，同前摄 letterbox 语义）。 */
+    fun setBottomFit(fit: Boolean) {
+        bottomFit = fit
         runAfterGlReady(Runnable { refreshMatrices() })
     }
 

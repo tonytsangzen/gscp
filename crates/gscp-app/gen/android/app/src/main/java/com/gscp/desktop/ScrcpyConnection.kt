@@ -100,13 +100,27 @@ class ScrcpyConnection(
 
     private val audioHandler = StreamHandler {
         try {
-            val stream = it.openInputStream()
-            // 首 socket 音频 meta：64B 设备名（实测无 dummy 字节），随后紧接 4B codec("opus")。
+            val raw = it.openInputStream()
+            // 音频流头两种格式（按 socket 序位而异）：
+            //  - 首 socket（overlay-only 模式 audio 在前）：64B 设备名 + 4B codec
+            //  - 第二 socket（完整流模式，scrcpy 标准）：直接 4B codec
+            // 解析器容错：BufferedInputStream mark/reset，先试带前缀，codec 字节
+            // 非法则回退无前缀。此前固定按带前缀读，完整流模式下 64B 帧头被当
+            // meta 吞掉 → 音频失步无声。
+            val stream = java.io.BufferedInputStream(raw, 65536)
+            stream.mark(128)
             val meta = ByteArray(64)
             readFully(stream, meta, meta.size)
             val buffer = ByteArray(16384)
-            val got = readFully(stream, buffer, 4)
-            val codec = String(buffer.copyOfRange(0, 4), StandardCharsets.US_ASCII)
+            var got = readFully(stream, buffer, 4)
+            var codec = if (got) String(buffer.copyOfRange(0, 4), StandardCharsets.US_ASCII) else ""
+            if (!codec.all { it.isLetterOrDigit() }) {
+                // codec 非法 → 按无前缀格式从头重读
+                Log.w(TAG, "audio meta-prefix parse invalid ('$codec'), retry without prefix")
+                stream.reset()
+                got = readFully(stream, buffer, 4)
+                codec = String(buffer.copyOfRange(0, 4), StandardCharsets.US_ASCII)
+            }
             Log.e(TAG, "audio channel got=$got codec='$codec' hdr=${buffer.copyOfRange(0, 8).joinToString("") { "%02x".format(it) }}")
             callback?.onAudioPrepare(codec)
             // 帧头 12B：ptsAndFlags(8) + size(4, BE)；首帧 config 位=ptsAndFlags 最高位。
