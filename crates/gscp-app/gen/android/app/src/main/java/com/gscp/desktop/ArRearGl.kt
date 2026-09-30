@@ -344,9 +344,9 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
             a[k++] = 1f - py / height.toFloat() * 2f
             var uu = if (mirror) 1f - u else u
             var vv = v
-            if (rotQ == 1) { val t = uu; uu = vv; vv = 1f - t }
+            if (rotQ == 1) { val t = uu; uu = 1f - vv; vv = t }
             else if (rotQ == 2) { uu = 1f - uu; vv = 1f - vv }
-            else if (rotQ == 3) { val t = uu; uu = 1f - vv; vv = t }
+            else if (rotQ == 3) { val t = uu; uu = vv; vv = 1f - t }
             vv = vBand + vv * (1f - 2f * vBand)   // 空带裁剪（纹理 v 空间）
             a[k++] = uu; a[k++] = vv
         }
