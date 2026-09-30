@@ -293,7 +293,9 @@ class ArRearGl(val width: Int, val height: Int) : RearComposer {
         GLES20.glUniform1i(uBTex, 0)
         GLES20.glUniform1i(uBMirror, if (bottomMirror) 1 else 0)
         GLES20.glUniform1f(uBBright, baseBrightness)
-        putQuad(bx0, by0, bx0 + dw, by0 + dh, 0f, 0f, 1f, 1f)
+        // 纹理采样按 bottomRotation 旋转（与 mix.frag rotQuad 同向；镜像在 shader 内）
+        putQuad(bx0, by0, bx0 + dw, by0 + dh, 0f, 0f, 1f, 1f,
+            rotQ = (bottomRotation.toInt() / 90) % 4)
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
 
