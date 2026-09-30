@@ -927,6 +927,50 @@ static jstring openGpuAuto(JNIEnv* env, const std::string& param,
 
 }  // namespace
 
+// AR 姿态轨迹状态（文件域：nativeFaceOpen/Close 跨会话复位）。
+// 轨迹关联按脸中心最近邻；每脸独立 One-Euro 状态。
+struct PoseTrack {
+    bool has = false;
+    float nose[2] = {0, 0};
+    float w[3] = {0, 0, 0};        // 旋转矢量 One-Euro 状态
+    float xPrev[3] = {0, 0, 0};
+    float dPrev[3] = {0, 0, 0};
+    bool hasEuro[3] = {false, false, false};
+    bool hasW = false;
+    bool hasT = false;             // 平移 One-Euro 状态
+    float tPrev[3] = {0, 0, 0};
+    float tDPrev[3] = {0, 0, 0};
+    bool hasTD[3] = {false, false, false};
+    bool hasO = false;             // overlay 像素 One-Euro：ovC(2) + 四角相对偏移(8)
+    float ovPrev[10] = {0,0,0,0,0,0,0,0,0,0};
+    float ovDP[10] = {0,0,0,0,0,0,0,0,0,0};
+    bool hasOE[10] = {false,false,false,false,false,false,false,false,false,false};
+    bool hasDim = false;           // 平滑框尺寸状态（overlay 屏尺寸稳定用）
+    float bwS = 0, bhS = 0;
+    bool hasEyeD = false;          // eyeD EWMA：kps 仅检测帧刷新，不平滑会周期阶跃
+    float eyeDS = 0;
+    bool hasR1 = false;            // 上一帧面内 x 轴（yaw≈±90° 投影退化时冻结防抖）
+    float r1L[3] = {1.f, 0.f, 0.f};
+    bool hopeOn = false;           // hopenet 接入滞回（38 开/30 关），防边界反复开关
+    float rawW = 0;                // 未膨胀 mesh 包围盒宽 EWMA（板尺寸用，与 ROI 裕量解耦）
+    float eyeDX = 1.f, eyeDY = 0.f;  // 观测眼线 33→263（相机系，板横轴用）
+    bool hasRollE = false;           // 眼线角 One-Euro（板 roll 阻尼）
+    float rollPrev = 0, rollDPrev = 0;
+    int miss = 0;                    // 连续未被任何检测关联的帧数（轨迹寿命）
+};
+static PoseTrack s_tracks[3];
+
+// SCRFD 节流：每 kDetEvery 帧跑一次全图检测，其余帧复用缓存框驱动 facemesh；
+// mesh 成功后用 468 点包围盒回写缓存框（跟随人脸移动），检测帧全量校正。
+static std::vector<Face> s_cached;
+static int s_frm = 0;
+
+static void tracksReset() {
+    for (int i = 0; i < 3; i++) s_tracks[i] = PoseTrack();
+    s_cached.clear();
+    s_frm = 0;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_gscp_desktop_ArNative_nativeFaceOpen(JNIEnv* env, jobject, jobject assets,
                                               jstring filesDir, jint backend, jint input)
@@ -939,6 +983,7 @@ Java_com_gscp_desktop_ArNative_nativeFaceOpen(JNIEnv* env, jobject, jobject asse
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         g_shutdown = false;
+        tracksReset();   // 跨会话不继承轨迹/缓存（丢脸轨迹泄漏的会话级兜底）
         if (g_net && g_backend == backend) {
             std::string j = std::string("{\"ok\":true,\"backend\":\"") + kBackendName[backend]
                           + "\",\"threads\":" + std::to_string(g_threads) + ",\"cached\":true}";
@@ -1047,6 +1092,7 @@ Java_com_gscp_desktop_ArNative_nativeFaceClose(JNIEnv*, jobject)
 {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_shutdown = true;
+    tracksReset();
     delete g_net;
     g_net = nullptr;
     g_backend = -1;
@@ -1126,10 +1172,8 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     bool ok = true;
     const char* err = "";
 
-    // SCRFD 节流：每 kDetEvery 帧跑一次全图检测，其余帧复用缓存框驱动 facemesh；
+    // SCRFD 节流（s_cached/s_frm 在文件域，nativeFaceOpen/Close 复位）；
     // mesh 成功后用 468 点包围盒回写缓存框（跟随人脸移动），检测帧全量校正。
-    static int s_frm = 0;
-    static std::vector<Face> s_cached;
     static float s_lastMax = -1.f;
     const int kDetEvery = 4;
     bool detRan = false;   // 检测帧标记（调试/JSON 用）；框口径已统一为 mesh
@@ -1254,39 +1298,17 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     env->ReleaseByteArrayElements(vArr, vp, JNI_ABORT);
 
     // 姿态：融合（facemesh 9 点 Kabsch + hopenet 大角度混入）→ One-Euro → overlay。
-    // 轨迹关联按脸中心最近邻；每脸独立 One-Euro 状态。
-    struct PoseTrack {
-        bool has = false;
-        float nose[2] = {0, 0};
-        float w[3] = {0, 0, 0};        // 旋转矢量 One-Euro 状态
-        float xPrev[3] = {0, 0, 0};
-        float dPrev[3] = {0, 0, 0};
-        bool hasEuro[3] = {false, false, false};
-        bool hasW = false;
-        bool hasT = false;             // 平移 One-Euro 状态
-        float tPrev[3] = {0, 0, 0};
-        float tDPrev[3] = {0, 0, 0};
-        bool hasTD[3] = {false, false, false};
-        bool hasO = false;             // overlay 像素 One-Euro：ovC(2) + 四角相对偏移(8)
-        float ovPrev[10] = {0,0,0,0,0,0,0,0,0,0};
-        float ovDP[10] = {0,0,0,0,0,0,0,0,0,0};
-        bool hasOE[10] = {false,false,false,false,false,false,false,false,false,false};
-        bool hasDim = false;           // 平滑框尺寸状态（overlay 屏尺寸稳定用）
-        float bwS = 0, bhS = 0;
-        bool hasEyeD = false;          // eyeD EWMA：kps 仅检测帧刷新，不平滑会周期阶跃
-        float eyeDS = 0;
-        bool hasR1 = false;            // 上一帧面内 x 轴（yaw≈±90° 投影退化时冻结防抖）
-        float r1L[3] = {1.f, 0.f, 0.f};
-        bool hopeOn = false;           // hopenet 接入滞回（38 开/30 关），防边界反复开关
-        float rawW = 0;                // 未膨胀 mesh 包围盒宽 EWMA（板尺寸用，与 ROI 裕量解耦）
-        float eyeDX = 1.f, eyeDY = 0.f;  // 观测眼线 33→263（相机系，板横轴用）
-        bool hasRollE = false;           // 眼线角 One-Euro（板 roll 阻尼）
-        float rollPrev = 0, rollDPrev = 0;
-    };
-    static PoseTrack s_tracks[3];
+    // （PoseTrack/s_tracks/s_cached 定义在文件域：nativeFaceOpen/Close 跨会话复位）
     float wtmp3[3];
 
     const float fps = 25.f;
+    // 轨迹寿命：未被关联的轨迹逐帧 +1，超 ~2s（24 帧 @12fps 实测）整槽复位释放。
+    // 若只增不放，死槽永久占坑（has 恒真）→ 换位/重新入镜后 freeTrk 枯竭，
+    // 人脸每帧被 continue 丢弃 = 丢失后永远无法再捕获。
+    for (int tk = 0; tk < 3; tk++) {
+        if (!s_tracks[tk].has) continue;
+        if (++s_tracks[tk].miss > 24) s_tracks[tk] = PoseTrack();
+    }
     for (int fi = 0; fi < (int)faces.size(); fi++) {
         Face& f = faces[fi];
         float R[9], tt[3];
@@ -1308,7 +1330,13 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
             trk = &s_tracks[freeTrk];
             *trk = PoseTrack();
             trk->has = true;
+        } else if (trk->miss > 8) {
+            // 丢失 ~0.6s 后重新关联：滤波/眼线/尺寸状态全部过期，按新轨迹重建，
+            // 避免 overlay 从丢失前位置大幅甩动
+            *trk = PoseTrack();
+            trk->has = true;
         }
+        trk->miss = 0;
         trk->nose[0] = nose[0]; trk->nose[1] = nose[1];
 
         // 姿态源：3=融合（主路径） 1=hopenet（对照）

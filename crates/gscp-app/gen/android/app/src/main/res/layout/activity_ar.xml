@@ -107,8 +107,8 @@
 
         <ImageView
             android:id="@+id/last_thumb"
-            android:layout_width="56dp"
-            android:layout_height="56dp"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
             android:layout_marginEnd="54dp"
             android:background="@drawable/bg_thumb"
             android:contentDescription="最近录像"
@@ -117,16 +117,16 @@
 
         <ImageButton
             android:id="@+id/button_record"
-            android:layout_width="76dp"
-            android:layout_height="76dp"
+            android:layout_width="64dp"
+            android:layout_height="64dp"
             android:background="@drawable/ic_record_idle"
             android:contentDescription="录像"
             android:scaleType="fitCenter" />
 
         <ImageButton
             android:id="@+id/btn_switch_cam"
-            android:layout_width="56dp"
-            android:layout_height="56dp"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
             android:layout_marginStart="54dp"
             android:background="@drawable/bg_switch_btn"
             android:contentDescription="切换前后摄"
@@ -137,8 +137,8 @@
     <!-- 录像启动/停止中的忙碌指示：与录像按钮同圆心、同外径的旋转进度环（叠加在按钮上） -->
     <com.gscp.desktop.RingSpinner
         android:id="@+id/record_spinner"
-        android:layout_width="76dp"
-        android:layout_height="76dp"
+        android:layout_width="64dp"
+        android:layout_height="64dp"
         android:layout_gravity="bottom|center_horizontal"
         android:layout_marginBottom="44dp"
         android:visibility="gone" />

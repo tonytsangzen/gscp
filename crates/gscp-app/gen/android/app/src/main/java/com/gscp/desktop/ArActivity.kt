@@ -977,16 +977,67 @@ class ArActivity : Activity() {
         hideRunnable = null
     }
 
-    /** 底部相机控件条可见性：进入预览（playing）即显示、退出预览隐藏。
+    /** 底部相机控件条可见性：进入预览（playing）即显示、退出预览隐藏；
+     *  预览中无触屏 10s 自动下滑隐藏，任意触摸上滑恢复（见 onScreenInteraction）。
      *  录像按钮/缩略图/切换钮在同一个 bottom_controls 容器里，一起显示/隐藏。主线程安全。 */
     private fun updateRecBtnVisible() {
-        val show = playing   // 进入预览状态显示、退出预览隐藏（与录像按钮一起）
+        val show = playing
         if (show == lastRecBtnShow) return
         lastRecBtnShow = show
         recTimerHandler.post {
-            findViewById<android.view.View>(R.id.bottom_controls).visibility =
-                if (show) android.view.View.VISIBLE else android.view.View.GONE
+            val v = findViewById<android.view.View>(R.id.bottom_controls)
+            recTimerHandler.removeCallbacks(idleHideControls)
+            if (show) {
+                // 进预览：复位为显示态并启动空闲计时
+                controlsShown = true
+                v.animate().cancel()
+                v.translationY = 0f; v.alpha = 1f
+                v.visibility = android.view.View.VISIBLE
+                recTimerHandler.postDelayed(idleHideControls, CONTROLS_IDLE_MS)
+            } else {
+                // 退预览：取消计时、复位动画状态（下次进预览从显示态开始）
+                controlsShown = true
+                v.animate().cancel()
+                v.translationY = 0f; v.alpha = 1f
+                v.visibility = android.view.View.GONE
+            }
         }
+    }
+
+    // ── 控件条空闲自动隐藏/恢复 ──
+    private var controlsShown = true
+    private val idleHideControls = Runnable { hideControls() }
+
+    /** 任意触屏（含按钮，dispatchTouchEvent 统一入口）：恢复显示并重置 10s 空闲计时。 */
+    private fun onScreenInteraction() {
+        if (!playing) return
+        recTimerHandler.removeCallbacks(idleHideControls)
+        if (!controlsShown) showControls()
+        recTimerHandler.postDelayed(idleHideControls, CONTROLS_IDLE_MS)
+    }
+
+    private fun hideControls() {
+        if (!controlsShown) return
+        controlsShown = false
+        val v = findViewById<android.view.View>(R.id.bottom_controls)
+        // 下滑出屏（高度 + 底边距）并淡出；结束后 INVISIBLE 使按钮不可误触
+        val margin = (v.layoutParams as? android.widget.FrameLayout.LayoutParams)?.bottomMargin ?: 0
+        v.animate().translationY((v.height + margin).toFloat()).alpha(0f).setDuration(250)
+            .withEndAction { if (!controlsShown) v.visibility = android.view.View.INVISIBLE }
+    }
+
+    private fun showControls() {
+        if (controlsShown) return
+        controlsShown = true
+        val v = findViewById<android.view.View>(R.id.bottom_controls)
+        v.visibility = android.view.View.VISIBLE
+        v.animate().translationY(0f).alpha(1f).setDuration(250)
+            .withEndAction { if (controlsShown) v.translationY = 0f }
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.action == android.view.MotionEvent.ACTION_DOWN) onScreenInteraction()
+        return super.dispatchTouchEvent(ev)
     }
 
     /** 前后摄切换反馈。 */
@@ -1935,6 +1986,7 @@ class ArActivity : Activity() {
         // det_10g 图内写死了 448 输入的 FPN 上采样尺寸，实时检测同样固定 448
         private const val LIVE_INPUT = 448
         private const val SCORE_THRESH = 0.50f
+        private const val CONTROLS_IDLE_MS = 10_000L   // 无触屏 10s 后控件条下滑隐藏
         // 麦克风混音：统一固定增益（无分段/曲线处理），和值饱和截断到 i16
         private const val MIC_GAIN = 10
     }
