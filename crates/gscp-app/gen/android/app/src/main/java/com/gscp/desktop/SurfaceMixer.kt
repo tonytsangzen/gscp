@@ -424,15 +424,18 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
         Matrix.setIdentityM(matrix, 0)
 
         // cover：铺满画布（宽高比不匹配时短边对齐，长边裁剪）；
-        // fit：contain 完整显示（出界部分由 shader 涂黑 = letterbox）
+        // fit：contain 完整显示（两轴缩放 ≥1，出界部分由 shader 涂黑 = letterbox）。
+        // 注意：缩放作用在画布 UV 轴（旋转在其后），contain 须按"显示宽高比"
+        // D 取轴——aspectRatio 参数是纹理 H/W，rot90/270 时 D=A，rot0/180 时 D=1/A。
         val canvasAspect = width.toFloat() / height
         var scaleX = 1.0f
         var scaleY = 1.0f
         if (bottomFit) {
-            if (aspectRatio > canvasAspect) {
-                scaleY = aspectRatio / canvasAspect
+            val displayed = if ((bottomRotation.toInt() / 90) % 2 == 1) aspectRatio else 1f / aspectRatio
+            if (displayed < canvasAspect) {
+                scaleY = canvasAspect / displayed    // 内容偏窄：上下 letterbox
             } else {
-                scaleX = aspectRatio / canvasAspect
+                scaleX = displayed / canvasAspect    // 内容偏宽：左右 letterbox
             }
         } else if (aspectRatio > canvasAspect) {
             scaleX = canvasAspect / aspectRatio
