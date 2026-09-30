@@ -1831,10 +1831,11 @@ class ArActivity : Activity() {
         override fun onError() {
             if (playing && frontActive) {
                 // 与 onDisconnect 同路：连接失败不滞留 AR 屏（playing=false 会让
-                // 控件条交互全部失效——含空闲隐藏后的单击恢复）
+                // 控件条交互全部失效——含空闲隐藏后的单击恢复）。
+                // 注意：onError 在 adb 线程回调，只能经 teardownToSettings 的
+                // runOnUiThread 触 UI；严禁在此线程直接 Toast/碰视图。
                 playing = false
                 teardownToSettings("连接失败，请检查眼镜 IP 与网络")
-                Toast.makeText(this@ArActivity, "连接失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -1858,14 +1859,11 @@ class ArActivity : Activity() {
 
         override fun onError() {
             if (rearActive) {
-                // teardownToSettings 内含 exitRearMode + restoreFrontMode + 控件条隐藏，
-                // 滞留 AR 屏会使控件条交互失效（同前摄 onError 注释）
+                // teardownToSettings 内含 exitRearMode + restoreFrontMode + 控件条/
+                // 进度条隐藏；onError 在 adb 线程回调，UI 一律经 teardown 的
+                // runOnUiThread 触发，严禁直接碰视图/Toast
                 playing = false
                 teardownToSettings("连接失败，请检查眼镜 IP 与网络")
-                runOnUiThread {
-                    progressView.visibility = android.view.View.GONE
-                    Toast.makeText(this@ArActivity, "连接失败", Toast.LENGTH_SHORT).show()
-                }
             }
         }
     }
