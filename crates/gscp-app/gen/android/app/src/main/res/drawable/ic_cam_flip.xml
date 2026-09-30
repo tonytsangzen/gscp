@@ -1,17 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 前后摄切换：Material cameraswitch 字形（相机机身 + 四角旋转箭头），
-     主流相机 App 切换前后摄的标准图标，白色填充 -->
+<!-- 前后摄切换：Material Symbols cameraswitch (rounded)，Apache 2.0,
+     google/material-design-icons。白色填充 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
-    android:viewportWidth="24"
-    android:viewportHeight="24">
-    <!-- 相机机身 + 镜头 -->
-    <path
-        android:pathData="M16,7h-1l-1,-1h-4L9,7L8,7c-1.1,0 -2,0.9 -2,2v6c0,1.1 0.9,2 2,2h8c1.1,0 2,-0.9 2,-2L18,9c0,-1.1 -0.9,-2 -2,-2zM12,14c-1.65,0 -3,-1.35 -3,-3s1.35,-3 3,-3 3,1.35 3,3 -1.35,3 -3,3z"
-        android:fillColor="#FFFFFFFF" />
-    <!-- 四角循环箭头 -->
-    <path
-        android:pathData="M9.34,5.36l-0.7,-1.42L12,0.48l3.36,3.46 -0.7,1.42L12,2.31zM17.46,9.34l1.42,-0.7L22.52,12l-3.46,3.36 -0.7,-1.42L21.69,12zM6.54,14.66l-1.42,0.7L1.48,12l3.46,-3.36 0.7,1.42L2.31,12zM14.66,18.64l0.7,1.42L12,23.52l-3.36,-3.46 0.7,-1.42L12,21.69z"
-        android:fillColor="#FFFFFFFF" />
+    android:viewportWidth="960"
+    android:viewportHeight="960">
+    <group android:translateY="960">
+        <path
+            android:pathData="M320-280q-33 0-56.5-23.5T240-360v-240q0-33 23.5-56.5T320-680h40l28-28q6-6 13.5-9t15.5-3h126q8 0 15.5 3t13.5 9l28 28h40q33 0 56.5 23.5T720-600v240q0 33-23.5 56.5T640-280H320Zm0-80h320v-240H320v240Zm160-40q33 0 56.5-23.5T560-480q0-33-23.5-56.5T480-560q-33 0-56.5 23.5T400-480q0 33 23.5 56.5T480-400Zm0-80Zm0 480Q304 0 171.5-110.5T7-389q-3-17 6.5-31T40-436q17-2 30 8.5T86-400q26 131 124.5 219T444-82l-34-34q-11-11-11-28t11-28q11-11 28-11t28 11L598-40q7 7 4.5 16T591-13q-27 7-54.5 10T480 0Zm0-960q176 0 308.5 110T953-571q3 17-6.5 31T920-524q-17 2-30-8.5T874-560q-26-131-124.5-219T516-878l34 34q11 11 11 28t-11 28q-11 11-28 11t-28-11L362-920q-7-7-4.5-16t11.5-11q27-7 54.5-10t56.5-3Z"
+            android:fillColor="#FFFFFFFF" />
+    </group>
 </vector>
