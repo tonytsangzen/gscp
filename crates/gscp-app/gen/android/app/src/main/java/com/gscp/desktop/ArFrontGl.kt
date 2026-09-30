@@ -57,6 +57,11 @@ class ArFrontGl(
     private var plateAlpha = 0.1f
     private var propTick = 0
 
+    // overlay 内容镜像开关（debug.gscp.ovmirror，默认开）：
+    // convertOverlayFrame 烘焙时已按观察者视角水平镜像；本开关开=维持该观感，
+    // 关=GL 网格 u 翻转抵消烘焙镜像（还原眼镜流原始朝向，正文字/号牌用）
+    @Volatile private var ovMirror = true
+
 
     private val renderSurfaces = mutableListOf<RenderSurface>()
 
@@ -103,6 +108,7 @@ class ArFrontGl(
     private var uMeshAlpha = 0
     private var uMeshMul = 0
     private var uMeshAdd = 0
+    private var uMeshFlip = 0
 
     private var camTex = 0
     private var camTexW = 0
@@ -173,6 +179,7 @@ class ArFrontGl(
         uMeshAlpha = GLES20.glGetUniformLocation(pMesh, "uAlpha")
         uMeshMul = GLES20.glGetUniformLocation(pMesh, "uMul")
         uMeshAdd = GLES20.glGetUniformLocation(pMesh, "uAdd")
+        uMeshFlip = GLES20.glGetUniformLocation(pMesh, "uFlip")
 
         quadBuf = ByteBuffer.allocateDirect(quadArr.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -456,6 +463,7 @@ class ArFrontGl(
         GLES20.glUniform1f(uMeshAlpha, alpha)
         GLES20.glUniform3f(uMeshMul, mul[0], mul[1], mul[2])
         GLES20.glUniform1f(uMeshAdd, add)
+        GLES20.glUniform1f(uMeshFlip, if (ovMirror) 0f else 1f)
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, meshBuf)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, MESH_N * MESH_N * 6)
     }
@@ -505,12 +513,15 @@ class ArFrontGl(
 
     // ── 纹理与 GL 状态 ─────────────────────────────────────────
 
-    /** 背板颜色/透明度属性轮询（GL 线程，每 30 拍一次，SystemProperties 反射读取）。 */
+    /** 背板颜色/透明度 + overlay 镜像开关属性轮询（GL 线程，每 30 拍一次，
+     *  SystemProperties 反射读取）。 */
     private fun pollPlateProps() {
         if (++propTick % 30 != 1) return
         try {
             val sp = Class.forName("android.os.SystemProperties")
             val get = sp.getMethod("get", String::class.java, String::class.java)
+            val m = (get.invoke(null, "debug.gscp.ovmirror", "") as String).trim()
+            if (m.isNotEmpty()) ovMirror = m != "0" && !m.equals("false", true)
             val hex = (get.invoke(null, "debug.gscp.platecolor", "004000") as String)
                 .trim().removePrefix("#").removePrefix("0x")
             if (hex.length >= 6) {
@@ -661,7 +672,8 @@ class ArFrontGl(
         """
 
         /** 网格贴图：premultiplied 采样；uMul/uAdd 在非预乘域做内容提亮（1.4/+12），
-         *  uAlpha 整层透明度（光晕 150/255、200/255）；加色/普通合成由 blend 状态区分。 */
+         *  uAlpha 整层透明度；uFlip=1 时水平翻转（镜像关档抵消烘焙镜像）；
+         *  加色/普通合成由 blend 状态区分。 */
         private const val FRAG_MESH = """
             precision mediump float;
             varying vec2 vUv;
@@ -669,8 +681,10 @@ class ArFrontGl(
             uniform float uAlpha;
             uniform vec3 uMul;
             uniform float uAdd;
+            uniform float uFlip;
             void main() {
-                vec4 s = texture2D(uTex, vUv);
+                vec2 uv = vec2(mix(vUv.x, 1.0 - vUv.x, uFlip), vUv.y);
+                vec4 s = texture2D(uTex, uv);
                 vec3 rgb = vec3(0.0);
                 if (s.a > 0.004) {
                     rgb = clamp((s.rgb / s.a) * uMul + uAdd, 0.0, 1.0) * s.a;
