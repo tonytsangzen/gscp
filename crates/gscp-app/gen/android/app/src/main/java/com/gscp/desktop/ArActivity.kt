@@ -1708,6 +1708,7 @@ class ArActivity : Activity() {
             exitRearMode()
             arPanel.visibility = android.view.View.GONE
             settingsPanel.visibility = android.view.View.VISIBLE
+            progressView.visibility = android.view.View.GONE
             findViewById<android.view.View>(R.id.bottom_controls).visibility = android.view.View.GONE
             lastRecBtnShow = false
             glassesState = 0
@@ -1826,12 +1827,11 @@ class ArActivity : Activity() {
 
         override fun onError() {
             if (playing && frontActive) {
+                // 与 onDisconnect 同路：连接失败不滞留 AR 屏（playing=false 会让
+                // 控件条交互全部失效——含空闲隐藏后的单击恢复）
                 playing = false
-                runOnUiThread {
-                    progressView.visibility = android.view.View.GONE
-                    showStatusText("连接失败，请检查眼镜 IP 与网络")
-                    Toast.makeText(this@ArActivity, "连接失败", Toast.LENGTH_SHORT).show()
-                }
+                teardownToSettings("连接失败，请检查眼镜 IP 与网络")
+                Toast.makeText(this@ArActivity, "连接失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -1855,13 +1855,13 @@ class ArActivity : Activity() {
 
         override fun onError() {
             if (rearActive) {
+                // teardownToSettings 内含 exitRearMode + restoreFrontMode + 控件条隐藏，
+                // 滞留 AR 屏会使控件条交互失效（同前摄 onError 注释）
                 playing = false
-                exitRearMode()
+                teardownToSettings("连接失败，请检查眼镜 IP 与网络")
                 runOnUiThread {
                     progressView.visibility = android.view.View.GONE
-                    showStatusText("连接失败，请检查眼镜 IP 与网络")
                     Toast.makeText(this@ArActivity, "连接失败", Toast.LENGTH_SHORT).show()
-                    restoreFrontMode()   // 后摄失败时手机相机已关，重开前摄保持可预览
                 }
             }
         }
