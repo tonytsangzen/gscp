@@ -1611,6 +1611,7 @@ class ArActivity : Activity() {
         arPanel.visibility = android.view.View.VISIBLE
         progressView.visibility = android.view.View.VISIBLE
         playing = true
+        attachFrontGlIfLive()   // 同 Activity 重连必须补挂 GL 输出（见函数注释）
         updateRecBtnVisible()   // 进入预览 → 显示底部三键（缩略图-录像-切换）
         startFrontConnection()
         showStatusText(statusTextFor())
@@ -1624,20 +1625,48 @@ class ArActivity : Activity() {
         }, 1800)
     }
 
+    /** 补挂前摄 GL 输出面（幂等）。teardown 会同步摘除输出面；同 Activity 内
+     *  再次连接时 ar_surface 若未经历 destroy/create（快速重连，部分机型
+     *  surfaceChanged 也不重发），仅靠 surface 回调永远挂不回去——相机与
+     *  眼镜流照常运行却无输出，画面卡死在最后一帧。凡 attached 为空且
+     *  holder surface 仍有效，立即挂回。 */
+    private fun attachFrontGlIfLive() {
+        val g = frontGl ?: return
+        if (frontGlAttached != null) return
+        val s = cameraView.holder.surface ?: return
+        if (!s.isValid) return
+        frontGlAttached = s
+        g.attachOutputSurface(s)
+        g.setActive(frontCamera)
+    }
+
     // ── 子系统切换：前摄（overlay-only + Canvas AR）与后摄（普通模式管线 + GL）互相独立 ──
 
-    /** 起前摄 overlay-only 连接（CPU overlay 帧供人脸锚点投影）。 */
+    // scrcpy 会话异步收尾线程（载体 = killall app_process）。新旧会话切换必须串行：
+    // 新连接若不等旧收尾完成，旧 killall 会误杀刚拉起的新 server——流永不到达、
+    // 也无错误回调，界面卡死在"连接中"（返回→再连接 100% 复现的根因）。
+    @Volatile private var scrcpyShutdown: Thread? = null
+
+    /** 起前摄 overlay-only 连接（CPU overlay 帧供人脸锚点投影）。
+     *  connectAsync 挪到工作线程，先等旧会话收尾完成。 */
     private fun startFrontConnection() {
         val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
         frontActive = true
         glassesState = 1
+        frontOverlaySeen = false   // 流看门狗按每次连接独立判定
         overlayDecoder = VideoDecoder()
-        connection = ScrcpyConnection(this, audioEnabled = audioEnabled, overlayOnly = true)
-        connection!!.connectAsync(ip, 5555, callback)
+        val newConn = ScrcpyConnection(this, audioEnabled = audioEnabled, overlayOnly = true)
+        connection = newConn
+        val waiter = scrcpyShutdown
+        Thread {
+            try { waiter?.join(5000) } catch (_: InterruptedException) {}
+            newConn.connectAsync(ip, 5555, callback)
+        }.start()
     }
 
-    /** 切前摄：先起新的 overlay-only 连接，再异步停掉后摄管线（killall 误杀窗口与旧实现相同）。 */
+    /** 切前摄：起新的 overlay-only 连接；旧后摄管线异步收尾并登记到
+     *  [scrcpyShutdown]，新连接会等它完成（避免 killall 误杀新 server）。 */
     private fun enterFrontMode() {
         frontCamera = true
         frontActive = true
@@ -1650,33 +1679,39 @@ class ArActivity : Activity() {
         val old = rearPlayer
         rearPlayer = null
         rearActive = false
-        if (old != null) Thread { try { old.stop() } catch (_: Exception) {} }.start()
+        if (old != null) {
+            scrcpyShutdown = Thread { try { old.stop() } catch (_: Exception) {} }.also { it.start() }
+        }
     }
 
-    /** 切后摄：停前摄子系统，起完全复用普通模式的 GlassesPlayer（全流硬解 → GL 合成）。 */
+    /** 切后摄：停前摄子系统（登记收尾），起完全复用普通模式的 GlassesPlayer
+     *  （全流硬解 → GL 合成）。后摄连接同样等旧收尾完成再发起。 */
     private fun enterRearMode() {
         rearActive = true
         glassesState = 1
         camHandler?.post { closeCameraNow() }   // 后摄基底=眼镜视频，手机相机整体停掉省电
         glSurface.visibility = android.view.View.VISIBLE   // surfaceChanged → ensureRearMixer → startRearPlayerIfReady
         frontGl?.setActive(false)   // 前摄 GL 合成停画（只清黑，垫在 3:4 GL 面之下）
-        startRearPlayerIfReady()
         showStatusText("后摄：连接眼镜画面…")
         val oldConn = connection
         val oldDec = overlayDecoder
         connection = null
         overlayDecoder = null
         frontActive = false
-        if (oldConn != null || oldDec != null) Thread {
-            try { oldConn?.disconnect() } catch (_: Exception) {}
-            try { oldDec?.stop() } catch (_: Exception) {}
-        }.start()
+        if (oldConn != null || oldDec != null) {
+            scrcpyShutdown = Thread {
+                try { oldConn?.disconnect() } catch (_: Exception) {}
+                try { oldDec?.stop() } catch (_: Exception) {}
+            }.also { it.start() }
+        }
+        startRearPlayerIfReady()
         try { glassesAudio?.stop() } catch (_: Exception) {}
         glassesAudio = null
         resetOverlay()
     }
 
-    /** 后摄管线就绪即连接（等 GL 面尺寸出来建好 mixer）。 */
+    /** 后摄管线就绪即连接（等 GL 面尺寸出来建好 mixer）。
+     *  connect 挪到工作线程，先等旧会话收尾完成。 */
     private fun startRearPlayerIfReady() {
         if (!rearActive || rearPlayer != null) return
         val mx = rearMixer ?: return
@@ -1689,16 +1724,23 @@ class ArActivity : Activity() {
             events = rearEvents,
         )
         rearPlayer = player
-        player.connect(ip)
+        val waiter = scrcpyShutdown
+        Thread {
+            try { waiter?.join(5000) } catch (_: InterruptedException) {}
+            player.connect(ip)
+        }.start()
     }
 
-    /** 停后摄子系统（幂等）：断开管线、藏 GL 面。异步释放，不阻塞调用线程。
+    /** 停后摄子系统（幂等）：断开管线、藏 GL 面。异步释放，不阻塞调用线程；
+     *  收尾线程登记到 [scrcpyShutdown] 供后续连接串行等待。
      *  GL 输出面同步摘除（不等 surfaceDestroyed），防收尾过渡帧串画面。 */
     private fun exitRearMode() {
         rearActive = false
         val old = rearPlayer
         rearPlayer = null
-        if (old != null) Thread { try { old.stop() } catch (_: Exception) {} }.start()
+        if (old != null) {
+            scrcpyShutdown = Thread { try { old.stop() } catch (_: Exception) {} }.also { it.start() }
+        }
         glAttached?.let { rearMixer?.detachOutputSurface(it) }
         glAttached = null
         glSurface.visibility = android.view.View.GONE
@@ -1719,6 +1761,7 @@ class ArActivity : Activity() {
             exitRearMode()
             arPanel.visibility = android.view.View.GONE
             settingsPanel.visibility = android.view.View.VISIBLE
+            connection = null   // 回设置页后旧连接对象不再持有（重连会新建）
             progressView.visibility = android.view.View.GONE
             findViewById<android.view.View>(R.id.bottom_controls).visibility = android.view.View.GONE
             lastRecBtnShow = false
@@ -1742,7 +1785,10 @@ class ArActivity : Activity() {
         frontActive = false
         val c = connection
         connection = null
-        if (c != null) Thread { try { c.disconnect() } catch (_: Exception) {} }.start()
+        // 收尾线程登记：下次连接先等 killall 完成（防误杀新 server 卡死在连接中）
+        if (c != null) {
+            scrcpyShutdown = Thread { try { c.disconnect() } catch (_: Exception) {} }.also { it.start() }
+        }
         try { glassesAudio?.stop() } catch (_: Exception) {}
         glassesAudio = null
         teardownToSettings("")
@@ -1760,6 +1806,7 @@ class ArActivity : Activity() {
     }
 
     // ── 前摄子系统回调：overlay-only 连接（无视频流），overlay CPU 帧供人脸投影 ──
+    @Volatile private var frontOverlaySeen = false   // 流看门狗：onOverlayPrepare 已到
     private val callback = object : ScrcpyConnection.EventCallback {
         override fun onConnect() {
             glassesState = 2
@@ -1767,6 +1814,14 @@ class ArActivity : Activity() {
                 progressView.visibility = android.view.View.GONE
                 showStatusText(statusTextFor())
             }
+            // 流看门狗：连接成功但 server 被杀/挂死时不会有任何错误回调，
+            // 界面会永久卡在"已连接无画面"。8s 内没等到 overlay 流就按失败收尾。
+            recTimerHandler.postDelayed({
+                if (playing && frontActive && !frontOverlaySeen) {
+                    playing = false
+                    teardownToSettings("连接超时，未收到眼镜画面")
+                }
+            }, 8000)
         }
 
         override fun onVideoPrepare(codec: String, width: Int, height: Int) {}
@@ -1802,6 +1857,7 @@ class ArActivity : Activity() {
         }
 
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
+            frontOverlaySeen = true   // 流看门狗：overlay 流已到达
             runOnUiThread {
                 showStatusText("overlay ${width}×${height}，请正对手机摄像头")
                 try {
