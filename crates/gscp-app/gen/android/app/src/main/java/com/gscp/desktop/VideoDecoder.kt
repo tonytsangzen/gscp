@@ -70,6 +70,9 @@ class VideoDecoder {
         }
     }
 
+    var diagOut = 0L   // 诊断：已渲染输出帧计数
+    var diagTag = "vdec"
+
     @Synchronized
     fun decode(buffer: ByteArray, offset: Int, length: Int) {
         val bufferInfo = MediaCodec.BufferInfo()
@@ -90,6 +93,8 @@ class VideoDecoder {
                     if (img != null) frameCallback?.invoke(img)
                 }
                 mediaCodec.releaseOutputBuffer(outputBufferIndex, toSurface)
+                if (toSurface && ++diagOut % 150L == 1L)
+                    android.util.Log.i("ar-ui", "$diagTag out #$diagOut")
             }
         } catch (e: Exception) {
             e.printStackTrace()

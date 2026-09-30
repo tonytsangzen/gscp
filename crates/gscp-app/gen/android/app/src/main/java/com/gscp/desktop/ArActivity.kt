@@ -87,6 +87,7 @@ class ArActivity : Activity() {
     private var overlayNew = false
     // overlay 内容版本号：convertOverlayFrame/resetOverlay 递增，GL 合成器据此刷新纹理
     @Volatile private var overlayVersion = 0
+    @Volatile var diagOverlayPkg = 0L   // 诊断：overlay 网络帧计数
 
     // ── 后摄子系统：完全复用普通模式（MainActivity）管线 ──
     // GlassesPlayer 自持连接/双硬解/音频；rearMixer 输出到 ar_gl_surface 显示，
@@ -1742,6 +1743,7 @@ class ArActivity : Activity() {
             this, mx, audioEnabled, bottomRotationDeg, bottomMirror,
             applySettings = { applySettingsToMixer(it) },
             events = rearEvents,
+            resetMixerOnStop = false,   // mixer 跨会话复用：reset 统一在新会话开始时做，防异步 stop 竞态
         )
         rearPlayer = player
         val waiter = scrcpyShutdown
@@ -1910,6 +1912,8 @@ class ArActivity : Activity() {
 
         override fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int) {
             try {
+                val n = ++diagOverlayPkg
+                if (n % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$n ${length}B")
                 overlayDecoder?.decode(buffer, offset, length)
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "overlay 解码中断", e)

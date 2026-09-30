@@ -19,6 +19,11 @@ class GlassesPlayer(
     /** 连接成功时下发合成参数（普通模式 = applySettingsToMixer）。 */
     private val applySettings: (SurfaceMixer) -> Unit,
     private val events: Events,
+    /** stop() 时是否 reset() 合成器输入面。普通模式 true（handleStopped 语义）；
+     *  AR 后摄必须传 false——mixer 跨会话复用，异步 stop 的 reset 若晚于新会话
+     *  绑定解码器落地，会把新 SurfaceTexture 拆掉 = overlay/视频永远不更新。
+     *  AR 在 startRearPlayerIfReady 里新会话开始时自行 reset。 */
+    private val resetMixerOnStop: Boolean = true,
 ) {
     interface Events {
         fun onConnect()
@@ -33,8 +38,8 @@ class GlassesPlayer(
     private val platformLock = Object()
 
     fun connect(ip: String, port: Int = 5555) {
-        videoDecoder = VideoDecoder()
-        overlayDecoder = VideoDecoder()
+        videoDecoder = VideoDecoder().also { it.diagTag = "rear-video" }
+        overlayDecoder = VideoDecoder().also { it.diagTag = "rear-overlay" }
         audioPlayer = AudioPlayer()
         connection = ScrcpyConnection(context, audioEnabled)
         connection!!.connectAsync(ip, port, callback)
@@ -49,7 +54,7 @@ class GlassesPlayer(
         overlayDecoder = null
         audioPlayer?.stop()
         audioPlayer = null
-        mixer.reset()
+        if (resetMixerOnStop) mixer.reset()
     }
 
     private val callback = object : ScrcpyConnection.EventCallback {

@@ -93,6 +93,9 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
     private var uTopCropMargin = 0
     private var topViewTimestamp: Long = 0
     private var bottomViewTimestamp: Long = 0
+    private var diagTop = 0L
+    private var diagBottom = 0L
+    private var diagTopAlive = false
 
     private val handlerThread: HandlerThread = HandlerThread("gscp-gl-thread")
     private val handler: Handler
@@ -188,6 +191,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
             synchronized(lock) {
                 bottomSurfaceTexture.updateTexImage()
                 bottomViewTimestamp = System.currentTimeMillis()
+                if (++diagBottom % 150L == 1L) Log.i("ar-ui", "mixer bottom frame #$diagBottom")
             }
         }
 
@@ -199,6 +203,7 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
             synchronized(lock) {
                 topSurfaceTexture.updateTexImage()
                 topViewTimestamp = System.currentTimeMillis()
+                if (++diagTop % 150L == 1L) Log.i("ar-ui", "mixer top frame #$diagTop")
             }
         }
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
@@ -330,6 +335,8 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
 
         // overlay 2 秒无帧自动隐藏（与桌面端静默语义一致）
         val topAlive = System.currentTimeMillis() - topViewTimestamp < 2000
+        if (!topAlive && diagTopAlive) Log.i("ar-ui", "mixer top HIDDEN (2s 无帧)")
+        diagTopAlive = topAlive
         if (topAlive) {
             GLES20.glUniform1i(uTopEnable, 1)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
@@ -357,6 +364,8 @@ class SurfaceMixer(val context: Context, val width: Int, val height: Int) {
 
     /** 断开后重建两路输入 Surface（旧 SurfaceTexture 随会话失效）。 */
     fun reset() {
+        Log.i("ar-ui", "mixer reset")
+        diagTop = 0; diagBottom = 0
         handler.post {
             releaseSurface()
             createSurface()
