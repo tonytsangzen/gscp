@@ -182,10 +182,10 @@ class ArActivity : Activity() {
 
     private val detectOn = true
     private var detLogTick = 0L
-    // 检测后端：默认 CPU FP32。真机取证（vivo Mali）：ncnn Vulkan 检测与 overlay
-    // GL 烘焙并发 ~3.5s 后 Vulkan 队列楔死（det 线程 native 空转、锚点停更、相机
-    // 画面冻结）；后摄无检测故不受影响。debug.gscp.detgpu=1 切回 Vulkan FP16 A/B。
-    private val backendIdx: Int = systemPropInt("debug.gscp.detgpu", 0)
+    // 检测后端：默认 Vulkan FP16（~20ms/帧）。前摄已固定 CPU 烘焙 overlay，
+    // 「Vulkan 检测 + GL 烘焙并发楔死 Mali 驱动」（7bde27c 取证）的触发条件
+    // 不复存在；debug.gscp.detgpu=0 可切 CPU FP32 A/B。
+    private val backendIdx: Int = systemPropInt("debug.gscp.detgpu", 1)
 
     private fun systemPropInt(key: String, def: Int): Int = try {
         val sp = Class.forName("android.os.SystemProperties")
@@ -1765,17 +1765,16 @@ class ArActivity : Activity() {
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
         glassesState = 1
         frontOverlaySeen = false   // 流看门狗按每次连接独立判定
-        resetOverlay()             // 与后摄 g.reset() 同位：新会话清残留（位图 + 烘焙核心）
-        val useGlBake = glBakeEnabled()
-        val useSr = useGlBake && glSrEnabled()
+        resetOverlay()             // 新会话清残留位图（GL 烘焙核心仅后摄使用）
+        // 前摄固定 CPU 烘焙（convertOverlayFrame，原验证管线）：GL 烘焙核心与
+        // Vulkan 检测并发会楔死 Mali 驱动（7bde27c 取证），前摄不再提供 GL 路径
+        // ——ArFrontGl 的 openOverlayStream 实现保留但不会被前摄触发。
         val player = GlassesPlayer(
             this, g, audioEnabled, bottomRotationDeg, bottomMirror,
             applySettings = { /* 前摄不消费 RearComposer 的视频参数 */ },
             events = frontEvents,
             resetMixerOnStop = false,   // 合成器跨会话复用（与后摄同理由）
-            overlayImageCallback = if (useGlBake) null else { img -> convertOverlayFrame(img) },
-            overlaySr = useSr,
-            overlaySrWeights = if (useSr) srWeights() else null,
+            overlayImageCallback = { img -> convertOverlayFrame(img) },
             overlayOnly = true,
         )
         frontPlayer = player
@@ -1968,13 +1967,6 @@ class ArActivity : Activity() {
         override fun onOverlayPackage(seq: Long) {
             diagOverlayPkg = seq
             if (seq % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$seq")
-            // GL 烘焙路径的产物转储（与 CPU 路径 convertOverlayFrame 内的转储同节拍，
-            // debug.gscp.dumpoverlay 语义：100/200/300 包各转储一批 content/glow/far）
-            if (glBakeEnabled() && seq >= 100L * (dumpCount + 1) && dumpCount < 3) {
-                dumpCount++
-                val dir = getExternalFilesDir(null)?.absolutePath
-                if (dir != null) frontGl?.dumpOverlay("$dir/ovgl_dump_${dumpCount}")
-            }
         }
 
         override fun onDisconnect() {
