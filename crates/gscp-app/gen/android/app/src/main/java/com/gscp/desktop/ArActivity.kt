@@ -181,9 +181,9 @@ class ArActivity : Activity() {
 
     private val detectOn = true
     private var detLogTick = 0L
-    // 预览/检测解耦：检测节流状态与输入快照（快照在 camHandler 拷贝，det 线程只读）
+    // 预览/检测解耦：检测在 det 线程背靠背串行（detBusy），输入快照在
+    // camHandler 拷贝（det 线程只读）
     private val detBusy = java.util.concurrent.atomic.AtomicBoolean(false)
-    private var lastDetAt = 0L
     private var dY: ByteArray? = null
     private var dU: ByteArray? = null
     private var dV: ByteArray? = null
@@ -625,13 +625,11 @@ class ArActivity : Activity() {
             img.close()
         }
         // 预览与检测解耦：预览 = 轻量转换（~2ms）每帧直出（30fps 恒定，不受检测
-        // 耗时影响）；检测 = ≥100ms 节流到 det 线程（输入快照，慢检测只拖慢锚点
-        // 刷新，不再拖累预览）。此前两者串在同一调用里，Vulkan 检测退化到数百 ms
-        // 时预览同步掉到 ~2.5fps = 卡顿。
+        // 耗时影响——Vulkan 检测退化到数百 ms 时预览不再同步掉帧 = 卡顿根因）。
+        // 检测 = det 线程背靠背跑满（与原管线同节奏，锚点 ~22fps；detBusy 串行 +
+        // 输入快照防撕裂），只影响锚点刷新率，不再拖累预览。
         processPreview()
-        val now = android.os.SystemClock.uptimeMillis()
-        if (!detBusy.get() && now - lastDetAt >= 100) {
-            lastDetAt = now
+        if (!detBusy.get()) {
             snapshotPlanesForDetect()
             val rot = currentRot()
             det.execute { runDetect(rot) }
