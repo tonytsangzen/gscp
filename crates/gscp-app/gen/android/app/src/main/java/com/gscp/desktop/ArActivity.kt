@@ -234,6 +234,7 @@ class ArActivity : Activity() {
     private var bakeHalf: Bitmap? = null
     private var bakeGlowCanvas: Canvas? = null
     private var bakeHalfCanvas: Canvas? = null
+    private var bakeFarCanvas: Canvas? = null
     private var glowSrc = Rect(0, 0, 0, 0)
     private var glowDst = Rect(0, 0, 0, 0)
     private var farDst = Rect(0, 0, 0, 0)
@@ -1609,6 +1610,7 @@ class ArActivity : Activity() {
                 if (bakeFar == null || bakeFar!!.width != fw || bakeFar!!.height != fh) {
                     bakeFar?.recycle()
                     bakeFar = Bitmap.createBitmap(fw, fh, Bitmap.Config.ARGB_8888)
+                    bakeFarCanvas = Canvas(bakeFar!!)
                 }
                 glowSrc.set(0, 0, w, h); glowDst.set(0, 0, gw, gh); farDst.set(0, 0, fw, fh)
                 if (nOp > 0) {
@@ -1638,13 +1640,11 @@ class ArActivity : Activity() {
                             glowSmoothPaint)
                     }
                     // 远距 = 平滑后 1/4 再降 1/16
-                    val farCv = Canvas(bakeFar!!)
-                    farCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    farCv.drawBitmap(bakeGlow!!, glowDst, farDst, glowSmoothPaint)
+                    bakeFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bakeFarCanvas!!.drawBitmap(bakeGlow!!, glowDst, farDst, glowSmoothPaint)
                 } else {
                     bakeGlowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    val farCv = Canvas(bakeFar!!)
-                    farCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bakeFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                 }
                 // ── 发布：锁内仅引用交换 + 版本号。GL 快照的纹理上传（2~4ms）与本段
                 //    串行，烘焙重活已全部在锁外完成，渲染线程不再被饿死。──
@@ -1655,6 +1655,10 @@ class ArActivity : Activity() {
                     overlayNew = true
                     overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
                 }
+                // 位图随交换轮换 → 画布重绑到新的私有位图（否则烘焙画进发布位图、
+                // 发布出去的是过期空图 = 光晕消失）
+                bakeGlowCanvas = bakeGlow?.let { Canvas(it) }
+                bakeFarCanvas = bakeFar?.let { Canvas(it) }
                 // debug.gscp.dumpoverlay=1:在 100/200/300 包时各转储一张解码位图
                 // (首帧为空帧,需等 UI 渲染后的包)。PNG 压缩较重，放锁外、转储私有位图。
                 if (diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
