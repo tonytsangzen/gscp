@@ -218,12 +218,17 @@ class ArActivity : Activity() {
     private val glowCm = android.graphics.ColorMatrix()
     private val glowAlphaPaint = Paint(Paint.FILTER_BITMAP_FLAG)   // 剪影绘制（每帧设平均色 + alpha 饱和）
     private val glowSmoothPaint = Paint(Paint.FILTER_BITMAP_FLAG)  // 金字塔缩放（纯双线性低通）
+    // ── 发布位图集（overlayLock 保护；GL 快照仅读取）——锁内只做引用交换 ──
     private var glowBmp: Bitmap? = null       // ob 1/4 降采样（中距光晕，烘焙平滑后）
-    private var glowCanvas: Canvas? = null
     private var bloomFarBmp: Bitmap? = null   // ob 1/16 降采样（远距光晕，烘焙平滑后）
-    private var bloomFarCanvas: Canvas? = null
-    private var glowHalfBmp: Bitmap? = null   // ob 1/8 中间层（金字塔低通用）
-    private var glowHalfCanvas: Canvas? = null
+    // ── 烘焙位图集（解码线程私有，不持锁）：overlay 流 ~40 包/s 时持锁烘焙会把
+    //    GL 渲染线程的快照饿死（前摄卡顿根因），故烘焙在私有位图上完成后锁内交换 ──
+    private var bakeBmp: Bitmap? = null
+    private var bakeGlow: Bitmap? = null
+    private var bakeFar: Bitmap? = null
+    private var bakeHalf: Bitmap? = null
+    private var bakeGlowCanvas: Canvas? = null
+    private var bakeHalfCanvas: Canvas? = null
     private var glowSrc = Rect(0, 0, 0, 0)
     private var glowDst = Rect(0, 0, 0, 0)
     private var farDst = Rect(0, 0, 0, 0)
@@ -1492,19 +1497,17 @@ class ArActivity : Activity() {
             if (vs == null || vs.size < cw * vPs * ((h shr 1) + 2)) {
                 vs = ByteArray(cw * vPs * ((h shr 1) + 2)); vScr = vs
             }
-            synchronized(overlayLock) {
+            // ── 烘焙在解码线程私有位图上进行（不持锁）：overlay 流高频时持锁烘焙
+            //    会把 GL 渲染线程的快照饿死（卡顿根因）。锁内只做引用交换。──
+            run {
                 var pix = overlayPix
                 if (pix == null || pix.size != w * h) { pix = IntArray(w * h); overlayPix = pix }
                 // 防“残影”：pix 跨帧复用，若本帧因 limit 提前 break 未写满，残留上一帧内容会
                 // 整块拷入 ob → 字符拖影。填零（全透明）确保未写到的行是空、而非旧帧。
                 java.util.Arrays.fill(pix, 0)
-                if (overlayBmp == null || overlayBmp!!.width != w || overlayBmp!!.height != h) {
-                    overlayBmp?.recycle()
-                    overlayBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                }
-                if (overlayBmp == null || overlayBmp!!.width != w || overlayBmp!!.height != h) {
-                    overlayBmp?.recycle()
-                    overlayBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                if (bakeBmp == null || bakeBmp!!.width != w || bakeBmp!!.height != h) {
+                    bakeBmp?.recycle()
+                    bakeBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     ArNative.nativeSetOverlaySize(w, h)
                 }
                 val cropL = crop.left
@@ -1555,7 +1558,7 @@ class ArActivity : Activity() {
                         o++
                     }
                 }
-                overlayBmp!!.setPixels(pix, 0, w, 0, 0, w, h)
+                bakeBmp!!.setPixels(pix, 0, w, 0, 0, w, h)
                 // 发光底图：内容剪影（不透明像素平均色 + alpha 饱和）→ 金字塔低通烘焙平滑。
                 // 剪影让任意字符贡献相同的发光源；多级降/升采样（纯双线性缩放）等效大半径
                 // 低通，不依赖 maskFilter——光晕均匀、无块状明暗边界
@@ -1564,20 +1567,19 @@ class ArActivity : Activity() {
                 // 光晕扩散面积更大，单位面积亮度更低
                 val hw = maxOf(4, w shr 4); val hh = maxOf(4, h shr 4)
                 val fw = maxOf(2, w shr 5); val fh = maxOf(2, h shr 5)
-                if (glowBmp == null || glowBmp!!.width != gw || glowBmp!!.height != gh) {
-                    glowBmp?.recycle()
-                    glowBmp = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
-                    glowCanvas = Canvas(glowBmp!!)
+                if (bakeGlow == null || bakeGlow!!.width != gw || bakeGlow!!.height != gh) {
+                    bakeGlow?.recycle()
+                    bakeGlow = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+                    bakeGlowCanvas = Canvas(bakeGlow!!)
                 }
-                if (glowHalfBmp == null || glowHalfBmp!!.width != hw || glowHalfBmp!!.height != hh) {
-                    glowHalfBmp?.recycle()
-                    glowHalfBmp = Bitmap.createBitmap(hw, hh, Bitmap.Config.ARGB_8888)
-                    glowHalfCanvas = Canvas(glowHalfBmp!!)
+                if (bakeHalf == null || bakeHalf!!.width != hw || bakeHalf!!.height != hh) {
+                    bakeHalf?.recycle()
+                    bakeHalf = Bitmap.createBitmap(hw, hh, Bitmap.Config.ARGB_8888)
+                    bakeHalfCanvas = Canvas(bakeHalf!!)
                 }
-                if (bloomFarBmp == null || bloomFarBmp!!.width != fw || bloomFarBmp!!.height != fh) {
-                    bloomFarBmp?.recycle()
-                    bloomFarBmp = Bitmap.createBitmap(fw, fh, Bitmap.Config.ARGB_8888)
-                    bloomFarCanvas = Canvas(bloomFarBmp!!)
+                if (bakeFar == null || bakeFar!!.width != fw || bakeFar!!.height != fh) {
+                    bakeFar?.recycle()
+                    bakeFar = Bitmap.createBitmap(fw, fh, Bitmap.Config.ARGB_8888)
                 }
                 glowSrc.set(0, 0, w, h); glowDst.set(0, 0, gw, gh); farDst.set(0, 0, fw, fh)
                 if (nOp > 0) {
@@ -1593,35 +1595,44 @@ class ArActivity : Activity() {
                     ))
                     glowAlphaPaint.colorFilter = android.graphics.ColorMatrixColorFilter(glowCm)
                     // 剪影 → 1/4
-                    glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    glowCanvas!!.drawBitmap(overlayBmp!!, glowSrc, glowDst, glowAlphaPaint)
+                    bakeGlowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bakeGlowCanvas!!.drawBitmap(bakeBmp!!, glowSrc, glowDst, glowAlphaPaint)
                     // 金字塔低通：1/4 → 1/8 → 1/4 双线性往返 = 大核平滑，两轮更柔
                     for (round in 0 until 2) {
-                        glowHalfCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                        glowHalfCanvas!!.drawBitmap(glowBmp!!, null,
+                        bakeHalfCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                        bakeHalfCanvas!!.drawBitmap(bakeGlow!!, null,
                             android.graphics.RectF(0f, 0f, hw.toFloat(), hh.toFloat()),
                             glowSmoothPaint)
-                        glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                        glowCanvas!!.drawBitmap(glowHalfBmp!!, null,
+                        bakeGlowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                        bakeGlowCanvas!!.drawBitmap(bakeHalf!!, null,
                             android.graphics.RectF(0f, 0f, gw.toFloat(), gh.toFloat()),
                             glowSmoothPaint)
                     }
                     // 远距 = 平滑后 1/4 再降 1/16
-                    bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    bloomFarCanvas!!.drawBitmap(glowBmp!!, glowDst, farDst, glowSmoothPaint)
+                    val farCv = Canvas(bakeFar!!)
+                    farCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    farCv.drawBitmap(bakeGlow!!, glowDst, farDst, glowSmoothPaint)
                 } else {
-                    glowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    bloomFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    bakeGlowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    val farCv = Canvas(bakeFar!!)
+                    farCv.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                 }
-                overlayNew = true
-                overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
+                // ── 发布：锁内仅引用交换 + 版本号。GL 快照的纹理上传（2~4ms）与本段
+                //    串行，烘焙重活已全部在锁外完成，渲染线程不再被饿死。──
+                synchronized(overlayLock) {
+                    val tb = bakeBmp; val tg = bakeGlow; val tf = bakeFar
+                    bakeBmp = overlayBmp; bakeGlow = glowBmp; bakeFar = bloomFarBmp
+                    overlayBmp = tb; glowBmp = tg; bloomFarBmp = tf
+                    overlayNew = true
+                    overlayVersion++   // 通知 GL 合成器上传新的内容/光晕纹理
+                }
                 // debug.gscp.dumpoverlay=1:在 100/200/300 包时各转储一张解码位图
-                // (首帧为空帧,需等 UI 渲染后的包)
+                // (首帧为空帧,需等 UI 渲染后的包)。PNG 压缩较重，放锁外、转储私有位图。
                 if (diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
                     dumpCount++
                     try {
                         val f = java.io.File(getExternalFilesDir(null), "overlay_dump_${dumpCount}.png")
-                        java.io.FileOutputStream(f).use { overlayBmp!!.compress(
+                        java.io.FileOutputStream(f).use { bakeBmp!!.compress(
                             Bitmap.CompressFormat.PNG, 100, it) }
                         android.util.Log.i(TAG, "overlay dump#${dumpCount}: ${f.absolutePath}")
                     } catch (e: Exception) {
