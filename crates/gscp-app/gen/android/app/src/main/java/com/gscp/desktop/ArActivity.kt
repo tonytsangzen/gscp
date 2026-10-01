@@ -92,6 +92,10 @@ class ArActivity : Activity() {
     // overlay 内容版本号：convertOverlayFrame/resetOverlay 递增，GL 合成器据此刷新纹理
     @Volatile private var overlayVersion = 0
     @Volatile var diagOverlayPkg = 0L   // 诊断：overlay 网络帧计数
+    // overlay 流活性：最近一次 overlay 包的单调时钟（合成器 3s 无包即隐藏 overlay+背板）
+    @Volatile private var lastOvPkgAt = 0L
+    private fun ovStreamAlive(): Boolean =
+        lastOvPkgAt != 0L && android.os.SystemClock.uptimeMillis() - lastOvPkgAt < 3000
     private var dumpCount = 0
 
     // ── 后摄子系统：完全复用普通模式（MainActivity）管线 ──
@@ -457,6 +461,7 @@ class ArActivity : Activity() {
                 }
             })
             rearGl = g
+            g.streamAliveCheck = { ovStreamAlive() }
             applyComposerSettings(g)
         }
         return g
@@ -477,6 +482,7 @@ class ArActivity : Activity() {
             )
             // 每拍唤醒录像编码线程取包（编码帧率≈GL 帧率，与旧 Canvas 路径的 tick 等价）
             g.frameCallback = { recorder?.tick() }
+            g.streamAliveCheck = { ovStreamAlive() }
             frontGl = g
         }
         return g
@@ -2051,6 +2057,7 @@ class ArActivity : Activity() {
 
         override fun onOverlayPackage(seq: Long) {
             diagOverlayPkg = seq
+            lastOvPkgAt = android.os.SystemClock.uptimeMillis()
             if (seq % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$seq")
         }
 
@@ -2075,6 +2082,10 @@ class ArActivity : Activity() {
 
     // ── 后摄子系统事件（GlassesPlayer = 普通模式管线）──
     private val rearEvents = object : GlassesPlayer.Events {
+        override fun onOverlayPackage(seq: Long) {
+            lastOvPkgAt = android.os.SystemClock.uptimeMillis()
+        }
+
         override fun onConnect() {
             glassesState = 2
             runOnUiThread {

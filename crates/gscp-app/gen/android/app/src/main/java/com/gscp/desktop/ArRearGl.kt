@@ -95,6 +95,9 @@ class ArRearGl(
     private var overlayVersionSeen = Int.MIN_VALUE
     private var hasContent = false
     private var diagTick = 0                    // 诊断节流(每 ~2s 一条)
+    // overlay 流活性：由宿主注入检查（3s 无 overlay 包 = 暂停 → 隐藏顶层 overlay）
+    @Volatile var streamAliveCheck: (() -> Boolean)? = null
+    @Volatile private var streamAlive = true
 
     // GPU 烘焙核心（debug.gscp.ovgl=1 时替代 CPU 烘焙位图快照）；
     // openOverlayStream 建，reset() 随会话重建，产物纹理同 context 直用。
@@ -355,6 +358,11 @@ class ArRearGl(
 
     private fun tick() {
         pollProps()
+        val alive = streamAliveCheck?.invoke() ?: true
+        if (alive != streamAlive) {
+            streamAlive = alive
+            Log.i("ar-rear-gl", "overlay stream " + if (alive) "resumed" else "paused >3s -> hide overlay")
+        }
         val b = baker
         if (b != null) {
             // GPU 烘焙：消费解码新帧（产物纹理原地更新）。overlay 流按需发帧，
@@ -413,6 +421,8 @@ class ArRearGl(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
 
         // ── 顶层：前摄同款发光（远 ADD α90 → 中 ADD α120 → 内容）──
+        // overlay 流暂停 >3s：隐藏顶层（底层眼镜视频照常）
+        if (!streamAlive) return
         if (!hasContent) return
         // 纹理源：GPU 烘焙产物优先，回退 CPU 烘焙位图上传
         val bk = baker

@@ -98,6 +98,10 @@ class ArFrontGl(
     private val faceRender = FloatArray(17)
     private var faceRenderValid = false
     private var lastRenderAt = 0L
+    // overlay 流活性：由宿主注入检查（3s 无 overlay 包 = 暂停 → 隐藏 overlay+背板）
+    @Volatile var streamAliveCheck: (() -> Boolean)? = null
+    @Volatile private var streamAlive = true
+    private var streamAliveLogged = true
     private var spdS = -1f                           // 锚点运动速度的指数平滑（px/帧）
     private var tauScale = 1f                        // debug.gscp.tauscale：τ 缩放（>1 更平滑/更迟滞，<1 更跟手）
     @Volatile private var camW = 0
@@ -404,6 +408,12 @@ class ArFrontGl(
 
     private fun tick() {
         pollPlateProps()
+        val alive = streamAliveCheck?.invoke() ?: true
+        if (alive != streamAlive) {
+            streamAlive = alive
+            streamAliveLogged = false
+            Log.i(TAG, "overlay stream " + if (alive) "resumed" else "paused >3s -> hide overlay/plate")
+        }
         val b = baker
         if (b != null) {
             // GPU 烘焙：消费解码新帧（产物纹理原地更新，无需上传/版本比对）
@@ -484,6 +494,7 @@ class ArFrontGl(
         }
 
         var ov = face ?: return
+        if (!streamAlive) return   // 流暂停 >3s：隐藏 overlay 与背板（相机层照常）
         // 锚点指数平滑：每渲染帧向最新锚点趋近 1-e^(-dt/τ)。锚点率低于渲染率时
         // 填平间隔（不再阶梯），检测噪声被低通（不再抖）；锚点停滞时输出冻结
         // 在最后位置平滑停住（无过冲无回跳）。
