@@ -98,6 +98,8 @@ class ArFrontGl(
     private val faceRender = FloatArray(17)
     private var faceRenderValid = false
     private var lastRenderAt = 0L
+    private var spdS = -1f                           // 锚点运动速度的指数平滑（px/帧）
+    private var tauScale = 1f                        // debug.gscp.tauscale：τ 缩放（>1 更平滑/更迟滞，<1 更跟手）
     @Volatile private var camW = 0
     @Volatile private var camH = 0
 
@@ -491,8 +493,17 @@ class ArFrontGl(
         if (!faceRenderValid || faceRender.size != ov.size) {
             System.arraycopy(ov, 0, faceRender, 0, ov.size)
             faceRenderValid = true
+            spdS = -1f
         } else {
-            val k = 1f - kotlin.math.exp(-dt / 70f)
+            // 自适应 τ（1€ 思路）：锚点位移大（转头）→ τ≈30ms 低延迟；静止/微动 →
+            // τ≈110ms 强平滑。move = 四角平均位移（canvas px），spdS 指数平滑防切档抖动。
+            var move = 0f
+            for (i in 0 until 8) { val d = ov[i] - faceRender[i]; move += d * d }
+            move = kotlin.math.sqrt(move / 8f)
+            spdS = if (spdS < 0f) move else spdS + (move - spdS) * (1f - kotlin.math.exp(-dt / 120f))
+            val f = ((spdS - 6f) / 30f).coerceIn(0f, 1f)
+            val tau = ((110f - 80f * f) * tauScale).coerceAtLeast(25f)
+            val k = 1f - kotlin.math.exp(-dt / tau)
             for (i in ov.indices) faceRender[i] += (ov[i] - faceRender[i]) * k
         }
         ov = faceRender
@@ -683,6 +694,8 @@ class ArFrontGl(
             }
             val a = (get.invoke(null, "debug.gscp.platealpha", "") as String).trim()
             if (a.isNotEmpty()) a.toFloatOrNull()?.let { plateAlpha = it.coerceIn(0f, 1f) }
+            val ts = (get.invoke(null, "debug.gscp.tauscale", "") as String).trim().toFloatOrNull()
+            if (ts != null && ts >= 0.25f) tauScale = ts.coerceAtMost(4f)
         } catch (_: Throwable) {
         }
     }
