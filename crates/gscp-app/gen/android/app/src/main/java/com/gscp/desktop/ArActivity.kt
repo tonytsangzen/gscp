@@ -139,7 +139,6 @@ class ArActivity : Activity() {
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var surfaceReady = false
-    private val busy = AtomicBoolean(false)
 
     @Volatile private var faceOv = arrayOf<FloatArray>()       // 每脸 17 值：四角 8 + 背板 8 + 距离 cm
     private var lastRecBtnShow = false   // bottom_controls 上次可见态（布局初始 hidden），避免每帧重复更新 View
@@ -182,6 +181,12 @@ class ArActivity : Activity() {
 
     private val detectOn = true
     private var detLogTick = 0L
+    // 预览/检测解耦：检测节流状态与输入快照（快照在 camHandler 拷贝，det 线程只读）
+    private val detBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var lastDetAt = 0L
+    private var dY: ByteArray? = null
+    private var dU: ByteArray? = null
+    private var dV: ByteArray? = null
     // 检测后端：默认 Vulkan FP16（~20ms/帧）。前摄已固定 CPU 烘焙 overlay，
     // 「Vulkan 检测 + GL 烘焙并发楔死 Mali 驱动」（7bde27c 取证）的触发条件
     // 不复存在；debug.gscp.detgpu=0 可切 CPU FP32 A/B。
@@ -571,7 +576,6 @@ class ArActivity : Activity() {
     private fun closeStream() {
         try { reader?.close() } catch (_: Exception) {}
         reader = null
-        busy.set(false)
     }
 
     private fun pickCamera(): String {
@@ -610,19 +614,99 @@ class ArActivity : Activity() {
         var img: Image? = null
         try { img = r.acquireLatestImage() } catch (_: Exception) {}
         if (img == null) return
-        if (busy.getAndSet(true)) { img.close(); return }
         try {
             val okCopy = copyPlanes(img)
             if (!okCopy) {
                 android.util.Log.e(TAG, "copyPlanes failed")
-                busy.set(false)
                 img.close()
                 return
             }
         } finally {
             img.close()
         }
-        det.execute { processFrame() }
+        // 预览与检测解耦：预览 = 轻量转换（~2ms）每帧直出（30fps 恒定，不受检测
+        // 耗时影响）；检测 = ≥100ms 节流到 det 线程（输入快照，慢检测只拖慢锚点
+        // 刷新，不再拖累预览）。此前两者串在同一调用里，Vulkan 检测退化到数百 ms
+        // 时预览同步掉到 ~2.5fps = 卡顿。
+        processPreview()
+        val now = android.os.SystemClock.uptimeMillis()
+        if (!detBusy.get() && now - lastDetAt >= 100) {
+            lastDetAt = now
+            snapshotPlanesForDetect()
+            val rot = currentRot()
+            det.execute { runDetect(rot) }
+        }
+    }
+
+    private fun currentRot(): Int {
+        val disp = windowManager.defaultDisplay
+        val displayRot = (disp?.rotation ?: 0) * 90
+        return (sensorOrientation - displayRot + 360) % 360
+    }
+
+    /** 预览：轻量转换（~2ms）→ 纹理上传。camHandler 串行调用。 */
+    private fun processPreview() {
+        val rot = currentRot()
+        val rw = if (rot == 90 || rot == 270) frameH else frameW
+        val rh = if (rot == 90 || rot == 270) frameW else frameH
+        val rb: ByteBuffer = synchronized(camBufLock) {
+            val need = rw * rh * 4
+            if (camBufBytes != need) {
+                for (i in camBufs.indices) {
+                    camBufs[i] = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder())
+                }
+                camBufBytes = need
+            }
+            val b = camBufs[camBufIdx]!!
+            camBufIdx = (camBufIdx + 1) % camBufs.size
+            b
+        }
+        ArNative.nativePreviewConvert(
+            yBuf!!, uBuf!!, vBuf!!, frameW, frameH,
+            yStride, uStride, vStride, uPix, vPix, rot, rb)
+        frontGl?.let { g ->
+            rb.rewind()
+            g.postCameraFrame(rb, rw, rh)
+        }
+    }
+
+    /** 检测输入快照（camHandler 拷贝，避免 det 线程读到被覆写的平面）。 */
+    private fun snapshotPlanesForDetect() {
+        if (dY == null || dY!!.size != yBuf!!.size) {
+            dY = yBuf!!.clone(); dU = uBuf!!.clone(); dV = vBuf!!.clone()
+        } else {
+            System.arraycopy(yBuf!!, 0, dY!!, 0, yBuf!!.size)
+            System.arraycopy(uBuf!!, 0, dU!!, 0, uBuf!!.size)
+            System.arraycopy(vBuf!!, 0, dV!!, 0, vBuf!!.size)
+        }
+    }
+
+    /** 检测（det 线程）：完整推理链，结果只喂锚点；不再产出预览像素。 */
+    private fun runDetect(rot: Int) {
+        detBusy.set(true)
+        try {
+            val rw = if (rot == 90 || rot == 270) frameH else frameW
+            val rh = if (rot == 90 || rot == 270) frameW else frameH
+            val detT0 = android.os.SystemClock.uptimeMillis()
+            val j = ArNative.nativeFaceDetect(
+                dY!!, dU!!, dV!!, frameW, frameH,
+                yStride, uStride, vStride, uPix, vPix, rot, true, null)
+            val detMs = android.os.SystemClock.uptimeMillis() - detT0
+            if (detMs > 3000) {
+                android.util.Log.w(TAG, "det STUCK ${detMs}ms")
+            } else if (++detLogTick % 100L == 1L) {
+                android.util.Log.i(TAG, "det ${detMs}ms/frame")
+            }
+            if (++dbgFrames <= 3)
+                android.util.Log.i(TAG, "frame#$dbgFrames rot=$rot upright=${rw}x$rh json=" +
+                    (if (j.length > 160) j.substring(0, 160) else j))
+            parseResult(j)
+            frontGl?.let { g -> g.setFace(faceOv.firstOrNull(), rw, rh) }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "帧检测异常", t)
+        } finally {
+            detBusy.set(false)
+        }
     }
 
     /** 三个平面按行拷贝（保留原 rowStride 布局），供 native 读取。 */
@@ -668,59 +752,6 @@ class ArActivity : Activity() {
             src.get(dst, pos, len)
         }
         src.clear()
-    }
-
-    private fun processFrame() {
-        try {
-            val disp = windowManager.defaultDisplay
-            val displayRot = (disp?.rotation ?: 0) * 90
-            val rot = (sensorOrientation - displayRot + 360) % 360
-            val rw = if (rot == 90 || rot == 270) frameH else frameW
-            val rh = if (rot == 90 || rot == 270) frameW else frameH
-
-            val rb: ByteBuffer = synchronized(camBufLock) {
-                val need = rw * rh * 4
-                if (camBufBytes != need) {
-                    for (i in camBufs.indices) {
-                        camBufs[i] = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder())
-                    }
-                    camBufBytes = need
-                }
-                val b = camBufs[camBufIdx]!!
-                camBufIdx = (camBufIdx + 1) % camBufs.size
-                b
-            }
-
-            val detT0 = android.os.SystemClock.uptimeMillis()
-            val j = ArNative.nativeFaceDetect(
-                yBuf!!, uBuf!!, vBuf!!, frameW, frameH,
-                yStride, uStride, vStride, uPix, vPix, rot, detectOn, rb)
-            val detMs = android.os.SystemClock.uptimeMillis() - detT0
-            if (detMs > 3000) {
-                // 卡死取证：单次检测超 3s（正常 5~60ms）——每 3s 记一条直到返回
-                android.util.Log.w(TAG, "det STUCK ${detMs}ms (Vulkan/GL 并发楔死?)")
-            } else if (++detLogTick % 150L == 1L) {
-                android.util.Log.i(TAG, "det ${detMs}ms/frame")
-            }
-
-            if (++dbgFrames <= 3)
-                android.util.Log.i(TAG, "frame#$dbgFrames rot=$rot upright=${rw}x$rh json=" +
-                    (if (j.length > 160) j.substring(0, 160) else j))
-
-            parseResult(j)
-
-            // GL 合成：相机帧纹理上传 + 人脸锚点状态（检测直写的 RGBA 原样上屏，所见即所测；
-            // 旧 copyPixelsFromBuffer + Canvas 软件绘制路径已整体移除）
-            frontGl?.let { g ->
-                rb.rewind()
-                g.postCameraFrame(rb, rw, rh)
-                g.setFace(faceOv.firstOrNull(), rw, rh)
-            }
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "帧处理异常", t)
-        } finally {
-            busy.set(false)
-        }
     }
 
     /** 提取 face0 overlay 四角锚点；人脸丢失时 faceOv 为空。

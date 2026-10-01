@@ -18,11 +18,11 @@ object ArNative {
                                 backend: Int, input: Int): String
 
     /**
-     * 一帧处理：YUV 三平面（保留 rowStride 布局）转 BGR 并顺时针旋转 rot 度，直立图
-     * RGBA 写入 rgbaOut（direct buffer，大小 = 直立图宽×高×4）；返回 JSON：
-     * {"ok","convMs","ms","w","h","rot","maxScore","faces":[
-     *   {"box":[4],"score","kps":[10],"pose":[3],"normal":[2][2],
-     *    "overlay":[4][2],"ovC":[2],"ovD":cm}]}
+     * 一帧处理：YUV 三平面（保留 rowStride 布局）转 BGR 并顺时针旋转 rot 度，
+     * 直立图 RGBA 写入 rgbaOut（direct buffer，大小 = 直立图宽×高×4；传 null 跳过
+     * 预览像素产出，仅跑检测）；返回 JSON：{"ok","convMs","ms","w","h","rot",
+     * "maxScore","faces":[{"box":[4],"score","kps":[10],"pose":[3],"normal":[2][2],
+     * "overlay":[4][2],"ovC":[2],"ovD":cm}]}
      */
     external fun nativeFaceDetect(
         y: ByteArray, u: ByteArray, v: ByteArray,
@@ -30,11 +30,24 @@ object ArNative {
         yStride: Int, uStride: Int, vStride: Int,
         uPix: Int, vPix: Int,
         rot: Int, detect: Boolean,
-        rgbaOut: java.nio.ByteBuffer,
+        rgbaOut: java.nio.ByteBuffer?,
     ): String
 
     /** 释放检测网（Vulkan 全局设备保留）。 */
     external fun nativeFaceClose()
+
+    /**
+     * 前摄预览专用轻量转换：仅 YUV→BGR→旋转→RGBA（无检测推理，~2ms）。
+     * 与 [nativeFaceDetect] 解耦（不取全局锁）——检测慢调用不再拖累预览帧率。
+     * 仅 camHandler 线程串行调用。直立图 RGBA 写入 rgbaOut。
+     */
+    external fun nativePreviewConvert(
+        y: ByteArray, u: ByteArray, v: ByteArray,
+        w: Int, h: Int,
+        yStride: Int, uStride: Int, vStride: Int,
+        uPix: Int, vPix: Int,
+        rot: Int, rgbaOut: java.nio.ByteBuffer,
+    )
 
     /** 姿态算法：1=hopenet（对照） 3=融合（默认主路径）；其余一律回融合。 */
     external fun nativeFaceSetPoseAlgo(algo: Int)

@@ -1898,3 +1898,47 @@ Java_com_gscp_desktop_ArNative_nativeSrOpenPath(
     LOGI("sr net(path) on safe cpu threads=%d", net->opt.num_threads);
     return env->NewStringUTF("{\"ok\":true,\"backend\":\"cpu\",\"scale\":2}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 前摄预览专用轻量转换：仅 YUV→BGR→旋转→RGBA（无检测推理）。
+// 背景：预览 RGBA 由 nativeFaceDetect 产出，检测慢（Vulkan 退化到数百 ms）时
+// 预览同步掉帧 = 卡顿。此入口与检测解耦：不走 g_mutex（检测慢调用持锁不再
+// 阻塞预览），预览帧率恒定 ~30fps；检测在独立线程按节流节奏运行。
+// 线程约束：仅 camHandler 串行调用（静态缓冲单线程使用）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gscp_desktop_ArNative_nativePreviewConvert(
+    JNIEnv* env, jobject, jbyteArray yArr, jbyteArray uArr, jbyteArray vArr,
+    jint w, jint h, jint yStride, jint uStride, jint vStride, jint uPix, jint vPix,
+    jint rot, jobject rgbaOut)
+{
+    jbyte* yp = env->GetByteArrayElements(yArr, nullptr);
+    jbyte* up = env->GetByteArrayElements(uArr, nullptr);
+    jbyte* vp = env->GetByteArrayElements(vArr, nullptr);
+    const int rw = (rot == 90 || rot == 270) ? h : w;
+    const int rh = (rot == 90 || rot == 270) ? w : h;
+    static std::vector<unsigned char> p_bgr, p_upr;
+    if (p_bgr.size() < (size_t)w * h * 3) p_bgr.resize((size_t)w * h * 3);
+    if (p_upr.size() < (size_t)rw * rh * 3) p_upr.resize((size_t)rw * rh * 3);
+    yuvToBgr((const unsigned char*)yp, (const unsigned char*)up, (const unsigned char*)vp,
+             w, h, yStride, uStride, vStride, uPix, vPix, p_bgr.data());
+    int ckw = 0, ckh = 0;
+    rotateBgr(p_bgr.data(), w, h, rot, p_upr.data(), &ckw, &ckh);
+    void* rgba = rgbaOut ? env->GetDirectBufferAddress(rgbaOut) : nullptr;
+    const jlong rgbaCap = rgbaOut ? env->GetDirectBufferCapacity(rgbaOut) : 0;
+    if (rgba && rgbaCap >= (jlong)rw * rh * 4) {
+        unsigned char* out = (unsigned char*)rgba;
+        const unsigned char* in = p_upr.data();
+        const size_t n = (size_t)rw * rh;
+        for (size_t i = 0; i < n; i++) {
+            out[i * 4 + 0] = in[i * 3 + 2];
+            out[i * 4 + 1] = in[i * 3 + 1];
+            out[i * 4 + 2] = in[i * 3 + 0];
+            out[i * 4 + 3] = 255;
+        }
+    }
+    env->ReleaseByteArrayElements(yArr, yp, JNI_ABORT);
+    env->ReleaseByteArrayElements(uArr, up, JNI_ABORT);
+    env->ReleaseByteArrayElements(vArr, vp, JNI_ABORT);
+}
