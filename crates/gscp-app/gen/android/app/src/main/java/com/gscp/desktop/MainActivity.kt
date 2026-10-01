@@ -120,6 +120,7 @@ class MainActivity : AppCompatActivity() {
         settingsButton.setOnClickListener { openSettingsDialog() }
         // AR 模式是唯一连接模式：「连接」直接进入 AR（原普通投屏 connect() 不再从 UI 触发）
         connectButton.setOnClickListener {
+            // AR 是唯一连接模式：保存输入的 IP（ArActivity 从 prefs 读取）后进入
             startActivity(android.content.Intent(this, ArActivity::class.java))
         }
     }

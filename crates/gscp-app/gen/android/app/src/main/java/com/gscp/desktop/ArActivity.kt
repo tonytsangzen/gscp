@@ -67,12 +67,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ArActivity : Activity() {
 
     private lateinit var prefs: android.content.SharedPreferences
-    private lateinit var settingsPanel: android.view.View
     private lateinit var arPanel: android.view.View
     private lateinit var cameraView: SurfaceView
     private lateinit var statusText: TextView
-    private lateinit var progressView: android.view.View
-    private lateinit var ipEdit: EditText
 
     // 前摄 overlay 会话（后摄同款 GlassesPlayer 管线，overlayOnly 连接）：
     // 连接/解码/音频生命周期全部由 player 自管，ArActivity 只消费事件。
@@ -255,12 +252,9 @@ class ArActivity : Activity() {
         prefs = getSharedPreferences("gscp", MODE_PRIVATE)
 
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
-        settingsPanel = findViewById(R.id.settings_panel)
         arPanel = findViewById(R.id.ar_panel)
         cameraView = findViewById(R.id.ar_surface)
         statusText = findViewById(R.id.ar_status)
-        progressView = findViewById(R.id.progress_bar)
-        ipEdit = findViewById(R.id.ip_address)
         glSurface = findViewById(R.id.ar_gl_surface)
         // 与普通模式完全相同的 3:4 显示平面（MainActivity 同款计算）：SurfaceMixer 的
         // overlay contain+cropMargin 公式仅在 3:4 画布下无失真，全屏画布会把画面拉长
@@ -323,7 +317,6 @@ class ArActivity : Activity() {
             }
         })
 
-        findViewById<Button>(R.id.button_connect).setOnClickListener { startAr() }
         recOverlay = findViewById(R.id.rec_overlay)
         val lastThumb = findViewById<ImageView>(R.id.last_thumb)
         // 相机 App 缩略图键惯例：bitmap 裁圆（outline 来自 bg_thumb 正圆），
@@ -349,13 +342,14 @@ class ArActivity : Activity() {
             if (recStarting || recStopping) return@setOnClickListener   // 启动/停止中忽略点击
             if (recorder?.recording == true) stopRec() else startRec()
         }
-        ipEdit.setText(prefs.getString("ip", ""))
         loadRecentLastVideo()            // 左侧显示上次录像缩略图（跨会话）
-        // AR 是唯一连接模式：已配置过 IP 的启动直接进入会话（主页「连接」一键
-        // 直达预览）；未配置时停在设置面板等输入。teardown 回面板后不会重复触发
-        // （仅 onCreate 执行一次）。
+        // AR 是唯一连接模式：连接由主界面发起（IP 在主界面保存），本页直接进会话；
+        // 无 IP 则提示并返回主界面输入（本页已无连接设置 UI）。
         if (prefs.getString("ip", "")?.isNotEmpty() == true) {
             startAr()
+        } else {
+            Toast.makeText(this, "请先在主界面填写眼镜 IP", Toast.LENGTH_SHORT).show()
+            finish()
         }
 
         camThread = HandlerThread("cam-bg").also { it.start() }
@@ -1781,16 +1775,14 @@ class ArActivity : Activity() {
 
     private fun startAr() {
         android.util.Log.i("ar-ui", "startAr")
-        val ip = ipEdit.text.toString().trim()
+        val ip = prefs.getString("ip", "")!!.trim()
         if (!Patterns.IP_ADDRESS.matcher(ip).matches()) {
-            Toast.makeText(this, "请输入有效的 IP 地址", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "请先在主界面填写眼镜 IP", Toast.LENGTH_SHORT).show()
+            finish()
             return
         }
-        prefs.edit().putString("ip", ip).apply()
 
-        settingsPanel.visibility = android.view.View.GONE
         arPanel.visibility = android.view.View.VISIBLE
-        progressView.visibility = android.view.View.VISIBLE
         playing = true
         frontActive = true      // 会话活动标记：maybeStartFrontPlayer 的启动门槛
         attachFrontGlIfLive()   // 同 Activity 重连必须补挂 GL 输出（见函数注释）
@@ -1851,8 +1843,7 @@ class ArActivity : Activity() {
         if (!frontActive || frontPlayer != null) return
         val g = frontGl ?: return   // GL 面未就绪：surfaceChanged/attach 回调会再触发
         android.util.Log.i("ar-ui", "maybeStartFrontPlayer")
-        val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
-        if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
+        val ip = prefs.getString("ip", null) ?: return
         glassesState = 1
         frontOverlaySeen = false   // 流看门狗按每次连接独立判定
         resetOverlay()             // 新会话清残留位图（GL 烘焙核心仅后摄使用）
@@ -1920,8 +1911,7 @@ class ArActivity : Activity() {
     private fun startRearPlayerIfReady() {
         if (!rearActive || rearPlayer != null) return
         val g = rearGl ?: return
-        val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
-        if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
+        val ip = prefs.getString("ip", null) ?: return
         g.reset()   // 重建两路输入面，清掉上一会话残留帧
         val useGlBake = glBakeEnabled()
         val useSr = useGlBake && glSrEnabled()
@@ -1978,14 +1968,12 @@ class ArActivity : Activity() {
             frontGlAttached = null
             frontGl?.setActive(false)
             exitRearMode()
-            arPanel.visibility = android.view.View.GONE
-            settingsPanel.visibility = android.view.View.VISIBLE
-            progressView.visibility = android.view.View.GONE
             findViewById<android.view.View>(R.id.bottom_controls).visibility = android.view.View.GONE
             lastRecBtnShow = false
             glassesState = 0
-            showStatusText(msg)
             restoreFrontMode()
+            // 连接设置 UI 已移除（连接由主界面发起）：收尾完成即返回主界面
+            finish()
         }
     }
 
@@ -2010,6 +1998,13 @@ class ArActivity : Activity() {
         teardownToSettings("")
     }
 
+    /** 返回主界面（显式启动，保证后台记录被系统回收时仍落在主界面而非桌面）。 */
+    private fun goMain() {
+        startActivity(android.content.Intent(this, MainActivity::class.java)
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP))
+        finish()
+    }
+
     /** 恢复前摄 AR 基准态：隐藏 GL 合成面、重开手机前摄。退出预览/断连时调用。 */
     private fun restoreFrontMode() {
         frontCamera = true
@@ -2030,7 +2025,6 @@ class ArActivity : Activity() {
             android.util.Log.i("ar-ui", "front onConnect")
             glassesState = 2
             runOnUiThread {
-                progressView.visibility = android.view.View.GONE
                 showStatusText(statusTextFor())
             }
             // 流看门狗：连接成功但 server 被杀/挂死时不会有任何错误回调，
@@ -2084,7 +2078,6 @@ class ArActivity : Activity() {
         override fun onConnect() {
             glassesState = 2
             runOnUiThread {
-                progressView.visibility = android.view.View.GONE
                 showStatusText(statusTextFor())
             }
         }
@@ -2110,9 +2103,9 @@ class ArActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (playing) {
-            exitAr()
+            exitAr()   // 内部走 teardownToSettings → goMain()
         } else {
-            finish()
+            goMain()
         }
     }
 

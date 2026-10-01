@@ -4,61 +4,6 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 连接设置 -->
-    <LinearLayout
-        android:id="@+id/settings_panel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center_vertical"
-        android:orientation="vertical"
-        android:padding="32dp">
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center_horizontal"
-            android:text="AR 试验模式"
-            android:textColor="#FFFFFF"
-            android:textSize="22sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:layout_gravity="center_horizontal"
-            android:gravity="center"
-            android:text="仅拉取 overlay 画面，用手机摄像头追踪人脸，\n把 overlay 绘制在人脸正前方（试验性）"
-            android:textColor="#99FFFFFF"
-            android:textSize="13sp" />
-
-        <EditText
-            android:id="@+id/ip_address"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:hint="眼镜 IP 地址"
-            android:imeOptions="actionDone"
-            android:inputType="text"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#66FFFFFF" />
-
-        <Button
-            android:id="@+id/button_connect"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="连接" />
-
-        <ProgressBar
-            android:id="@+id/progress_bar"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center_horizontal"
-            android:layout_marginTop="24dp"
-            android:visibility="gone" />
-    </LinearLayout>
-
     <!-- AR 画面：SurfaceView，相机帧 + 检测/姿态/overlay 全部画在同一 Canvas 上
          （与 ncnn-benchmark CameraActivity 同架构：所见即所测） -->
     <FrameLayout
