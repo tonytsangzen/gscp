@@ -118,8 +118,8 @@ class MainActivity : AppCompatActivity() {
 
         ipEdit.setText(prefs.getString("ip", ""))
         settingsButton.setOnClickListener { openSettingsDialog() }
-        connectButton.setOnClickListener { connect() }
-        findViewById<Button>(R.id.button_ar).setOnClickListener {
+        // AR 模式是唯一连接模式：「连接」直接进入 AR（原普通投屏 connect() 不再从 UI 触发）
+        connectButton.setOnClickListener {
             startActivity(android.content.Intent(this, ArActivity::class.java))
         }
     }

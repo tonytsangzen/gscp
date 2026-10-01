@@ -351,6 +351,12 @@ class ArActivity : Activity() {
         }
         ipEdit.setText(prefs.getString("ip", ""))
         loadRecentLastVideo()            // 左侧显示上次录像缩略图（跨会话）
+        // AR 是唯一连接模式：已配置过 IP 的启动直接进入会话（主页「连接」一键
+        // 直达预览）；未配置时停在设置面板等输入。teardown 回面板后不会重复触发
+        // （仅 onCreate 执行一次）。
+        if (prefs.getString("ip", "")?.isNotEmpty() == true) {
+            startAr()
+        }
 
         camThread = HandlerThread("cam-bg").also { it.start() }
         camHandler = Handler(camThread!!.looper)
