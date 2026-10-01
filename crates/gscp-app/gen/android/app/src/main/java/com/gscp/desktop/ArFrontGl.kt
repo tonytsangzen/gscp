@@ -91,6 +91,13 @@ class ArFrontGl(
     @Volatile private var released = false
     // face0 17 值（overlay 四角 8 + 背板 8 + 距离），直立图像坐标；camW/H = 直立尺寸
     @Volatile private var face: FloatArray? = null
+    // 锚点渲染侧指数平滑（一阶低通，τ≈70ms）：锚点率(~20fps，Vulkan 退化时更低)
+    // 低于渲染率(30fps)时阶梯跟随 + 速度外推在噪声锚点上会抖——改为渲染帧指数
+    // 趋近最新锚点：无过冲、天然消检测噪声，代价是固定 ~70ms 平滑延迟。
+    // native 的 One-Euro 已滤锚点噪声，此级只做时间维度的连续化。
+    private val faceRender = FloatArray(17)
+    private var faceRenderValid = false
+    private var lastRenderAt = 0L
     @Volatile private var camW = 0
     @Volatile private var camH = 0
 
@@ -265,6 +272,7 @@ class ArFrontGl(
     /** 人脸锚点状态（face0 17 值或 null）+ 直立相机尺寸。 */
     fun setFace(ov17: FloatArray?, w: Int, h: Int) {
         face = ov17
+        if (ov17 == null || w != camW || h != camH) faceRenderValid = false   // 复位：下一帧直接吸附
         camW = w
         camH = h
     }
@@ -473,7 +481,21 @@ class ArFrontGl(
             GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
         }
 
-        val ov = face ?: return
+        var ov = face ?: return
+        // 锚点指数平滑：每渲染帧向最新锚点趋近 1-e^(-dt/τ)。锚点率低于渲染率时
+        // 填平间隔（不再阶梯），检测噪声被低通（不再抖）；锚点停滞时输出冻结
+        // 在最后位置平滑停住（无过冲无回跳）。
+        val now = android.os.SystemClock.uptimeMillis()
+        val dt = (now - lastRenderAt).coerceIn(1L, 100L).toFloat()
+        lastRenderAt = now
+        if (!faceRenderValid || faceRender.size != ov.size) {
+            System.arraycopy(ov, 0, faceRender, 0, ov.size)
+            faceRenderValid = true
+        } else {
+            val k = 1f - kotlin.math.exp(-dt / 70f)
+            for (i in ov.indices) faceRender[i] += (ov[i] - faceRender[i]) * k
+        }
+        ov = faceRender
         if (w <= 0 || h <= 0) return
         // overlay 内容四角（canvas px；与旧 mapX/mapY 一致的前置镜像）
         val sc = minOf(width.toFloat() / w, height.toFloat() / h)

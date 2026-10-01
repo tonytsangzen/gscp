@@ -192,6 +192,7 @@ class ArActivity : Activity() {
     // 预览/检测解耦：检测在 det 线程背靠背串行（detBusy），输入快照在
     // camHandler 拷贝（det 线程只读）
     private val detBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var detShutdown = false   // onDestroy 后相机回调不得再投递 det 任务
     private var dY: ByteArray? = null
     private var dU: ByteArray? = null
     private var dV: ByteArray? = null
@@ -638,10 +639,10 @@ class ArActivity : Activity() {
         // 检测 = det 线程背靠背跑满（与原管线同节奏，锚点 ~22fps；detBusy 串行 +
         // 输入快照防撕裂），只影响锚点刷新率，不再拖累预览。
         processPreview()
-        if (!detBusy.get()) {
+        if (!detShutdown && !detBusy.get()) {
             snapshotPlanesForDetect()
             val rot = currentRot()
-            det.execute { runDetect(rot) }
+            try { det.execute { runDetect(rot) } } catch (_: java.util.concurrent.RejectedExecutionException) {}
         }
     }
 
@@ -2120,6 +2121,7 @@ class ArActivity : Activity() {
         val fp = frontPlayer
         frontPlayer = null
         if (fp != null) Thread { try { fp.stop() } catch (_: Exception) {} }.start()
+        detShutdown = true
         det.shutdown()
         openExec.shutdown()
         resetOverlay()
