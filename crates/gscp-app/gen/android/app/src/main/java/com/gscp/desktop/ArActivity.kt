@@ -74,10 +74,9 @@ class ArActivity : Activity() {
     private lateinit var progressView: android.view.View
     private lateinit var ipEdit: EditText
 
-    private var connection: ScrcpyConnection? = null
-    // 眼镜端音频：Opus 解码 → AudioTrack 外放（录像只录手机麦克风，不接解码 PCM）
-    private var glassesAudio: AudioPlayer? = null
-    private var overlayDecoder: VideoDecoder? = null
+    // 前摄 overlay 会话（后摄同款 GlassesPlayer 管线，overlayOnly 连接）：
+    // 连接/解码/音频生命周期全部由 player 自管，ArActivity 只消费事件。
+    private var frontPlayer: GlassesPlayer? = null
     private val overlayLock = Any()
     private var overlayBmp: Bitmap? = null
     private var overlayPix: IntArray? = null
@@ -182,7 +181,17 @@ class ArActivity : Activity() {
     private var audioEnabled = true
 
     private val detectOn = true
-    private val backendIdx = 2      // Vulkan FP16（自动调优，失败回退 CPU FP32）
+    private var detLogTick = 0L
+    // 检测后端：默认 CPU FP32。真机取证（vivo Mali）：ncnn Vulkan 检测与 overlay
+    // GL 烘焙并发 ~3.5s 后 Vulkan 队列楔死（det 线程 native 空转、锚点停更、相机
+    // 画面冻结）；后摄无检测故不受影响。debug.gscp.detgpu=1 切回 Vulkan FP16 A/B。
+    private val backendIdx: Int = systemPropInt("debug.gscp.detgpu", 0)
+
+    private fun systemPropInt(key: String, def: Int): Int = try {
+        val sp = Class.forName("android.os.SystemProperties")
+        val get = sp.getMethod("get", String::class.java, String::class.java)
+        (get.invoke(null, key, def.toString()) as String).trim().toIntOrNull() ?: def
+    } catch (_: Throwable) { def }
     private var playing = false
     private var openSent = false
     private var dbgFrames = 0
@@ -282,6 +291,7 @@ class ArActivity : Activity() {
                     g.attachOutputSurface(s)
                 }
                 g.setActive(frontCamera)
+                maybeStartFrontPlayer()   // 后摄同款：GL 面就绪 → 起会话
             }
 
             override fun surfaceDestroyed(h: SurfaceHolder) {
@@ -676,9 +686,17 @@ class ArActivity : Activity() {
                 b
             }
 
+            val detT0 = android.os.SystemClock.uptimeMillis()
             val j = ArNative.nativeFaceDetect(
                 yBuf!!, uBuf!!, vBuf!!, frameW, frameH,
                 yStride, uStride, vStride, uPix, vPix, rot, detectOn, rb)
+            val detMs = android.os.SystemClock.uptimeMillis() - detT0
+            if (detMs > 3000) {
+                // 卡死取证：单次检测超 3s（正常 5~60ms）——每 3s 记一条直到返回
+                android.util.Log.w(TAG, "det STUCK ${detMs}ms (Vulkan/GL 并发楔死?)")
+            } else if (++detLogTick % 150L == 1L) {
+                android.util.Log.i(TAG, "det ${detMs}ms/frame")
+            }
 
             if (++dbgFrames <= 3)
                 android.util.Log.i(TAG, "frame#$dbgFrames rot=$rot upright=${rw}x$rh json=" +
@@ -1684,9 +1702,10 @@ class ArActivity : Activity() {
         arPanel.visibility = android.view.View.VISIBLE
         progressView.visibility = android.view.View.VISIBLE
         playing = true
+        frontActive = true      // 会话活动标记：maybeStartFrontPlayer 的启动门槛
         attachFrontGlIfLive()   // 同 Activity 重连必须补挂 GL 输出（见函数注释）
         updateRecBtnVisible()   // 进入预览 → 显示底部三键（缩略图-录像-切换）
-        startFrontConnection()
+        maybeStartFrontPlayer()
         showStatusText(statusTextFor())
         // 预览就绪后后台预热录像编码器，避免首次点录像时偶发 1~5s 初始化
         camHandler?.postDelayed({
@@ -1714,6 +1733,7 @@ class ArActivity : Activity() {
             frontGlAttached = s
             g.attachOutputSurface(s)
             g.setActive(frontCamera)
+            maybeStartFrontPlayer()   // surface 有效直挂路径同样要起会话
             return
         }
         // 表面已失效且回调不会重发：强制重建
@@ -1733,22 +1753,36 @@ class ArActivity : Activity() {
     // 也无错误回调，界面卡死在"连接中"（返回→再连接 100% 复现的根因）。
     @Volatile private var scrcpyShutdown: Thread? = null
 
-    /** 起前摄 overlay-only 连接（CPU overlay 帧供人脸锚点投影）。
-     *  connectAsync 挪到工作线程，先等旧会话收尾完成。 */
-    private fun startFrontConnection() {
-        android.util.Log.i("ar-ui", "startFrontConnection")
+    /** 起前摄会话：后摄同款 GlassesPlayer 管线 + overlayOnly 连接（手机画面由
+     *  Camera2 提供，不消费眼镜视频流）。前置条件 = frontGl 已建（cameraView
+     *  surfaceChanged / attachFrontGlIfLive 重建后都会再调本函数）；connect 挪到
+     *  工作线程，先等旧会话收尾完成（防 killall 误杀新 server）。 */
+    private fun maybeStartFrontPlayer() {
+        if (!frontActive || frontPlayer != null) return
+        val g = frontGl ?: return   // GL 面未就绪：surfaceChanged/attach 回调会再触发
+        android.util.Log.i("ar-ui", "maybeStartFrontPlayer")
         val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
-        frontActive = true
         glassesState = 1
         frontOverlaySeen = false   // 流看门狗按每次连接独立判定
-        overlayDecoder = VideoDecoder()
-        val newConn = ScrcpyConnection(this, audioEnabled = audioEnabled, overlayOnly = true)
-        connection = newConn
+        resetOverlay()             // 与后摄 g.reset() 同位：新会话清残留（位图 + 烘焙核心）
+        val useGlBake = glBakeEnabled()
+        val useSr = useGlBake && glSrEnabled()
+        val player = GlassesPlayer(
+            this, g, audioEnabled, bottomRotationDeg, bottomMirror,
+            applySettings = { /* 前摄不消费 RearComposer 的视频参数 */ },
+            events = frontEvents,
+            resetMixerOnStop = false,   // 合成器跨会话复用（与后摄同理由）
+            overlayImageCallback = if (useGlBake) null else { img -> convertOverlayFrame(img) },
+            overlaySr = useSr,
+            overlaySrWeights = if (useSr) srWeights() else null,
+            overlayOnly = true,
+        )
+        frontPlayer = player
         val waiter = scrcpyShutdown
         Thread {
             try { waiter?.join(5000) } catch (_: InterruptedException) {}
-            newConn.connectAsync(ip, 5555, callback)
+            player.connect(ip)
         }.start()
     }
 
@@ -1758,6 +1792,7 @@ class ArActivity : Activity() {
         frontCamera = true
         frontActive = true
         glassesState = 1
+        frontOverlaySeen = false
         camHandler?.post { closeCameraNow(); startCamera() }
         glSurface.visibility = android.view.View.GONE
         frontGl?.setActive(true)   // 前摄 GL 合成恢复上屏
@@ -1768,7 +1803,7 @@ class ArActivity : Activity() {
         if (old != null) {
             scrcpyShutdown = Thread { try { old.stop() } catch (_: Exception) {} }.also { it.start() }
         }
-        startFrontConnection()
+        maybeStartFrontPlayer()
         showStatusText(statusTextFor())
     }
 
@@ -1781,20 +1816,13 @@ class ArActivity : Activity() {
         glSurface.visibility = android.view.View.VISIBLE   // surfaceChanged → ensureRearGl → startRearPlayerIfReady
         frontGl?.setActive(false)   // 前摄 GL 合成停画（只清黑，垫在 3:4 GL 面之下）
         showStatusText("后摄：连接眼镜画面…")
-        val oldConn = connection
-        val oldDec = overlayDecoder
-        connection = null
-        overlayDecoder = null
+        val oldFront = frontPlayer
+        frontPlayer = null
         frontActive = false
-        if (oldConn != null || oldDec != null) {
-            scrcpyShutdown = Thread {
-                try { oldConn?.disconnect() } catch (_: Exception) {}
-                try { oldDec?.stop() } catch (_: Exception) {}
-            }.also { it.start() }
+        if (oldFront != null) {
+            scrcpyShutdown = Thread { try { oldFront.stop() } catch (_: Exception) {} }.also { it.start() }
         }
         startRearPlayerIfReady()
-        try { glassesAudio?.stop() } catch (_: Exception) {}
-        glassesAudio = null
         resetOverlay()
     }
 
@@ -1849,8 +1877,11 @@ class ArActivity : Activity() {
         runOnUiThread {
             watchdogRunnable?.let { recTimerHandler.removeCallbacks(it) }
             if (recorder?.recording == true) stopRec()
-            overlayDecoder?.stop()
-            overlayDecoder = null
+            val fp = frontPlayer
+            frontPlayer = null
+            if (fp != null) {
+                scrcpyShutdown = Thread { try { fp.stop() } catch (_: Exception) {} }.also { it.start() }
+            }
             resetOverlay()
             // 同步摘除前摄 GL 输出（不等 surfaceDestroyed 的滞后回调）：
             // 否则过渡帧里旧 AR 画面/连接提示会叠在已显示的设置页上
@@ -1860,7 +1891,6 @@ class ArActivity : Activity() {
             exitRearMode()
             arPanel.visibility = android.view.View.GONE
             settingsPanel.visibility = android.view.View.VISIBLE
-            connection = null   // 回设置页后旧连接对象不再持有（重连会新建）
             progressView.visibility = android.view.View.GONE
             findViewById<android.view.View>(R.id.bottom_controls).visibility = android.view.View.GONE
             lastRecBtnShow = false
@@ -1885,14 +1915,8 @@ class ArActivity : Activity() {
         android.util.Log.i("ar-ui", "exitAr")
         playing = false
         frontActive = false
-        val c = connection
-        connection = null
-        // 收尾线程登记：下次连接先等 killall 完成（防误杀新 server 卡死在连接中）
-        if (c != null) {
-            scrcpyShutdown = Thread { try { c.disconnect() } catch (_: Exception) {} }.also { it.start() }
-        }
-        try { glassesAudio?.stop() } catch (_: Exception) {}
-        glassesAudio = null
+        // 前摄 player 收尾登记在 teardownToSettings（scrcpyShutdown 串行，
+        // 下次连接先等 killall 完成——防误杀新 server 卡死在连接中）
         teardownToSettings("")
     }
 
@@ -1907,10 +1931,11 @@ class ArActivity : Activity() {
         }
     }
 
-    // ── 前摄子系统回调：overlay-only 连接（无视频流），overlay CPU 帧供人脸投影 ──
+    // ── 前摄子系统事件（GlassesPlayer overlayOnly 管线；解码/音频接线在 player 内，
+    //  这里只消费状态：看门狗布防、overlay 流到达标记、诊断计数与 GL 产物转储）──
     @Volatile private var frontOverlaySeen = false   // 流看门狗：onOverlayPrepare 已到
     private var watchdogRunnable: Runnable? = null   // 看门狗句柄：换连接/收尾时必须撤销
-    private val callback = object : ScrcpyConnection.EventCallback {
+    private val frontEvents = object : GlassesPlayer.Events {
         override fun onConnect() {
             android.util.Log.i("ar-ui", "front onConnect")
             glassesState = 2
@@ -1933,91 +1958,22 @@ class ArActivity : Activity() {
             recTimerHandler.postDelayed(wd, 8000)
         }
 
-        override fun onVideoPrepare(codec: String, width: Int, height: Int) {}
-        override fun onVideoPackage(buffer: ByteArray, offset: Int, length: Int) {}
-
-        override fun onAudioPrepare(codec: String) {
-            // 与 onAudioConfig 同在音频 Handler 线程上顺序执行，须在此同步建好播放器，
-            // 不能再走 UI 线程（否则 onAudioConfig 先到会拿不到 glassesAudio）。
-            try {
-                val prev = glassesAudio
-                try { prev?.stop() } catch (_: Exception) {}
-                glassesAudio = AudioPlayer()
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "眼镜音频就绪失败", e)
-            }
-        }
-
-        override fun onAudioConfig(csd0: ByteArray) {
-            try {
-                val ap = glassesAudio
-                if (ap != null) ap.start(csd0) else android.util.Log.w(TAG, "audio config 无播放器，丢弃")
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "眼镜音频配置失败", e)
-            }
-        }
-
-        override fun onAudioPackage(buffer: ByteArray, offset: Int, length: Int) {
-            try {
-                glassesAudio?.play(buffer, offset, length)
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "眼镜音频播放中断", e)
-            }
-        }
-
-        override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
-            android.util.Log.i("ar-ui", "overlayPrepare")
+        override fun onOverlayPrepare(width: Int, height: Int) {
             frontOverlaySeen = true   // 流看门狗：overlay 流已到达
             runOnUiThread {
                 showStatusText("overlay ${width}×${height}，请正对手机摄像头")
-                try {
-                    if (overlayDecoder != null) {
-                        runCatching { overlayDecoder?.stop() }   // 重连/复用前停掉旧解码器
-                        overlayDecoder = null
-                    }
-                    resetOverlay()
-                    val od = VideoDecoder()
-                    var glOk = false
-                    if (glBakeEnabled()) {
-                        // GPU 烘焙：解码直写 ArFrontGl 内烘焙核心的输入面（零 CPU 逐像素）；
-                        // debug.gscp.ovsr=1 时核心内部先过 GL 原生 ESPCN ×2 再键控
-                        try {
-                            val sr = glSrEnabled()
-                            val surface = frontGl?.openOverlayStream(width, height, sr, srWeights())
-                                ?: throw IllegalStateException("frontGl 未就绪")
-                            od.start(width, height, surface)
-                            glOk = true
-                            android.util.Log.i("ar-ui", "overlay decode -> gl bake" + if (sr) "+sr" else "")
-                        } catch (e: Exception) {
-                            android.util.Log.w(TAG, "overlay gl-bake 建流失败，回退 CPU 烘焙", e)
-                        }
-                    }
-                    if (!glOk) {
-                        // 无 Surface 解码：getOutputImage 给出 CPU 可读 I420（绕开厂商平铺格式）
-                        od.frameCallback = { img -> convertOverlayFrame(img) }
-                        od.start(width, height, null)
-                    }
-                    overlayDecoder = od
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "overlay prepare 失败", e)
-                }
             }
         }
 
-        override fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int) {
-            try {
-                val n = ++diagOverlayPkg
-                if (n % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$n ${length}B")
-                // GL 烘焙路径的产物转储（与 CPU 路径 convertOverlayFrame 内的转储同节拍，
-                // debug.gscp.dumpoverlay 语义：100/200/300 包各转储一批 content/glow/far）
-                if (glBakeEnabled() && diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
-                    dumpCount++
-                    val dir = getExternalFilesDir(null)?.absolutePath
-                    if (dir != null) frontGl?.dumpOverlay("$dir/ovgl_dump_${dumpCount}")
-                }
-                overlayDecoder?.decode(buffer, offset, length)
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "overlay 解码中断", e)
+        override fun onOverlayPackage(seq: Long) {
+            diagOverlayPkg = seq
+            if (seq % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$seq")
+            // GL 烘焙路径的产物转储（与 CPU 路径 convertOverlayFrame 内的转储同节拍，
+            // debug.gscp.dumpoverlay 语义：100/200/300 包各转储一批 content/glow/far）
+            if (glBakeEnabled() && seq >= 100L * (dumpCount + 1) && dumpCount < 3) {
+                dumpCount++
+                val dir = getExternalFilesDir(null)?.absolutePath
+                if (dir != null) frontGl?.dumpOverlay("$dir/ovgl_dump_${dumpCount}")
             }
         }
 
@@ -2081,11 +2037,13 @@ class ArActivity : Activity() {
         playing = false
         frontActive = false
         rearActive = false
-        connection?.disconnect()
         stopCamera()
-        val player = rearPlayer
+        val rp = rearPlayer
         rearPlayer = null
-        if (player != null) Thread { try { player.stop() } catch (_: Exception) {} }.start()
+        if (rp != null) Thread { try { rp.stop() } catch (_: Exception) {} }.start()
+        val fp = frontPlayer
+        frontPlayer = null
+        if (fp != null) Thread { try { fp.stop() } catch (_: Exception) {} }.start()
         det.shutdown()
         openExec.shutdown()
         resetOverlay()

@@ -1,6 +1,7 @@
 package com.gscp.desktop
 
 import android.graphics.Bitmap
+import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -35,7 +36,50 @@ class ArFrontGl(
     val height: Int,
     /** 每拍取 overlay 内容快照（GL 线程调用；实现方持锁回调，位图仅在回调内有效）。 */
     private val overlays: WithOverlays,
-) {
+) : RearComposer {
+    // ── RearComposer（后摄同款 GlassesPlayer 管线的合成器面）────────────
+    // 前摄连接为 overlayOnly（无视频流）：bottom/top 输入面不被消费，给 1×1 占位；
+    // overlay 走覆写的 openOverlayStream（GPU 烘焙核心）。视频参数 setter 均不消费。
+    private var placeholderTex = 0
+    private var placeholderSt: SurfaceTexture? = null
+    private var placeholderSurface: Surface? = null
+
+    override fun getBottomSurface(): Surface = placeholderSurface
+        ?: throw IllegalStateException("frontGl placeholder surface 未初始化（GL 线程未就绪）")
+
+    override fun getTopSurface(): Surface = getBottomSurface()
+
+    override fun setBottomAspectRatio(ratio: Float) {}
+    override fun setBottomRotation(rotation: Float, mirror: Boolean) {}
+    override fun setTopAspectRatio(ratio: Float) {}
+    override fun setOverlayScale(scale: Float) {}
+    override fun setOverlayParams(
+        alpha: Float, brightness: Float, saturation: Float, dim: Float,
+        keyLow: Float, keyHigh: Float, featherPower: Float, featherRadiusPx: Int,
+    ) {}
+    override fun setBaseBrightness(value: Float) {}
+    override fun setTopRotation(rotationDeg: Int, mirror: Boolean) {}
+
+    /** 会话收尾：关 GPU 烘焙核心（CPU 烘焙位图/版本由 ArActivity.resetOverlay 复位）。 */
+    override fun reset() {
+        closeOverlayStream()
+    }
+
+    /** 1×1 占位输入面（GL 线程创建； GlassesPlayer overlayOnly 流程不会消费）。 */
+    private fun createPlaceholderSurface() {
+        val t = IntArray(1)
+        GLES20.glGenTextures(1, t, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, t[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, 1, 1, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+        placeholderTex = t[0]
+        val st = SurfaceTexture(t[0])
+        st.setDefaultBufferSize(1, 1)
+        placeholderSt = st
+        placeholderSurface = Surface(st)
+    }
     fun interface WithOverlays {
         fun snapshot(action: (content: Bitmap?, glow: Bitmap?, bloom: Bitmap?, version: Int) -> Unit)
     }
@@ -162,6 +206,7 @@ class ArFrontGl(
                 intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
             EGL14.eglMakeCurrent(eglDisplay, pbSurface, pbSurface, eglContext)
             initGl()
+            createPlaceholderSurface()
 
             renderFrame()
         }
@@ -229,7 +274,7 @@ class ArFrontGl(
      * 纹理直接可用），同步返回解码输入面。与 CPU 烘焙互斥（见 debug.gscp.ovgl）。
      * sr=true：核心内部先过 GL 原生 ESPCN ×2 超分（失败自动退回非 SR）。
      */
-    fun openOverlayStream(streamW: Int, streamH: Int, sr: Boolean = false, srWeights: ByteArray? = null): Surface {
+    override fun openOverlayStream(streamW: Int, streamH: Int, sr: Boolean, srWeights: ByteArray?): Surface {
         val latch = java.util.concurrent.CountDownLatch(1)
         var surface: Surface? = null
         handler.post {
@@ -314,6 +359,14 @@ class ArFrontGl(
             }
             baker?.let { runCatching { it.release() } }
             baker = null
+            placeholderSurface?.release()
+            placeholderSurface = null
+            placeholderSt?.release()
+            placeholderSt = null
+            if (placeholderTex != 0) {
+                GLES20.glDeleteTextures(1, intArrayOf(placeholderTex), 0)
+                placeholderTex = 0
+            }
             val texs = intArrayOf(camTex, contentTex, glowTex, bloomTex)
             GLES20.glDeleteTextures(texs.size, texs, 0)
             camTex = 0; contentTex = 0; glowTex = 0; bloomTex = 0

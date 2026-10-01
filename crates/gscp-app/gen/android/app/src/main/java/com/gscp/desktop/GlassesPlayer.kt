@@ -31,11 +31,22 @@ class GlassesPlayer(
     /** sr=true：GPU 烘焙核心启用 GL 原生 ESPCN ×2 超分（debug.gscp.ovsr）。 */
     private val overlaySr: Boolean = false,
     private val overlaySrWeights: ByteArray? = null,
+    /** overlay-only 连接（AR 前摄同款）：不向 server 请求视频流（画面由手机
+     *  相机提供），仅 overlay(+audio)；getBottomSurface 不被消费。 */
+    private val overlayOnly: Boolean = false,
 ) {
     interface Events {
         fun onConnect()
         fun onDisconnect()
         fun onError()
+
+        /** overlay 流就绪（scrcpy 线程；解码器接线前后均会触发）。
+         *  前摄用于流看门狗布防/状态提示；后摄默认不消费。 */
+        fun onOverlayPrepare(width: Int, height: Int) {}
+
+        /** overlay 网络包（scrcpy 线程；seq 为本会话 1 起计数）。
+         *  前摄用于诊断计数与 GL 烘焙产物转储节拍；后摄默认不消费。 */
+        fun onOverlayPackage(seq: Long) {}
     }
 
     private var connection: ScrcpyConnection? = null
@@ -51,8 +62,8 @@ class GlassesPlayer(
         audioPlayer = AudioPlayer()
         // 单连接完整流（Rokid 眼镜实测无法并存两个 server：视频 server 开相机后
         // overlay server 的采集流会被关闭）。overlay 流为按需帧（UI 变化才发），
-        // 显示端保留最后一帧即可（前摄语义）。
-        connection = ScrcpyConnection(context, audioEnabled)
+        // 显示端保留最后一帧即可（前摄语义）。overlayOnly 时 server 不给视频流。
+        connection = ScrcpyConnection(context, audioEnabled, overlayOnly)
         connection!!.connectAsync(ip, port, callback)
     }
 
@@ -101,6 +112,7 @@ class GlassesPlayer(
         private var overlayPkg = 0L
         override fun onOverlayPrepare(codec: String, width: Int, height: Int) {
             android.util.Log.i("ar-ui", "rear overlayPrepare $codec ${width}x$height")
+            events.onOverlayPrepare(width, height)
             synchronized(platformLock) {
                 mixer.setTopAspectRatio(width.toFloat() / height)
                 if (overlayImageCallback != null) {
@@ -117,7 +129,9 @@ class GlassesPlayer(
         }
 
         override fun onOverlayPackage(buffer: ByteArray, offset: Int, length: Int) {
-            if (++overlayPkg % 50L == 1L) android.util.Log.i("ar-ui", "rear overlayPkg #$overlayPkg ${length}B")
+            val seq = ++overlayPkg
+            if (seq % 50L == 1L) android.util.Log.i("ar-ui", "rear overlayPkg #$seq ${length}B")
+            events.onOverlayPackage(seq)
             overlayDecoder?.decode(buffer, offset, length)
         }
 
