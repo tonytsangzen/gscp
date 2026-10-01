@@ -1673,3 +1673,228 @@ Java_com_gscp_desktop_ArNative_nativeFaceDetect(
     j += "]}";
     return env->NewStringUTF(j.c_str());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// overlay 超分（ncnn-benchmark sr_benchmark ESPCN x2 灰度，单色文字目标域训练）：
+// 480² 亮度 → 960² 亮度；色度仍走 GL 双线性（luma-SR + 色度移植是文字超分标准做法）。
+// 独立 g_srMutex：SR 在 GL 线程调用，不得与检测线程的 g_mutex 互相阻塞。
+// 后端：Vulkan 优先（小卷积网 CPU 4 线程 ~10ms/帧偏重），失败按蓝本回退
+// safe-CPU（fp32/普通卷积/多线程；真机对 pnnx 模型有 SIGSEGV 前科，见
+// ensurePoseNets 注释）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+static ncnn::Net* g_srNet = nullptr;
+static std::mutex g_srMutex;
+static const char* kSrParam = "espcn_x2.ncnn.param";
+static const char* kSrBin = "espcn_x2.ncnn.bin";
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_gscp_desktop_ArNative_nativeSrOpen(
+    JNIEnv* env, jobject, jobject assets, jint threads, jboolean wantVulkan)
+{
+    std::lock_guard<std::mutex> lk(g_srMutex);
+    if (g_srNet) { delete g_srNet; g_srNet = nullptr; }
+    AAssetManager* am = assets ? AAssetManager_fromJava(env, assets) : nullptr;
+    if (!am) return env->NewStringUTF("{\"ok\":false,\"err\":\"no_assets\"}");
+    std::vector<unsigned char> p = readAsset(am, kSrParam);
+    std::vector<unsigned char> b = readAsset(am, kSrBin);
+    if (p.empty() || b.empty()) return env->NewStringUTF("{\"ok\":false,\"err\":\"assets_missing\"}");
+    std::string param((const char*)p.data(), p.size());
+    param.push_back('\0');
+
+    // Vulkan 设备进程级只取一次（与 ensurePoseNets 同款；SR 独立使用时也生效）
+    static std::once_flag srVkOnce;
+    std::call_once(srVkOnce, [] { if (!g_vk) g_vk = ncnn::get_gpu_device(0); });
+
+    if (wantVulkan == JNI_TRUE && g_vk) {
+        ncnn::Net* net = new ncnn::Net;
+        net->opt.lightmode = true;
+        net->opt.num_threads = 1;
+        net->opt.use_vulkan_compute = true;
+        // 真机 Mali 实测：本模型 Vulkan fp16 损坏，默认 fp32（SR_VK_FP16=1 实验用）
+        net->opt.use_fp16_packed = false;
+        net->opt.use_fp16_storage = false;
+        net->opt.use_fp16_arithmetic = false;
+        if (const char* e = getenv("SR_VK_FP16"); e && e[0] == '1') {
+            net->opt.use_fp16_packed = true;
+            net->opt.use_fp16_storage = true;
+            net->opt.use_fp16_arithmetic = true;
+            LOGI("sr vulkan fp16 experiment");
+        }
+        net->opt.use_packing_layout = true;
+        net->opt.use_shader_local_memory = false;
+        ncnn::VkBlobAllocator* vb = new ncnn::VkBlobAllocator(g_vk);
+        ncnn::VkStagingAllocator* vs = new ncnn::VkStagingAllocator(g_vk);
+        net->opt.blob_vkallocator = vb;
+        net->opt.workspace_vkallocator = vb;
+        net->opt.staging_vkallocator = vs;
+        net->set_vulkan_device(g_vk);
+        if (net->load_param_mem(param.c_str()) == 0) {
+            const unsigned char* mem = b.data();
+            ncnn::DataReaderFromMemory dr(mem);
+            if (net->load_model(dr) == 0) {
+                g_srNet = net;
+                LOGI("sr net on vulkan");
+                return env->NewStringUTF("{\"ok\":true,\"backend\":\"vulkan\",\"scale\":2}");
+            }
+        }
+        delete net;
+        LOGE("sr vulkan load failed, fallback cpu");
+    }
+
+    // safe-CPU：fp32 + 普通卷积（pnnx 模型真机稳健配置），线程数可配
+    ncnn::Net* net = new ncnn::Net;
+    net->opt.lightmode = true;
+    net->opt.num_threads = threads > 0 ? threads : 4;
+    net->opt.use_fp16_storage = false;
+    net->opt.use_fp16_packed = false;
+    net->opt.use_fp16_arithmetic = false;
+    net->opt.use_sgemm_convolution = false;
+    net->opt.use_winograd_convolution = false;
+    net->opt.use_vulkan_compute = false;
+    if (net->load_param_mem(param.c_str()) != 0) { delete net; return env->NewStringUTF("{\"ok\":false,\"err\":\"load_param\"}"); }
+    const unsigned char* mem = b.data();
+    ncnn::DataReaderFromMemory dr(mem);
+    if (net->load_model(dr) != 0) { delete net; return env->NewStringUTF("{\"ok\":false,\"err\":\"load_model\"}"); }
+    g_srNet = net;
+    LOGI("sr net on safe cpu threads=%d", net->opt.num_threads);
+    return env->NewStringUTF("{\"ok\":true,\"backend\":\"cpu\",\"scale\":2}");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gscp_desktop_ArNative_nativeSrClose(JNIEnv*, jobject)
+{
+    std::lock_guard<std::mutex> lk(g_srMutex);
+    if (g_srNet) { delete g_srNet; g_srNet = nullptr; }
+}
+
+/** lumaIn = w*h 字节亮度；lumaOut = 4*w*h 字节（2x2 放大）。同线程串行调用。 */
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_gscp_desktop_ArNative_nativeSrProcess(
+    JNIEnv* env, jobject, jobject lumaIn, jint w, jint h, jobject lumaOut)
+{
+    std::lock_guard<std::mutex> lk(g_srMutex);
+    if (!g_srNet) return env->NewStringUTF("{\"ok\":false,\"err\":\"not_open\"}");
+    uint8_t* in = (uint8_t*)(lumaIn ? env->GetDirectBufferAddress(lumaIn) : nullptr);
+    uint8_t* out = (uint8_t*)(lumaOut ? env->GetDirectBufferAddress(lumaOut) : nullptr);
+    const jlong inCap = lumaIn ? env->GetDirectBufferCapacity(lumaIn) : 0;
+    const jlong outCap = lumaOut ? env->GetDirectBufferCapacity(lumaOut) : 0;
+    if (!in || !out || inCap < (jlong)w * h || outCap < (jlong)4 * w * h)
+        return env->NewStringUTF("{\"ok\":false,\"err\":\"bad_buffer\"}");
+
+    const double t0 = nowMs();
+    ncnn::Mat src(w, h, 1);
+    {
+        float* p = (float*)src.data;
+        for (int i = 0; i < w * h; i++) p[i] = in[i] * (1.0f / 255.0f);
+    }
+    ncnn::Extractor ex = g_srNet->create_extractor();
+    if (ex.input("in0", src) != 0)
+        return env->NewStringUTF("{\"ok\":false,\"err\":\"input\"}");
+    ncnn::Mat dst;
+    if (ex.extract("out0", dst) != 0 || dst.w != w * 2 || dst.h != h * 2)
+        return env->NewStringUTF("{\"ok\":false,\"err\":\"extract\"}");
+    const int ow = w * 2, oh = h * 2;
+    for (int y = 0; y < oh; y++) {
+        const float* row = dst.row(y);
+        uint8_t* orow = out + (size_t)y * ow;
+        for (int x = 0; x < ow; x++) {
+            float v = row[x] * 255.0f;
+            int i = (int)(v + 0.5f);
+            orow[x] = (uint8_t)(i < 0 ? 0 : (i > 255 ? 255 : i));
+        }
+    }
+    const double ms = nowMs() - t0;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"ms\":%.2f,\"w\":%d,\"h\":%d,\"ow\":%d,\"oh\":%d}",
+             ms, w, h, ow, oh);
+    return env->NewStringUTF(buf);
+}
+
+/** 文件路径加载变体：离线 app_process jar 测试用（无 AssetManager 上下文）。 */
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_gscp_desktop_ArNative_nativeSrOpenPath(
+    JNIEnv* env, jobject, jstring paramPath, jstring binPath, jint threads, jboolean wantVulkan)
+{
+    std::lock_guard<std::mutex> lk(g_srMutex);
+    if (g_srNet) { delete g_srNet; g_srNet = nullptr; }
+    const char* pp = env->GetStringUTFChars(paramPath, nullptr);
+    const char* bp = env->GetStringUTFChars(binPath, nullptr);
+    FILE* fp = fopen(pp, "rb");
+    FILE* fb = fopen(bp, "rb");
+    std::string param;
+    std::vector<unsigned char> b;
+    if (fp) {
+        char chunk[4096];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) param.append(chunk, n);
+        param.push_back('\0');
+        fclose(fp);
+    }
+    if (fb) {
+        unsigned char chunk[4096];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof(chunk), fb)) > 0) b.insert(b.end(), chunk, chunk + n);
+        fclose(fb);
+    }
+    env->ReleaseStringUTFChars(paramPath, pp);
+    env->ReleaseStringUTFChars(binPath, bp);
+    if (param.empty() || b.empty()) return env->NewStringUTF("{\"ok\":false,\"err\":\"files_missing\"}");
+
+    static std::once_flag srVkOnce2;
+    std::call_once(srVkOnce2, [] { if (!g_vk) g_vk = ncnn::get_gpu_device(0); });
+
+    if (wantVulkan == JNI_TRUE && g_vk) {
+        ncnn::Net* net = new ncnn::Net;
+        net->opt.lightmode = true;
+        net->opt.num_threads = 1;
+        net->opt.use_vulkan_compute = true;
+        net->opt.use_packing_layout = true;
+        // 真机 Mali 实测：本模型 Vulkan fp16 输出竖条纹损坏（fp32 与 CPU 逐像素
+        // 一致）——默认 fp32，SR_VK_FP16=1 仅作实验对照。
+        net->opt.use_fp16_packed = false;
+        net->opt.use_fp16_storage = false;
+        net->opt.use_fp16_arithmetic = false;
+        if (const char* e = getenv("SR_VK_FP16"); e && e[0] == '1') {
+            net->opt.use_fp16_packed = true;
+            net->opt.use_fp16_storage = true;
+            net->opt.use_fp16_arithmetic = true;
+            LOGI("sr vulkan fp16 experiment");
+        }
+        net->opt.use_shader_local_memory = false;
+        ncnn::VkBlobAllocator* vb = new ncnn::VkBlobAllocator(g_vk);
+        ncnn::VkStagingAllocator* vs = new ncnn::VkStagingAllocator(g_vk);
+        net->opt.blob_vkallocator = vb;
+        net->opt.workspace_vkallocator = vb;
+        net->opt.staging_vkallocator = vs;
+        net->set_vulkan_device(g_vk);
+        if (net->load_param_mem(param.c_str()) == 0) {
+            const unsigned char* mem = b.data();
+            ncnn::DataReaderFromMemory dr(mem);
+            if (net->load_model(dr) == 0) {
+                g_srNet = net;
+                LOGI("sr net(path) on vulkan");
+                return env->NewStringUTF("{\"ok\":true,\"backend\":\"vulkan\",\"scale\":2}");
+            }
+        }
+        delete net;
+        LOGE("sr vulkan(path) load failed, fallback cpu");
+    }
+
+    ncnn::Net* net = new ncnn::Net;
+    net->opt.lightmode = true;
+    net->opt.num_threads = threads > 0 ? threads : 4;
+    net->opt.use_fp16_storage = false;
+    net->opt.use_fp16_packed = false;
+    net->opt.use_fp16_arithmetic = false;
+    net->opt.use_sgemm_convolution = false;
+    net->opt.use_winograd_convolution = false;
+    net->opt.use_vulkan_compute = false;
+    if (net->load_param_mem(param.c_str()) != 0) { delete net; return env->NewStringUTF("{\"ok\":false,\"err\":\"load_param\"}"); }
+    const unsigned char* mem = b.data();
+    ncnn::DataReaderFromMemory dr(mem);
+    if (net->load_model(dr) != 0) { delete net; return env->NewStringUTF("{\"ok\":false,\"err\":\"load_model\"}"); }
+    g_srNet = net;
+    LOGI("sr net(path) on safe cpu threads=%d", net->opt.num_threads);
+    return env->NewStringUTF("{\"ok\":true,\"backend\":\"cpu\",\"scale\":2}");
+}

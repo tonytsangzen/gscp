@@ -1621,7 +1621,55 @@ class ArActivity : Activity() {
 
     private fun showStatus(s: String?) { showStatusText(s ?: statusTextFor()) }
 
+    /**
+     * overlay 烘焙路径开关：debug.gscp.ovgl（默认 0 = CPU 烘焙。
+     * ⚠ 前摄 GL 加速尚不可用：GPU 烘焙路径在前摄连续 overlay 流下仍有问题，
+     * 后摄 GL 烘焙 + GL 原生 SR 也待真机复验——真机调试时可 setprop 1 试验，
+     * 试验完记得恢复）。置 1 = GPU 烘焙 OverlayBakeCore（解码直写 GL）。
+     * 读取时机 = 建流时（onOverlayPrepare / startRearPlayerIfReady），
+     * setprop 运行中切换下次连接生效。
+     */
+    private fun glBakeEnabled(): Boolean {
+        return try {
+            val sp = Class.forName("android.os.SystemProperties")
+            val get = sp.getMethod("get", String::class.java, String::class.java)
+            val v = (get.invoke(null, "debug.gscp.ovgl", "0") as String).trim()
+            v != "0" && !v.equals("false", true)
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    /**
+     * overlay 超分开关：debug.gscp.ovsr（默认 1 = GPU 烘焙前先过 GL 原生 ESPCN ×2
+     * 灰度超分，480² 亮度 → 960²，文字/图标显著增锐；置 0 关闭）。建流时读取，
+     * 运行中切换下次连接生效。权重缺失/浮点渲染目标不可用时核心自动退回非 SR。
+     */
+    private fun glSrEnabled(): Boolean {
+        return try {
+            val sp = Class.forName("android.os.SystemProperties")
+            val get = sp.getMethod("get", String::class.java, String::class.java)
+            val v = (get.invoke(null, "debug.gscp.ovsr", "1") as String).trim()
+            v != "0" && !v.equals("false", true)
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    /** ESPCN fp32 权重（espcn_x2.f32，81KB，懒加载缓存）。 */
+    @Volatile private var srWeights: ByteArray? = null
+    private fun srWeights(): ByteArray? {
+        srWeights?.let { return it }
+        return try {
+            assets.open("espcn_x2.f32").use { it.readBytes() }.also { srWeights = it }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "sr weights load fail", t)
+            null
+        }
+    }
+
     // ── scrcpy overlay 连接 ───────────────────────────────────
+
 
     private fun startAr() {
         android.util.Log.i("ar-ui", "startAr")
@@ -1758,15 +1806,19 @@ class ArActivity : Activity() {
         val ip = prefs.getString("ip", null) ?: ipEdit.text.toString().trim()
         if (ip.isEmpty()) { showStatusText("未配置眼镜 IP"); return }
         g.reset()   // 重建两路输入面，清掉上一会话残留帧
+        val useGlBake = glBakeEnabled()
+        val useSr = useGlBake && glSrEnabled()
         val player = GlassesPlayer(
             this, g, audioEnabled, bottomRotationDeg, bottomMirror,
             applySettings = { applyComposerSettings(it) },
             events = rearEvents,
             resetMixerOnStop = false,   // 合成器跨会话复用：reset 统一在新会话开始时做，防异步 stop 竞态
-            // 后摄 overlay 复用前摄 CPU 烘焙（convertOverlayFrame：keyLut 黑键抠像 +
-            // 饱和度 + 内容/光晕剪影），ArRearGl 只做纹理合成。旧路径硬解直写 OES 后
-            // GLSL 现场键控，羽化区间的暗色像素 premult 合成会压暗底层 = 抠图残留黑边。
-            overlayImageCallback = { img -> convertOverlayFrame(img) },
+            // debug.gscp.ovgl=1（默认）：overlay 解码直写 ArRearGl 内烘焙核心输入面
+            // （RearComposer.openOverlayStream），CPU 烘焙不再参与；置 0 回退
+            // convertOverlayFrame CPU 烘焙位图路径（下方回调）。
+            overlayImageCallback = if (useGlBake) null else { img -> convertOverlayFrame(img) },
+            overlaySr = useSr,
+            overlaySrWeights = if (useSr) srWeights() else null,
         )
         rearPlayer = player
         val waiter = scrcpyShutdown
@@ -1825,6 +1877,8 @@ class ArActivity : Activity() {
             overlayNew = false
             overlayVersion++   // 通知 GL 合成器清空 overlay/光晕纹理
         }
+        // GPU 烘焙路径：同步关闭输入面并清空产物纹理（下次建流重开）
+        frontGl?.closeOverlayStream()
     }
 
     private fun exitAr() {
@@ -1923,9 +1977,26 @@ class ArActivity : Activity() {
                     }
                     resetOverlay()
                     val od = VideoDecoder()
-                    od.frameCallback = { img -> convertOverlayFrame(img) }
-                    // 无 Surface 解码：getOutputImage 给出 CPU 可读 I420（绕开厂商平铺格式）
-                    od.start(width, height, null)
+                    var glOk = false
+                    if (glBakeEnabled()) {
+                        // GPU 烘焙：解码直写 ArFrontGl 内烘焙核心的输入面（零 CPU 逐像素）；
+                        // debug.gscp.ovsr=1 时核心内部先过 GL 原生 ESPCN ×2 再键控
+                        try {
+                            val sr = glSrEnabled()
+                            val surface = frontGl?.openOverlayStream(width, height, sr, srWeights())
+                                ?: throw IllegalStateException("frontGl 未就绪")
+                            od.start(width, height, surface)
+                            glOk = true
+                            android.util.Log.i("ar-ui", "overlay decode -> gl bake" + if (sr) "+sr" else "")
+                        } catch (e: Exception) {
+                            android.util.Log.w(TAG, "overlay gl-bake 建流失败，回退 CPU 烘焙", e)
+                        }
+                    }
+                    if (!glOk) {
+                        // 无 Surface 解码：getOutputImage 给出 CPU 可读 I420（绕开厂商平铺格式）
+                        od.frameCallback = { img -> convertOverlayFrame(img) }
+                        od.start(width, height, null)
+                    }
                     overlayDecoder = od
                 } catch (e: Exception) {
                     android.util.Log.w(TAG, "overlay prepare 失败", e)
@@ -1937,6 +2008,13 @@ class ArActivity : Activity() {
             try {
                 val n = ++diagOverlayPkg
                 if (n % 150L == 1L) android.util.Log.i("ar-ui", "overlayPkg #$n ${length}B")
+                // GL 烘焙路径的产物转储（与 CPU 路径 convertOverlayFrame 内的转储同节拍，
+                // debug.gscp.dumpoverlay 语义：100/200/300 包各转储一批 content/glow/far）
+                if (glBakeEnabled() && diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
+                    dumpCount++
+                    val dir = getExternalFilesDir(null)?.absolutePath
+                    if (dir != null) frontGl?.dumpOverlay("$dir/ovgl_dump_${dumpCount}")
+                }
                 overlayDecoder?.decode(buffer, offset, length)
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "overlay 解码中断", e)

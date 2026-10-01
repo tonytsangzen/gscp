@@ -11,6 +11,20 @@ import android.view.Surface
 interface RearComposer {
     fun getBottomSurface(): Surface
     fun getTopSurface(): Surface
+
+    /**
+     * overlay 流建流：按流尺寸开一个解码输入面。默认回落 [getTopSurface]
+     * （普通模式 SurfaceMixer 的 GLSL 现场键控管线不变）；ArRearGl 覆写为
+     * GPU 烘焙核心（OverlayBakeCore）的输入面，替代 CPU 烘焙。
+     * sr=true 时烘焙核心启用 GL 原生 ESPCN ×2 超分（debug.gscp.ovsr）。
+     */
+    fun openOverlayStream(
+        width: Int,
+        height: Int,
+        sr: Boolean = false,
+        srWeights: ByteArray? = null,
+    ): Surface = getTopSurface()
+
     fun setBottomAspectRatio(ratio: Float)
     fun setBottomRotation(rotation: Float, mirror: Boolean)
     fun setTopAspectRatio(ratio: Float)

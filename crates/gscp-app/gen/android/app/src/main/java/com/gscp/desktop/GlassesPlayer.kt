@@ -28,6 +28,9 @@ class GlassesPlayer(
      *  （AR 后摄复用前摄 convertOverlayFrame CPU 烘焙，消 GLSL 现场键控的黑残留；
      *  此时 mixer.getTopSurface() 不再被消费）。 */
     private val overlayImageCallback: ((android.media.Image) -> Unit)? = null,
+    /** sr=true：GPU 烘焙核心启用 GL 原生 ESPCN ×2 超分（debug.gscp.ovsr）。 */
+    private val overlaySr: Boolean = false,
+    private val overlaySrWeights: ByteArray? = null,
 ) {
     interface Events {
         fun onConnect()
@@ -105,7 +108,10 @@ class GlassesPlayer(
                     overlayDecoder?.frameCallback = overlayImageCallback
                     overlayDecoder?.start(width, height, null)
                 } else {
-                    overlayDecoder?.start(width, height, mixer.getTopSurface())
+                    // 合成器自管 overlay 输入面（ArRearGl = GPU 烘焙核心，
+                    // SurfaceMixer = 原 GLSL 现场键控 OES）
+                    overlayDecoder?.start(width, height,
+                        mixer.openOverlayStream(width, height, overlaySr, overlaySrWeights))
                 }
             }
         }

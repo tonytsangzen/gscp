@@ -96,6 +96,14 @@ class ArRearGl(
     private var hasContent = false
     private var diagTick = 0                    // 诊断节流(每 ~2s 一条)
 
+    // GPU 烘焙核心（debug.gscp.ovgl=1 时替代 CPU 烘焙位图快照）；
+    // openOverlayStream 建，reset() 随会话重建，产物纹理同 context 直用。
+    @Volatile private var baker: OverlayBakeCore? = null
+    private var bakeStreamW = 0
+    private var bakeStreamH = 0
+    private var bakeStreamSr = false
+    private var bakeStreamSrWeights: ByteArray? = null
+
     private var bottomTexture = 0
     private var topTexture = 0                  // 接口占位（见 createStreams）
     private lateinit var bottomSurfaceTexture: SurfaceTexture
@@ -129,7 +137,10 @@ class ArRearGl(
             eglConfig = configs[0]!!
             eglContext = EGL14.eglCreateContext(
                 eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT,
-                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+                intArrayOf(
+                    EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,   // ES3：overlay GL 原生 ESPCN 超分需要；GLSL 100 旧 shader 兼容
+                    EGL14.EGL_NONE
+                ), 0)
             val pb = EGL14.eglCreatePbufferSurface(
                 eglDisplay, eglConfig,
                 intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
@@ -184,6 +195,44 @@ class ArRearGl(
     override fun getBottomSurface(): Surface = bottomSurface
     override fun getTopSurface(): Surface = topSurface   // 占位，见 createStreams
 
+    /** GPU 烘焙输入面：GL 线程建/重建烘焙核心（会话级，reset() 重建）。
+     *  同步返回解码输入面；CPU 烘焙回退路径（overlayImageCallback）不走此接口。
+     *  sr=true：核心内部先过 GL 原生 ESPCN ×2 超分（失败自动退回非 SR）。 */
+    override fun openOverlayStream(streamW: Int, streamH: Int, sr: Boolean, srWeights: ByteArray?): Surface {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var surface: Surface? = null
+        handler.post {
+            if (released) {
+                latch.countDown()
+                return@post
+            }
+            try {
+                closeBakerLocked()
+                val b = OverlayBakeCore()
+                surface = b.open(streamW, streamH, handler, sr, srWeights)
+                bakeStreamSrWeights = srWeights
+                baker = b
+                bakeStreamW = streamW
+                bakeStreamH = streamH
+                bakeStreamSr = sr
+                ArNative.nativeSetOverlaySize(b.contentW(), b.contentH())
+                Log.i("ar-rear-gl", "overlay gl-bake open ${streamW}x${streamH} content=${b.contentW()}x${b.contentH()}")
+            } catch (t: Throwable) {
+                Log.w("ar-rear-gl", "overlay gl-bake open fail", t)
+                surface = null
+            }
+            latch.countDown()
+        }
+        try { latch.await(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+        return surface ?: throw IllegalStateException("overlay gl-bake open timeout")
+    }
+
+    private fun closeBakerLocked() {
+        val b = baker ?: return
+        baker = null
+        try { b.release() } catch (t: Throwable) { Log.w("ar-rear-gl", "baker release fail", t) }
+    }
+
     override fun setBottomAspectRatio(ratio: Float) { bottomAspect = ratio }
     override fun setBottomRotation(rotation: Float, mirror: Boolean) {
         bottomRotation = rotation; bottomMirror = mirror
@@ -213,6 +262,21 @@ class ArRearGl(
             GLES20.glDeleteTextures(2, intArrayOf(bottomTexture, topTexture), 0)
             bottomSurfaceTexture.release(); bottomSurface.release()
             topSurfaceTexture.release(); topSurface.release()
+            // 烘焙核心随会话重建（清掉旧会话帧；流尺寸沿用上次建流参数）
+            hasContent = false
+            val b = baker
+            baker = null
+            if (b != null && bakeStreamW > 0) {
+                runCatching { b.release() }
+                try {
+                    val nb = OverlayBakeCore()
+                    nb.open(bakeStreamW, bakeStreamH, handler, bakeStreamSr, bakeStreamSrWeights)
+                    baker = nb
+                    ArNative.nativeSetOverlaySize(nb.contentW(), nb.contentH())
+                } catch (t: Throwable) {
+                    Log.w("ar-rear-gl", "baker reopen fail", t)
+                }
+            }
             createStreams()
         }
     }
@@ -245,6 +309,11 @@ class ArRearGl(
     /** 每拍渲染完成后回调（GL 线程；驱动录像编码线程 drain）。 */
     var frameCallback: (() -> Unit)? = null
 
+    /** GPU 烘焙产物转储（真机 A/B 取证；GL 线程执行）。 */
+    fun dumpOverlay(pathPrefix: String) {
+        handler.post { baker?.dump(pathPrefix) }
+    }
+
     fun release() {
         released = true
         handler.post {
@@ -252,6 +321,7 @@ class ArRearGl(
                 for (rs in renderSurfaces) rs.release()
                 renderSurfaces.clear()
             }
+            closeBakerLocked()
             GLES20.glDeleteTextures(2, intArrayOf(bottomTexture, topTexture), 0)
             GLES20.glDeleteTextures(3, intArrayOf(contentTex, glowTex, bloomTex), 0)
             EGL14.eglMakeCurrent(eglDisplay,
@@ -285,16 +355,27 @@ class ArRearGl(
 
     private fun tick() {
         pollProps()
-        // 前摄同款：overlay 烘焙快照 → 纹理（版本号变化才重新上传；位图在
-        // provider 持锁期间有效）。overlay 流按需发帧，UI 静默期保留最后内容。
-        overlays.snapshot { content, glow, bloom, ver ->
-            if (ver != overlayVersionSeen) {
-                overlayVersionSeen = ver
-                contentTex = uploadBitmap(contentTex, content)
-                glowTex = uploadBitmap(glowTex, glow)
-                bloomTex = uploadBitmap(bloomTex, bloom)
-                hasContent = content != null && !content.isRecycled
-                content?.let { topAspect = it.width.toFloat() / it.height.toFloat() }
+        val b = baker
+        if (b != null) {
+            // GPU 烘焙：消费解码新帧（产物纹理原地更新）。overlay 流按需发帧，
+            // UI 静默期保留最后内容。
+            try { b.bakeIfPending() } catch (t: Throwable) { Log.w("ar-rear-gl", "ov bake fail", t) }
+            if (!hasContent && b.hasBaked()) {
+                hasContent = true
+                topAspect = if (b.contentH() > 0) b.contentW().toFloat() / b.contentH() else 1f
+            }
+        } else {
+            // 前摄同款：overlay 烘焙快照 → 纹理（版本号变化才重新上传；位图在
+            // provider 持锁期间有效）
+            overlays.snapshot { content, glow, bloom, ver ->
+                if (ver != overlayVersionSeen) {
+                    overlayVersionSeen = ver
+                    contentTex = uploadBitmap(contentTex, content)
+                    glowTex = uploadBitmap(glowTex, glow)
+                    bloomTex = uploadBitmap(bloomTex, bloom)
+                    hasContent = content != null && !content.isRecycled
+                    content?.let { topAspect = it.width.toFloat() / it.height.toFloat() }
+                }
             }
         }
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -331,11 +412,19 @@ class ArRearGl(
         GLES20.glVertexAttribPointer(0, 4, GLES20.GL_FLOAT, false, 0, quadBuf)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
 
-        // ── 顶层：前摄烘焙位图，前摄同款发光（远 ADD α90 → 中 ADD α120 → 内容）──
+        // ── 顶层：前摄同款发光（远 ADD α90 → 中 ADD α120 → 内容）──
         if (!hasContent) return
-        drawTopLayer(bloomTex, additive = true, alpha = BLOOM_FAR_ALPHA, mul = MUL_BLOOM, add = 0f)
-        drawTopLayer(glowTex, additive = true, alpha = BLOOM_MID_ALPHA, mul = MUL_BLOOM, add = 0f)
-        drawTopLayer(contentTex, additive = false, alpha = 1f, mul = MUL_CONTENT, add = 12f / 255f)
+        // 纹理源：GPU 烘焙产物优先，回退 CPU 烘焙位图上传
+        val bk = baker
+        val cTex: Int; val gTex: Int; val fTex: Int
+        if (bk != null && bk.hasBaked()) {
+            cTex = bk.contentTex(); gTex = bk.glowTex(); fTex = bk.bloomTex()
+        } else {
+            cTex = contentTex; gTex = glowTex; fTex = bloomTex
+        }
+        drawTopLayer(fTex, additive = true, alpha = BLOOM_FAR_ALPHA, mul = MUL_BLOOM, add = 0f)
+        drawTopLayer(gTex, additive = true, alpha = BLOOM_MID_ALPHA, mul = MUL_BLOOM, add = 0f)
+        drawTopLayer(cTex, additive = false, alpha = 1f, mul = MUL_CONTENT, add = 12f / 255f)
         GLES20.glDisable(GLES20.GL_BLEND)
     }
 

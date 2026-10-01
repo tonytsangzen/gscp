@@ -41,4 +41,23 @@ object ArNative {
 
     /** overlay 显示位图尺寸（内容包围盒裁剪后）——quad 纵横比按实际内容锁定。 */
     external fun nativeSetOverlaySize(w: Int, h: Int)
+
+    // ── overlay 超分（ncnn-benchmark sr_benchmark ESPCN x2 灰度）──────────
+
+    /**
+     * 加载超分网：assets/espcn_x2.ncnn.param/bin（480² 亮度 → 960²）。
+     * vulkan=true 优先 Vulkan FP16（需检测网先建好 GPU 设备则自动创建），
+     * 失败回退 safe-CPU（fp32/普通卷积，pnnx 模型真机稳健配置）。
+     * 返回 JSON {"ok","backend":"vulkan"|"cpu","scale":2}。
+     */
+    external fun nativeSrOpen(assets: android.content.res.AssetManager, threads: Int, vulkan: Boolean): String
+
+    /**
+     * 亮度超分：lumaIn = w*h 字节（direct），lumaOut = 4*w*h 字节（direct，2x2 放大）。
+     * 返回 JSON {"ok","ms","w","h","ow","oh"}。调用线程需串行。
+     */
+    external fun nativeSrProcess(lumaIn: java.nio.ByteBuffer, w: Int, h: Int, lumaOut: java.nio.ByteBuffer): String
+
+    /** 释放超分网（Vulkan 全局设备保留）。 */
+    external fun nativeSrClose()
 }
