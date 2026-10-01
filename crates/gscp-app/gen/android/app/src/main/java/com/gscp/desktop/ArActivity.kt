@@ -80,9 +80,17 @@ class ArActivity : Activity() {
     private val overlayLock = Any()
     private var overlayBmp: Bitmap? = null
     private var overlayPix: IntArray? = null
-    private var yScr: ByteArray? = null
-    private var uScr: ByteArray? = null
-    private var vScr: ByteArray? = null
+    // 帧缓冲（解码线程私有）：整帧平面拷贝，供去重比较与转换共用
+    private var frameY: ByteArray? = null
+    private var frameU: ByteArray? = null
+    private var frameV: ByteArray? = null
+    private var prevY: ByteArray? = null
+    private var prevU: ByteArray? = null
+    private var prevV: ByteArray? = null
+    private var prevValid = false
+    private var prevW = 0
+    private var prevH = 0
+    private var lastBakeAt = 0L
     private var overlayNew = false
     // overlay 内容版本号：convertOverlayFrame/resetOverlay 递增，GL 合成器据此刷新纹理
     @Volatile private var overlayVersion = 0
@@ -1493,7 +1501,9 @@ class ArActivity : Activity() {
     }
 
     /** 解码线程回调：overlay I420 Image → RGBA Bitmap（BT.601 limited，兼容 planar/semiplanar + cropRect）。
-     *  行数据先 bulk 拷到 scratch 数组再逐像素索引（直接读 direct ByteBuffer 逐次都是 JNI）。 */
+     *  帧流程：平面整体拷入帧缓冲 → 与上一帧去重（眼镜 UI 静止时整段烘焙跳过）→
+     *  限速 20fps → 逐像素键控/饱和 → 光晕金字塔 → 锁内引用交换发布。
+     *  CPU 效率：overlay 流 ~40 包/s 时逐帧全量烘焙 ≈ 1.5 个大核；去重后静止态为 0。 */
     private fun convertOverlayFrame(img: Image) {
         try {
             // 用 cropRect 的真实可见区：厂商解码可能带 16/32 对齐填充 + 裁剪偏移，
@@ -1516,60 +1526,87 @@ class ArActivity : Activity() {
             val uPs = pl[1].pixelStride
             val vPs = pl[2].pixelStride
             val cw = (w + 1) shr 1
-            // scratch 复用（解码线程串行调用）
-            var ys = yScr
-            if (ys == null || ys.size < yRs * (h + 1)) { ys = ByteArray(yRs * (h + 1)); yScr = ys }
-            var us = uScr
-            if (us == null || us.size < cw * uPs * ((h shr 1) + 2)) {
-                us = ByteArray(cw * uPs * ((h shr 1) + 2)); uScr = us
+            // 帧缓冲复用（解码线程串行调用）：行主序整帧拷贝，供去重与转换共用
+            var frameY = this.frameY
+            if (frameY == null || frameY.size < w * h) { frameY = ByteArray(w * h); this.frameY = frameY }
+            val uBytes = cw * uPs
+            var frameU = this.frameU
+            if (frameU == null || frameU.size < uBytes * ((h + 1) shr 1)) { frameU = ByteArray(uBytes * ((h + 1) shr 1)); this.frameU = frameU }
+            var frameV = this.frameV
+            if (frameV == null || frameV.size < cw * vPs * ((h + 1) shr 1)) { frameV = ByteArray(cw * vPs * ((h + 1) shr 1)); this.frameV = frameV }
+            val cropL = crop.left
+            val cropT = crop.top
+            // 平面整体拷入帧缓冲（记录实际可拷行数——limit 截断边缘与旧行为一致）
+            var copiedY = 0
+            var copiedUV = 0
+            for (j in 0 until h) {
+                val yRow = (j + topRow + cropT) * yRs + cropL
+                if (yRow + w > yB.limit()) break
+                yB.position(yRow)
+                yB.get(frameY, j * w, w)
+                copiedY = j + 1
+                if ((j and 1) == 0) {
+                    // 色度行随 crop 同步偏移（4:2:0：cTop = (y+crop.top)/2 + crop.left/2）
+                    val cTop = ((j + topRow + cropT) shr 1) + (cropL shr 1)
+                    val uRow = cTop * uRs
+                    if (uRow + uBytes > uB.limit() || uRow + uBytes > vB.limit()) break
+                    uB.position(uRow)
+                    uB.get(frameU, (j shr 1) * uBytes, uBytes)
+                    vB.position(cTop * vRs)
+                    vB.get(frameV, (j shr 1) * cw * vPs, cw * vPs)
+                    copiedUV = (j shr 1) + 1
+                }
             }
-            var vs = vScr
-            if (vs == null || vs.size < cw * vPs * ((h shr 1) + 2)) {
-                vs = ByteArray(cw * vPs * ((h shr 1) + 2)); vScr = vs
+            // ── 帧去重：与上一帧逐字节比较。眼镜 UI 静止时（常见态）烘焙/发布/上传
+            //    全部跳过，CPU 占用归零；prev 缓冲复用，无每帧分配。──
+            val wantDump = diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3
+            val pY = prevY; val pU = prevU; val pV = prevV
+            val identical = prevValid && pY != null && pU != null && pV != null &&
+                pY.size == frameY.size && pU.size == frameU.size && pV.size == frameV.size &&
+                prevW == w && prevH == h &&
+                frameY.contentEquals(pY) && frameU.contentEquals(pU) && frameV.contentEquals(pV)
+            if (pY == null || pY.size != frameY.size) {
+                prevY = frameY.copyOf(); prevU = frameU.copyOf(); prevV = frameV.copyOf()
+            } else {
+                System.arraycopy(frameY, 0, pY, 0, frameY.size)
+                System.arraycopy(frameU, 0, pU, 0, frameU.size)
+                System.arraycopy(frameV, 0, pV, 0, frameV.size)
             }
+            prevValid = true; prevW = w; prevH = h
+            if (identical) {
+                if (wantDump) dumpOverlayBitmap()
+                return
+            }
+            // ── 烘焙限速 20fps：内容持续变化时的 CPU 封顶（静止态已被去重消除）──
+            val nowMs = android.os.SystemClock.uptimeMillis()
+            if (nowMs - lastBakeAt < 50) return
+            lastBakeAt = nowMs
+
             // ── 烘焙在解码线程私有位图上进行（不持锁）：overlay 流高频时持锁烘焙
             //    会把 GL 渲染线程的快照饿死（卡顿根因）。锁内只做引用交换。──
             run {
                 var pix = overlayPix
                 if (pix == null || pix.size != w * h) { pix = IntArray(w * h); overlayPix = pix }
-                // 防“残影”：pix 跨帧复用，若本帧因 limit 提前 break 未写满，残留上一帧内容会
-                // 整块拷入 ob → 字符拖影。填零（全透明）确保未写到的行是空、而非旧帧。
+                // 防“残影”：pix 跨帧复用，未写到的行保持全透明（与旧 limit-break 行为一致）
                 java.util.Arrays.fill(pix, 0)
                 if (bakeBmp == null || bakeBmp!!.width != w || bakeBmp!!.height != h) {
                     bakeBmp?.recycle()
                     bakeBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     ArNative.nativeSetOverlaySize(w, h)
                 }
-                val cropL = crop.left
-                val cropT = crop.top
-                val uBytes = cw * uPs
                 var o = 0
                 var sumR = 0; var sumG = 0; var sumB = 0; var nOp = 0   // 不透明内容平均色（光晕统一色调）
-                for (j in 0 until h) {
-                    val yRow = (j + topRow + cropT) * yRs + cropL
-                    if (yRow + w > yB.limit()) break
-                    yB.position(yRow)
-                    yB.get(ys, 0, w)                       // Y 行 bulk 拷贝
-                    if ((j and 1) == 0) {
-                        // 色度行随 crop 同步偏移（4:2:0：cTop = (y+crop.top)/2 + crop.left/2）
-                        val cTop = ((j + topRow + cropT) shr 1) + (cropL shr 1)
-                        val uRow = cTop * uRs
-                        if (uRow + uBytes > uB.limit() || uRow + uBytes > vB.limit()) break
-                        uB.position(uRow)
-                        uB.get(us, 0, uBytes)              // 按 pixelStride 读满（planar=1 / NV12=2）
-                        vB.position(cTop * vRs)
-                        vB.get(vs, 0, cw * vPs)
-                    }
+                for (j in 0 until minOf(copiedY, copiedUV * 2)) {
                     for (i in 0 until w) {
                         // 水平镜像：观察者看到的眼镜屏与内容左右相反（旧 GL 路径 u→1-u 同理）
                         val si = w - 1 - i
                         val c = si shr 1
-                        val y = (ys[si].toInt() and 0xFF) - 16
+                        val y = (frameY[j * w + si].toInt() and 0xFF) - 16
                         // planar：像素间距 1 直读；semiplanar(NV12)：UV 交错，U 在偶位 V 在奇位
-                        val u = if (uPs == 1) (us[c].toInt() and 0xFF) - 128
-                                else (us[c * uPs].toInt() and 0xFF) - 128
-                        val v = if (vPs == 1) (vs[c].toInt() and 0xFF) - 128
-                                else (vs[c * vPs + 1].toInt() and 0xFF) - 128
+                        val u = if (uPs == 1) (frameU[(j shr 1) * uBytes + c].toInt() and 0xFF) - 128
+                                else (frameU[(j shr 1) * uBytes + c * uPs].toInt() and 0xFF) - 128
+                        val v = if (vPs == 1) (frameV[(j shr 1) * cw * vPs + c].toInt() and 0xFF) - 128
+                                else (frameV[(j shr 1) * cw * vPs + c * vPs + 1].toInt() and 0xFF) - 128
                         var r = (298 * y + 409 * v + 128) shr 8
                         var g = (298 * y - 100 * u - 208 * v + 128) shr 8
                         var b = (298 * y + 516 * u + 128) shr 8
@@ -1646,6 +1683,8 @@ class ArActivity : Activity() {
                     bakeGlowCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                     bakeFarCanvas!!.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                 }
+                // 转储（锁外，转储当前烘焙位图；PNG 压缩较重）
+                if (wantDump) dumpOverlayBitmap()
                 // ── 发布：锁内仅引用交换 + 版本号。GL 快照的纹理上传（2~4ms）与本段
                 //    串行，烘焙重活已全部在锁外完成，渲染线程不再被饿死。──
                 synchronized(overlayLock) {
@@ -1659,25 +1698,25 @@ class ArActivity : Activity() {
                 // 发布出去的是过期空图 = 光晕消失）
                 bakeGlowCanvas = bakeGlow?.let { Canvas(it) }
                 bakeFarCanvas = bakeFar?.let { Canvas(it) }
-                // debug.gscp.dumpoverlay=1:在 100/200/300 包时各转储一张解码位图
-                // (首帧为空帧,需等 UI 渲染后的包)。PNG 压缩较重，放锁外、转储私有位图。
-                if (diagOverlayPkg >= 100L * (dumpCount + 1) && dumpCount < 3) {
-                    dumpCount++
-                    try {
-                        val f = java.io.File(getExternalFilesDir(null), "overlay_dump_${dumpCount}.png")
-                        java.io.FileOutputStream(f).use { bakeBmp!!.compress(
-                            Bitmap.CompressFormat.PNG, 100, it) }
-                        android.util.Log.i(TAG, "overlay dump#${dumpCount}: ${f.absolutePath}")
-                    } catch (e: Exception) {
-                        android.util.Log.w(TAG, "overlay dump fail", e)
-                    }
-                }
             }
         } catch (t: Throwable) {
             // Throwable：JNI 方法不匹配等 Error 也不得杀死解码线程
             android.util.Log.w(TAG, "overlay frame convert fail", t)
         } finally {
             try { img.close() } catch (_: Exception) {}
+        }
+    }
+
+    /** 转储当前烘焙位图（解码线程；诊断用，100/200/300 包各一张）。 */
+    private fun dumpOverlayBitmap() {
+        dumpCount++
+        try {
+            val f = java.io.File(getExternalFilesDir(null), "overlay_dump_${dumpCount}.png")
+            java.io.FileOutputStream(f).use { bakeBmp!!.compress(
+                Bitmap.CompressFormat.PNG, 100, it) }
+            android.util.Log.i(TAG, "overlay dump#${dumpCount}: ${f.absolutePath}")
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "overlay dump fail", e)
         }
     }
 
@@ -1950,6 +1989,7 @@ class ArActivity : Activity() {
             overlayNew = false
             overlayVersion++   // 通知 GL 合成器清空 overlay/光晕纹理
         }
+        prevValid = false   // 会话复位：强制下一帧去重失效，必烘焙
         // GPU 烘焙路径：同步关闭输入面并清空产物纹理（下次建流重开）
         frontGl?.closeOverlayStream()
     }
