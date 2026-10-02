@@ -118,9 +118,15 @@ class MainActivity : AppCompatActivity() {
 
         ipEdit.setText(prefs.getString("ip", ""))
         settingsButton.setOnClickListener { openSettingsDialog() }
-        // AR 模式是唯一连接模式：「连接」直接进入 AR（原普通投屏 connect() 不再从 UI 触发）
+        // AR 模式是唯一连接模式：「连接」校验并保存 IP 后直接进入 AR
+        // （原普通投屏 connect() 不再从 UI 触发；ArActivity 从 prefs 读取并自动开会话）
         connectButton.setOnClickListener {
-            // AR 是唯一连接模式：保存输入的 IP（ArActivity 从 prefs 读取）后进入
+            val ip = ipEdit.text.toString().trim()
+            if (!Patterns.IP_ADDRESS.matcher(ip).matches()) {
+                Toast.makeText(this, "请输入有效的 IP 地址", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            prefs.edit().putString("ip", ip).apply()
             startActivity(android.content.Intent(this, ArActivity::class.java))
         }
     }

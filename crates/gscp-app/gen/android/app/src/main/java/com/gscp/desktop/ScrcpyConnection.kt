@@ -1,6 +1,7 @@
 package com.gscp.desktop
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import io.github.muntashirakon.adb.AdbConnection
 import io.github.muntashirakon.adb.AdbStream
@@ -195,12 +196,19 @@ class ScrcpyConnection(
         }
     }
 
+    /** overlay-only 模式下音频是否真正开启：audio_source=output 依赖眼镜端 API 29+ 的
+     *  AudioPlaybackCapture（老眼镜/老设备整路不可用）。param 串与 handleList 必须
+     *  用同一判定，否则 server 少开一路 audio 而 client 仍按 audio-first 分发，
+     *  槽位整体错位 → overlay 永远无人读取。 */
+    private val overlayAudioActive: Boolean =
+        audioEnabled && Build.VERSION.SDK_INT >= 29
+
     /** 服务器回连顺序：camera 视频、音频（可选）、control、overlay（禁用者跳过）。
  *  本工程 overlay 模式下 video 恒关，实测服务端开启顺序为 [audio, control, overlay]，
  *  audio 承载于“首 socket”，前缀带 1 dummy + 64B 设备名（对 display/output 这类
  *  带设备名的首 socket；PC 端在 scrcpy.rs 的 sniff_first_socket_stream 正是这么读的）。 */
     private val handleList: List<StreamHandler> = when {
-        overlayOnly && audioEnabled -> listOf(audioHandler, controlHandler, overlayHandler, nullHandler)
+        overlayOnly && overlayAudioActive -> listOf(audioHandler, controlHandler, overlayHandler, nullHandler)
         overlayOnly -> listOf(controlHandler, overlayHandler, nullHandler, nullHandler)
         audioEnabled -> listOf(videoHandler, audioHandler, controlHandler, overlayHandler)
         else -> listOf(videoHandler, controlHandler, overlayHandler, nullHandler)
@@ -233,8 +241,13 @@ class ScrcpyConnection(
                     val param = if (overlayOnly) {
                         // max_size=640：竖屏设备 overlay 原生 480×640（与真实分辨率一致）；
                         // overlay 模式可再开 audio（audio_source=output 抓眼镜端输出），video 恒关。
-                        "log_level=info video=false audio=$audioEnabled max_size=640 overlay=true " +
-                            "audio_source=output"
+                        // video_source=display：video 关闭时无实际作用，但 server 缺省按 camera
+                        // 走版本检查，在 Android < 12 上会直接拒绝整个会话（scrcpy 相机管线
+                        // 要求 12+）；显式给 display 让 overlay-only 在老设备上也能拉流。
+                        // audio_source=output 依赖 API 29 的 AudioPlaybackCapture，更低版本整路关掉。
+                        val audio = overlayAudioActive
+                        "log_level=info video=false video_source=display audio=$audio " +
+                            "max_size=640 overlay=true audio_source=output"
                     } else {
                         "log_level=info video_source=camera audio_source=output " +
                             "max_size=1024 video=true audio=$audioEnabled overlay=true"

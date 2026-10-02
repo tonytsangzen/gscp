@@ -89,6 +89,9 @@ class ArFrontGl(
 
     @Volatile private var active = true
     @Volatile private var released = false
+    // GL 初始化成功才为 true：初始化失败（个别老驱动/模拟器桥 shader 必编译失败）
+    // 时禁用渲染而不是让 GL 线程带未捕获异常杀死整个应用。
+    @Volatile private var glOk = false
     // face0 17 值（overlay 四角 8 + 背板 8 + 距离），直立图像坐标；camW/H = 直立尺寸
     @Volatile private var face: FloatArray? = null
     // 锚点渲染侧指数平滑（一阶低通，τ≈70ms）：锚点率(~20fps，Vulkan 退化时更低)
@@ -190,40 +193,54 @@ class ArFrontGl(
         handlerThread.start()
         handler = Handler(handlerThread.looper)
         handler.post {
-            val version = IntArray(2)
-            EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
+            try {
+                val version = IntArray(2)
+                EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
 
-            val configAttributes = intArrayOf(
-                EGL14.EGL_RED_SIZE, 8,
-                EGL14.EGL_GREEN_SIZE, 8,
-                EGL14.EGL_BLUE_SIZE, 8,
-                EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                // RECORDABLE_ANDROID：允许把合成结果挂到 MediaCodec 编码器输入 Surface（录像）
-                android.opengl.EGLExt.EGL_RECORDABLE_ANDROID, 1,
-                EGL14.EGL_NONE
-            )
-            val configs = arrayOfNulls<EGLConfig>(1)
-            val numConfigs = IntArray(1)
-            EGL14.eglChooseConfig(eglDisplay, configAttributes, 0, configs, 0, 1, numConfigs, 0)
-            eglConfig = configs[0]!!
+                val configAttributes = intArrayOf(
+                    EGL14.EGL_RED_SIZE, 8,
+                    EGL14.EGL_GREEN_SIZE, 8,
+                    EGL14.EGL_BLUE_SIZE, 8,
+                    EGL14.EGL_ALPHA_SIZE, 8,
+                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                    // RECORDABLE_ANDROID：允许把合成结果挂到 MediaCodec 编码器输入 Surface（录像）
+                    android.opengl.EGLExt.EGL_RECORDABLE_ANDROID, 1,
+                    EGL14.EGL_NONE
+                )
+                val configs = arrayOfNulls<EGLConfig>(1)
+                val numConfigs = IntArray(1)
+                EGL14.eglChooseConfig(eglDisplay, configAttributes, 0, configs, 0, 1, numConfigs, 0)
+                if (numConfigs[0] == 0) throw IllegalStateException("no matching EGLConfig")
+                eglConfig = configs[0]!!
 
-            val contextAttributes = intArrayOf(
-                EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,   // ES3：overlay GL 原生 ESPCN 超分需要；GLSL 100 旧 shader 兼容
-                EGL14.EGL_NONE
-            )
-            eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT, contextAttributes, 0)
+                // ES3 优先（overlay GL 原生 ESPCN 超分需要；GLSL 100 旧 shader 兼容）；
+                // 只有 ES2 的老驱动拿不到 ES3 上下文时降级 ES2（超分退化为关闭）。
+                eglContext = createContext(3)
+                if (eglContext == EGL14.EGL_NO_CONTEXT) {
+                    Log.w(TAG, "ES3 context unavailable, falling back to ES2")
+                    eglContext = createContext(2)
+                }
 
-            val pbSurface = EGL14.eglCreatePbufferSurface(
-                eglDisplay, eglConfig,
-                intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-            EGL14.eglMakeCurrent(eglDisplay, pbSurface, pbSurface, eglContext)
-            initGl()
-            createPlaceholderSurface()
-
+                val pbSurface = EGL14.eglCreatePbufferSurface(
+                    eglDisplay, eglConfig,
+                    intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+                EGL14.eglMakeCurrent(eglDisplay, pbSurface, pbSurface, eglContext)
+                initGl()
+                createPlaceholderSurface()
+                glOk = true
+            } catch (t: Throwable) {
+                // 兼容性兜底：shader/上下文初始化失败只降级（画面黑、无 GL 特效），不崩进程。
+                if (!::eglContext.isInitialized) eglContext = EGL14.EGL_NO_CONTEXT
+                glOk = false
+                Log.e(TAG, "front GL init failed - GL rendering disabled", t)
+            }
             renderFrame()
         }
     }
+
+    private fun createContext(clientVersion: Int): EGLContext =
+        EGL14.eglCreateContext(eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT,
+            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, clientVersion, EGL14.EGL_NONE), 0)
 
     private fun initGl() {
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
@@ -335,7 +352,7 @@ class ArFrontGl(
     fun attachOutputSurface(surface: Surface, crop: Boolean = false) {
         android.util.Log.i("ar-front-gl", "attachOutputSurface crop=$crop count=${renderSurfaces.size + 1}")
         handler.post {
-            if (released) return@post
+            if (released || !glOk) return@post
             synchronized(renderSurfaces) {
                 renderSurfaces.add(RenderSurface(surface, crop))
             }
@@ -381,9 +398,11 @@ class ArFrontGl(
                 GLES20.glDeleteTextures(1, intArrayOf(placeholderTex), 0)
                 placeholderTex = 0
             }
-            val texs = intArrayOf(camTex, contentTex, glowTex, bloomTex)
-            GLES20.glDeleteTextures(texs.size, texs, 0)
-            camTex = 0; contentTex = 0; glowTex = 0; bloomTex = 0
+            if (glOk) {
+                val texs = intArrayOf(camTex, contentTex, glowTex, bloomTex)
+                GLES20.glDeleteTextures(texs.size, texs, 0)
+                camTex = 0; contentTex = 0; glowTex = 0; bloomTex = 0
+            }
             EGL14.eglMakeCurrent(eglDisplay,
                 EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             EGL14.eglDestroyContext(eglDisplay, eglContext)
@@ -407,6 +426,7 @@ class ArFrontGl(
     }
 
     private fun tick() {
+        if (!glOk) return
         pollPlateProps()
         val alive = streamAliveCheck?.invoke() ?: true
         if (alive != streamAlive) {

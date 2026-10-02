@@ -360,24 +360,45 @@ class ArActivity : Activity() {
         camHandler = Handler(camThread!!.looper)
         ArNative.nativeFaceSetPoseAlgo(3)   // 融合（mesh Kabsch + hopenet 大角度）
 
-        if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
+        // 相机：人脸追踪必需；READ_EXTERNAL_STORAGE（<33 才存在）：录像缩略图查
+        // MediaStore 用（24–28 无授权直接 SecurityException）。一并申请，结果合并处理。
+        val need = mutableListOf<String>()
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
+            need += android.Manifest.permission.CAMERA
+        }
+        if (Build.VERSION.SDK_INT < 33 &&
+            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            need += android.Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (need.isEmpty()) {
             tryStart()
         } else {
-            requestPermissions(arrayOf(android.Manifest.permission.CAMERA), REQ_CAM)
+            requestPermissions(need.toTypedArray(), REQ_CAM)
         }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_CAM &&
-            grantResults.isNotEmpty() && grantResults[0] ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            tryStart()
-        } else if (requestCode == REQ_CAM) {
-            showStatusText("未授予相机权限，无法追踪人脸")
+        if (requestCode == REQ_CAM) {
+            val camIdx = permissions.indexOf(android.Manifest.permission.CAMERA)
+            val camGranted =
+                camIdx >= 0 && grantResults.getOrNull(camIdx) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            val readIdx = permissions.indexOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            if (readIdx >= 0 && grantResults.getOrNull(readIdx) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                loadRecentLastVideo()   // 授权前查不了 MediaStore，这里补一次
+            }
+            if (camGranted) {
+                tryStart()
+            } else {
+                showStatusText("未授予相机权限，无法追踪人脸")
+            }
         } else if (requestCode == REQ_MIC) {
             if (grantResults.isNotEmpty() && grantResults[0] ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -1050,12 +1071,24 @@ class ArActivity : Activity() {
 
     /** 前台载入最近一条录像（跨会话）：查询 Movies 里最新的视频设为 lastVideoUri 并生成缩略图。 */
     private fun loadRecentLastVideo() {
+        // 29+ 无授权也能查到本应用自录的媒体；24–28 需要运行时读存储权限，
+        // 缺失时查询必抛 SecurityException，这里直接跳过（授权回调里会再查一次）。
+        if (Build.VERSION.SDK_INT < 30 &&
+            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        // RELATIVE_PATH 是 API 29+ 新增列，24–28 的 projection 里带上会 SQLiteException
+        val cols = if (Build.VERSION.SDK_INT >= 29) arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME,
+            MediaStore.Video.Media.RELATIVE_PATH)
+        else arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME)
         Thread {
             try {
-                val cols = arrayOf(
-                    MediaStore.Video.Media._ID,
-                    MediaStore.Video.Media.DISPLAY_NAME,
-                    MediaStore.Video.Media.RELATIVE_PATH)
                 val c = contentResolver.query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     cols, null, null, MediaStore.Video.Media.DATE_ADDED + " DESC") ?: return@Thread
                 if (c.moveToFirst() && isMoviesRow(c)) {
