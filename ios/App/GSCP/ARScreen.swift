@@ -151,29 +151,32 @@ final class ARContainerUIView: UIView {
 
     private func apply(anchor: FaceAnchor) {
         latestAnchor = anchor
-        guard let overlay = session?.overlayPlayer.displayLayer else { return }
+        guard let player = session?.overlayPlayer else { return }
+        let overlay = player.displayLayer
         let scalePct = CGFloat(settings?.overlayScalePct ?? 100)
+        // 流宽高比（CALayer 无 width/height，用 player 记录的流信息）
+        let streamAspect: CGFloat = {
+            guard player.width > 0, player.height > 0 else { return 1.6 }
+            return CGFloat(player.height) / CGFloat(player.width)
+        }()
         if anchor.valid {
             // overlay 画在人脸上方（对齐 Android：overlay 画在人脸正前方，
             // 尺寸随人脸宽度 ≈ 距离）
             let faceW = anchor.size * bounds.width
             let targetW = faceW * 1.35 * (scalePct / 100)
-            let aspect = overlay.width > 0
-                ? CGFloat(overlay.height) / CGFloat(overlay.width) : 1.6
-            let targetH = targetW * aspect
+            let targetH = targetW * streamAspect
             let center = CGPoint(x: anchor.center.x * bounds.width,
                                  y: anchor.center.y * bounds.height - targetH * 0.1)
             var t = CGAffineTransform.identity
             t = t.translatedBy(x: center.x, y: center.y)
             t = t.rotated(by: anchor.roll)
             t = t.translatedBy(x: -targetW / 2, y: -targetH / 2)
-            overlay.setAffineTransform(t)
-            overlay.frame = CGRect(x: 0, y: 0, width: targetW, height: targetH)
+            overlay.bounds = CGRect(x: 0, y: 0, width: targetW, height: targetH)
             overlay.setAffineTransform(t)
             overlay.isHidden = false
         } else {
             // 无脸：居中全幅（与 Android 无脸时的兜底一致）
-            overlay.frame = bounds
+            overlay.bounds = bounds
             overlay.setAffineTransform(.identity)
             overlay.isHidden = false
         }

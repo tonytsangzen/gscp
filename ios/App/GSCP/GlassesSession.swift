@@ -25,6 +25,8 @@ final class GlassesSession: ObservableObject {
     /// Opus 解码 + 播放（按需创建：拿到 OpusHead 后才知道声道数）
     private let audioDecoder = OpusAudioDecoder()
     private var audioOut: AudioOut?
+    /// ScrcpyConnection.delegate 是 weak，delegateBox 必须在此强持有
+    private var delegateBox: ScrcpyEventDelegate?
 
     func connect(ip: String, port: UInt16 = 5555, settings: AppSettings) {
         guard state != .connecting, stateIsNotStreaming else { return }
@@ -35,7 +37,6 @@ final class GlassesSession: ObservableObject {
         if let audioOut, !audioOut.started {
             audioOut = nil                 // 引擎启动失败（如模拟器/无音频设备）→ 静默降级
         }
-        audioNote = audioOut == nil ? "" : ""
 
         let options = ScrcpyConnection.Options(
             audioEnabled: settings.audioEnabled,
@@ -112,8 +113,10 @@ final class GlassesSession: ObservableObject {
                 }
             }
         }
-        conn.delegate = DelegateBox(session: session, player: player,
-                                    opus: opus, audioOutBox: audioOutBox)
+        let box = DelegateBox(session: session, player: player,
+                              opus: opus, audioOutBox: audioOutBox)
+        conn.delegate = box
+        delegateBox = box
         overlayPlayer.onFirstFrame = { [weak self] in
             // 首帧即视为流 established（与 Android 看门狗语义一致：8s 无帧 = 超时）
         }
