@@ -9,11 +9,11 @@ final class AppSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        _ip = defaults.string(forKey: "ip") ?? ""
-        _overlayScalePct = defaults.object(forKey: "overlayScalePct") as? Int ?? 100
-        _overlayAlphaPct = defaults.object(forKey: "overlayAlphaPct") as? Int ?? 100
-        _overlayBrightnessPct = defaults.object(forKey: "overlayBrightnessPct") as? Int ?? 100
-        _audioEnabled = defaults.object(forKey: "audioEnabled") as? Bool ?? true
+        _ip = Published(initialValue: defaults.string(forKey: "ip") ?? "")
+        _overlayScalePct = Published(initialValue: defaults.object(forKey: "overlayScalePct") as? Int ?? 100)
+        _overlayAlphaPct = Published(initialValue: defaults.object(forKey: "overlayAlphaPct") as? Int ?? 100)
+        _overlayBrightnessPct = Published(initialValue: defaults.object(forKey: "overlayBrightnessPct") as? Int ?? 100)
+        _audioEnabled = Published(initialValue: defaults.object(forKey: "audioEnabled") as? Bool ?? true)
     }
 
     @Published private(set) var ip: String

@@ -260,6 +260,7 @@
 			isa = XCSwiftPackageProductDependency;
 			packageName = GSCPKit;
 			package = AA0000000000000000000021 /* XCLocalSwiftPackageReference ".." */;
+			productName = GSCPKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

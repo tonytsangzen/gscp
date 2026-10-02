@@ -109,14 +109,14 @@ final class ARContainerUIView: UIView {
         let preview = AVCaptureVideoPreviewLayer(session: tracker.session)
         preview.videoGravity = .resizeAspectFill
         preview.frame = bounds
-        preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer.addSublayer(preview)
 
         // overlay 层（置顶）
         let overlay = session.overlayPlayer.displayLayer
         overlay.videoGravity = .resizeAspect
         overlay.frame = bounds
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer.addSublayer(overlay)
 
         // 人脸锚点 → overlay 变换
@@ -133,7 +133,7 @@ final class ARContainerUIView: UIView {
     func applySettings(_ settings: AppSettings) {
         let overlay = session?.overlayPlayer.displayLayer
         overlay?.opacity = Float(settings.overlayAlphaPct) / 100
-        apply(latestAnchor)   // 缩放参数变化立即生效
+        apply(anchor: latestAnchor)   // 缩放参数变化立即生效
     }
 
     func setRecording(_ on: Bool) {
@@ -184,6 +184,6 @@ final class ARContainerUIView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        apply(latestAnchor)
+        apply(anchor: latestAnchor)
     }
 }
