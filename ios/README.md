@@ -73,6 +73,25 @@ swift run gscp-selftest    # 协议自检（帧格式/annexB/adb 帧/CRC/密钥�
 验证了未授权超时路径；手机上点「允许 USB 调试」后探针即可完成真机授权闭环
 （密钥与 Android 端一致，已被眼镜配对过的设备天然信任）。
 
+## 真机安装（免费 Apple ID 个人签名）
+
+不想付费加入 Developer Program 时，用个人团队免费签名（证书由 Xcode 自动生成）：
+
+1. 本机装完整 Xcode（App Store；注意留 ~35GB 磁盘）
+2. Xcode → Settings → Accounts 登录 Apple ID（双因素验证）
+3. iPhone 数据线连接，手机端 打开 设置 → 隐私与安全性 → 开发者模式
+4. Xcode 打开 `ios/App/GSCP.xcodeproj` → Signing & Capabilities →
+   Team 选个人团队 → 首次构建（Xcode 自动生成证书 + 免费描述文件并注册设备）
+5. 之后命令行出包/续签：
+
+   ```sh
+   ios/scripts/build-device.sh     # 自动识别证书/TeamID，构建 ipa 并可选安装
+   ```
+
+免费签名限制：描述文件 7 天过期（过期重跑脚本即可）、每设备每周 3 个应用、
+无法进 CI 常态出包。付费账号（$99/年）则走 developer.apple.com 的证书申请
+流程 + CI 密钥签名，可常态分发真机包。
+
 ## 构建 iOS App（需完整 Xcode 17+）
 
 ```sh
