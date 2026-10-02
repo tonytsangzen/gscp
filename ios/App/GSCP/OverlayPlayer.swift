@@ -2,6 +2,7 @@ import Foundation
 import CoreMedia
 import AVFoundation
 import UIKit
+import GSCPKit
 
 /// overlay 流播放器：scrcpy overlay 帧 → AVSampleBufferDisplayLayer 硬解上屏。
 /// （能力对齐 Android GlassesPlayer 的 overlay 解码渲染路径；iOS 用系统

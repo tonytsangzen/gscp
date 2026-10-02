@@ -84,7 +84,7 @@ final class CameraFaceTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDel
             self.onAnchor?(FaceAnchor(center: center, size: box.width,
                                       roll: roll, yaw: yaw, valid: true))
         }
-        let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .frontMirrored, options: [:])
+        let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .leftMirrored, options: [:])
         try? handler.perform([request])
     }
 }

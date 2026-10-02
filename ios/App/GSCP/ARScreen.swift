@@ -92,6 +92,7 @@ struct ARContainerView: UIViewRepresentable {
 }
 
 /// 合成视图：底层相机预览，上层 overlay DisplayLayer 随人脸锚点变换。
+/// （CALayer 的 autoresizingMask 在 iOS 不可用：子层几何统一在 layoutSubviews 维护。）
 final class ARContainerUIView: UIView {
     private weak var session: GlassesSession?
     private var tracker = CameraFaceTracker()
@@ -99,6 +100,7 @@ final class ARContainerUIView: UIView {
     private var settings: AppSettings?
     private var recording = false
     private var latestAnchor = FaceAnchor(center: .zero, size: 0, roll: 0, yaw: 0, valid: false)
+    private let previewLayer = AVCaptureVideoPreviewLayer()
 
     func attach(session: GlassesSession, settings: AppSettings) {
         self.session = session
@@ -106,17 +108,16 @@ final class ARContainerUIView: UIView {
 
         // 相机预览层
         tracker.session.sessionPreset = .high
-        let preview = AVCaptureVideoPreviewLayer(session: tracker.session)
-        preview.videoGravity = .resizeAspectFill
-        preview.frame = bounds
-        preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        layer.addSublayer(preview)
+        previewLayer.session = tracker.session
+        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.frame = bounds
+        layer.addSublayer(previewLayer)
 
         // overlay 层（置顶）
         let overlay = session.overlayPlayer.displayLayer
         overlay.videoGravity = .resizeAspect
-        overlay.frame = bounds
-        overlay.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        overlay.bounds = bounds
+        overlay.position = CGPoint(x: bounds.midX, y: bounds.midY)
         layer.addSublayer(overlay)
 
         // 人脸锚点 → overlay 变换
@@ -159,6 +160,10 @@ final class ARContainerUIView: UIView {
             guard player.width > 0, player.height > 0 else { return 1.6 }
             return CGFloat(player.height) / CGFloat(player.width)
         }()
+        // 独立子层的 anchorPoint 默认 (0,0)：统一改为中心锚点，position 即层中心
+        if overlay.anchorPoint != CGPoint(x: 0.5, y: 0.5) {
+            overlay.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        }
         if anchor.valid {
             // overlay 画在人脸上方（对齐 Android：overlay 画在人脸正前方，
             // 尺寸随人脸宽度 ≈ 距离）
@@ -167,16 +172,14 @@ final class ARContainerUIView: UIView {
             let targetH = targetW * streamAspect
             let center = CGPoint(x: anchor.center.x * bounds.width,
                                  y: anchor.center.y * bounds.height - targetH * 0.1)
-            var t = CGAffineTransform.identity
-            t = t.translatedBy(x: center.x, y: center.y)
-            t = t.rotated(by: anchor.roll)
-            t = t.translatedBy(x: -targetW / 2, y: -targetH / 2)
             overlay.bounds = CGRect(x: 0, y: 0, width: targetW, height: targetH)
-            overlay.setAffineTransform(t)
+            overlay.position = center
+            overlay.setAffineTransform(CGAffineTransform(rotationAngle: anchor.roll))
             overlay.isHidden = false
         } else {
             // 无脸：居中全幅（与 Android 无脸时的兜底一致）
             overlay.bounds = bounds
+            overlay.position = CGPoint(x: bounds.midX, y: bounds.midY)
             overlay.setAffineTransform(.identity)
             overlay.isHidden = false
         }
@@ -184,6 +187,10 @@ final class ARContainerUIView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.frame = bounds
         apply(anchor: latestAnchor)
+        CATransaction.commit()
     }
 }

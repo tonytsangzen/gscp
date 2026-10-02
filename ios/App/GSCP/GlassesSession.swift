@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import GSCPKit
 
 /// 会话状态（对齐 Android ArActivity 的 recOverlay 状态文案语义）。
 enum GlassesState: Equatable {
@@ -16,7 +17,6 @@ final class GlassesSession: ObservableObject {
     @Published private(set) var state: GlassesState = .idle
     @Published private(set) var overlayFrames = 0
     @Published private(set) var audioPackets = 0
-    /// v1 说明：iOS 无系统 Opus 解码器，音频流已接收但暂不播放（见 ios/README.md）。
     @Published private(set) var audioNote: String = ""
 
     let overlayPlayer = OverlayPlayer()
@@ -34,7 +34,7 @@ final class GlassesSession: ObservableObject {
         state = .connecting
         overlayPlayer.reset()
         audioOut = AudioOut(channels: 2)   // OpusHead 到达后如声道不同由解码侧容错
-        if let audioOut, !audioOut.started {
+        if let out = audioOut, !out.started {
             audioOut = nil                 // 引擎启动失败（如模拟器/无音频设备）→ 静默降级
         }
 
