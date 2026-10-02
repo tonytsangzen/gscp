@@ -158,11 +158,58 @@ jobs:
           if-no-files-found: error
           path: crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/gscp_*.apk
 
+  # ── iOS：协议自检 + 模拟器 App 包 ──
+  ios:
+    name: iOS (selftest + simulator app)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选择最新 Xcode（App 工程为 Xcode 16+ 同步分组格式）
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -n1)/Contents/Developer"
+          xcodebuild -version
+
+      - name: 协议自检（adb/scrcpy 帧格式、密钥解析、AUTH 签名、OpusHead/libopus）
+        working-directory: ios
+        run: |
+          swift build
+          swift run gscp-selftest
+
+      - name: 安装 xcodegen（工程构建失败时的回退生成器）
+        run: brew install xcodegen
+
+      - name: 构建模拟器 App（优先已提交工程，失败回退 xcodegen 重新生成）
+        working-directory: ios/App
+        run: |
+          set -euo pipefail
+          build() {
+            xcodebuild -project GSCP.xcodeproj -target GSCP -configuration Release \
+              -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO SYMROOT="$PWD/build" build
+          }
+          if ! build; then
+            echo "已提交工程构建失败 → xcodegen 重新生成后重试"
+            xcodegen generate
+            build
+          fi
+          APP=$(ls -d build/Release-iphonesimulator/GSCP.app)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$GITHUB_WORKSPACE/Cargo.toml" | head -n1)
+          ditto -c -k --keepParent "$APP" "gscp_${VERSION}_ios_simulator.app.zip"
+          ls -lh "gscp_${VERSION}_ios_simulator.app.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: gscp-ios-simulator
+          if-no-files-found: error
+          path: ios/App/gscp_*_ios_simulator.app.zip
+
   # ── 发布：tag 推送时自动创建 Release 并绑定各平台产物与文档 ──
   release:
     name: 发布 GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [desktop, android]
+    needs: [desktop, android, ios]
     runs-on: ubuntu-latest
     permissions:
       contents: write
