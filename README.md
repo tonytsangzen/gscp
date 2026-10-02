@@ -3,7 +3,7 @@
 在电脑或手机上观看 AR 眼镜画面的工具：给眼镜配好 Wi-Fi，之后随时随地无线投屏——
 眼镜看到的（camera）+ 眼镜显示的（overlay）+ 声音，合成在一个窗口里实时观看。
 
-支持 **Windows / macOS / Linux / Android**。
+支持 **Windows / macOS / Linux / Android / iOS**。
 
 ---
 
@@ -18,6 +18,7 @@
 | Linux（Debian/Ubuntu） | `gscp_<版本>_amd64.deb` |
 | Linux（通用） | `gscp_<版本>_amd64.AppImage` |
 | Android（arm64） | `gscp_<版本>_aarch64.apk` |
+| iOS（模拟器） | `gscp_<版本>_ios_simulator.app.zip`（拖入 iOS 模拟器使用；真机包需开发者签名，暂未分发） |
 
 ## 桌面端使用（Windows / macOS / Linux）
 
@@ -74,6 +75,21 @@
 4. 播放中：点连接页右上角 **⚙** 调整参数（overlay 缩放 / 透明度 /
    亮度 / 饱和度 / 抠像 / 底图旋转等）；播放为全屏沉浸模式，
    从屏幕边缘滑动可临时呼出系统栏，按返回键断开回到连接页。
+
+## iPhone 端使用
+
+iOS 端与 Android 同构：只负责「连接 + 播放」，配网先用桌面端完成。
+
+1. 下载 `gscp_<版本>_ios_simulator.app.zip`，解压后把 `GSCP.app`
+   拖进 iOS 模拟器（Xcode → Devices）即可运行；真机安装需自行用
+   Xcode 签名构建（见下）。
+2. 确认 iPhone 与眼镜连接同一 Wi-Fi，输入眼镜 IP 点「连接」。
+3. 全屏 AR 会自动开启：手机前摄追踪人脸，眼镜 overlay 画在人脸正前方；
+   右侧按钮退出，中键录像，左侧 ⚙ 调整参数。
+4. 音频经内嵌 libopus 解码播放；设置里可关。
+
+> 核心协议栈（ADB / scrcpy / 硬解 / 音频）与桌面、Android 共用同一套
+> 语义，详见 [ios/README.md](ios/README.md) 的能力对齐矩阵与验证记录。
 
 ## 常见问题
 
@@ -154,6 +170,29 @@ cd crates/gscp-app/gen/android
 版本号在三处：`Cargo.toml`、`crates/gscp-app/tauri.conf.json`、
 `crates/gscp-app/gen/android/app/tauri.properties`（versionName/versionCode）。
 
+### 从源码构建 iOS 版本
+
+iOS 端是纯 Swift（无 Rust 依赖），核心协议栈在 `ios/` 的 SwiftPM 包里：
+
+```sh
+cd ios
+swift build                # GSCPKit + 闭环探针 + 协议自检 全部编译
+swift run gscp-selftest    # 23 项协议自检（帧格式/密钥/AUTH 签名/OpusHead…）
+
+# 闭环探针（macOS 上把任一 Android 设备的 adbd 当"眼镜"跑全链路）：
+.build/debug/gscp-probe 127.0.0.1 5555 20
+```
+
+App 构建（需完整 Xcode 17+）：
+
+```sh
+open ios/App/GSCP.xcodeproj        # Cmd+R 运行到模拟器/真机
+# 工程打不开时：brew install xcodegen && ios/App/gen-project.sh 重新生成
+```
+
+CI 的 `ios` job 在每次 push 时跑自检 + 模拟器包构建；协议细节、能力
+对齐矩阵与已知限制见 [ios/README.md](ios/README.md)。
+
 ## License
 
 本项目代码以 [MIT License](LICENSE) 授权。
@@ -166,6 +205,7 @@ cd crates/gscp-app/gen/android
 | OpenH264（源码编译） | H.264 软件解码 | BSD-2-Clause |
 | libopus | 音频解码（Unix 系统库） | BSD-3-Clause |
 | libadb（Android 端 AAR） | adb 协议实现 | GPL-3.0 |
+| libopus 1.5.2（iOS 端源码内嵌） | 音频解码 | BSD-3-Clause |
 | Tauri / wgpu / winit 等 Rust 生态 | 应用框架与渲染 | MIT OR Apache-2.0 |
 
 > 注意：Android 端因捆绑 GPL-3.0 的 libadb 库，该端应用按 GPL-3.0 授权分发；
