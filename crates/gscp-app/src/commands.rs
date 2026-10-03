@@ -196,17 +196,6 @@ fn run_start_wifi_sync(ssid: &str, password: &str, keepalive: bool) -> anyhow::R
     let ip = gscp_core::wifi::get_ip_address(&mut device, 30)?;
     logbus::emit(&format!("连接成功:{ip}"));
 
-    if keepalive {
-        logbus::emit("启动wifi保活...");
-        match wrapper.connect_device(DEVICE_MODEL_PREFIX) {
-            Ok(mut d) => {
-                gscp_core::daemon::deploy_wifi_daemon(&mut d)?;
-                logbus::emit("守护进程已部署");
-            }
-            Err(e) => logbus::emit(&format!("守护进程部署失败: {e:#}")),
-        }
-    }
-
     logbus::emit("启用 ADB TCP/IP...");
     gscp_core::wifi::enable_adb_tcpip(5555)?;
 
@@ -231,6 +220,22 @@ fn run_start_wifi_sync(ssid: &str, password: &str, keepalive: bool) -> anyhow::R
     }
     if !connected {
         logbus::emit(&format!("警告: 无法通过 TCP 连接 {ip}:5555, 但 WiFi 已配置"));
+    }
+
+    if keepalive {
+        logbus::emit("启动wifi保活...");
+        // 经 adb shell 拉起的进程位于 adbd 的 cgroup 内，adbd 重启（adb tcpip
+        // 切换）会连带杀掉它们，因此 daemon 必须在 TCP 模式切换完成后再部署。
+        let mut daemon_device = wrapper
+            .get_device_by_name(&format!("{ip}:5555"))
+            .or_else(|_| wrapper.connect_device(DEVICE_MODEL_PREFIX));
+        match daemon_device.as_mut() {
+            Ok(d) => match gscp_core::daemon::deploy_wifi_daemon(d) {
+                Ok(()) => logbus::emit("守护进程已部署"),
+                Err(e) => logbus::emit(&format!("守护进程部署失败: {e:#}")),
+            },
+            Err(e) => logbus::emit(&format!("守护进程部署失败: {e:#}")),
+        }
     }
 
     Ok(ip)

@@ -6,6 +6,11 @@ use crate::adb::{self, ADBServerDevice};
 const DAEMON_REMOTE_PATH: &str = "/data/local/tmp/wifi_daemon";
 
 /// 部署并启动 WiFi 保活 daemon：杀旧进程 → push → chmod → 运行。
+///
+/// 关键约束：经 adb shell 拉起的进程位于 adbd 的 cgroup 内，`adb tcpip` 切换
+/// 会重启 adbd 并连带杀掉它们（setsid 也无法幸免）。因此必须在 adbd 重启
+/// （TCP 模式切换）完成之后调用，否则 daemon 启动后几秒内即被杀。
+/// 见 `gscp-app` 的 `run_start_wifi_sync` 与 `tests/daemon_deploy_e2e.rs`。
 pub fn deploy_wifi_daemon(device: &mut ADBServerDevice) -> anyhow::Result<()> {
     let _ = adb::shell_command(device, "killall wifi_daemon");
     adb::upload_file(device, crate::WIFI_DAEMON_BYTES, DAEMON_REMOTE_PATH)?;
