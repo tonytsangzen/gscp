@@ -26,3 +26,9 @@ scripts/build-android.sh            # 只构建不安装
 - [ ] 改过 `tools/ncnn/*.cpp`：构建日志里确认 shim 重新编译（`✓ jniLibs/arm64-v8a/libncnnshim.so`）
 - [ ] 排查 native 行为问题时先**卸载重装**（防设备上残留旧库造成误判）
 - [ ] 真机回归：AR 前摄（跟踪 / overlay 对齐 / 发光 / 录像）、AR 后摄（画面 / 音频）、第一页播放
+
+## 版本记录
+
+| 版本 | 主要变更 |
+|---|---|
+| 1.2.5 | 修复 Wi-Fi 保活 daemon 启动即被杀：`adb tcpip` 切换重启 adbd 时会按 cgroup 连带杀掉 shell 拉起的进程，daemon 部署移至 TCP 模式切换完成之后经 TCP 连接执行；新增 `daemon_deploy_e2e` 设备端时序测试 |
