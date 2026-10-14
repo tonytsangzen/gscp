@@ -123,8 +123,42 @@ jobs:
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "NDK: $NDK"
 
+      - name: 拉取 ncnn 源码（vendored 目录被 gitignore，锁定提交 + glslang submodule）
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Tencent/ncnn tools/ncnn/src
+          git -C tools/ncnn/src fetch --depth 1 origin 6c52e59dfb610cbd77946bea19099aaf96f8dcc1
+          git -C tools/ncnn/src checkout 6c52e59dfb610cbd77946bea19099aaf96f8dcc1
+          git -C tools/ncnn/src submodule update --init --depth 1 glslang
+
+      - name: 构建 ncnn（arm64-v8a shared + Vulkan，与本地 tools/ncnn/build-android-arm64 同参）
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y libvulkan-dev
+          cmake -S tools/ncnn/src -B tools/ncnn/build-android-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_SHARED_LIB=ON -DNCNN_VULKAN=ON -DNCNN_OPENMP=OFF \
+            -DNCNN_BUILD_TOOLS=OFF -DNCNN_BUILD_EXAMPLES=OFF
+          cmake --build tools/ncnn/build-android-arm64 --parallel
+
       - name: 预构建 Rust 库（解包 registry 源码并预热编译）
         run: cargo build --release --package gscp-app --lib --target aarch64-linux-android
+
+      - name: 构建 ncnnshim（ar_face_live.cpp → jniLibs/arm64-v8a）
+        run: ./tools/ncnn/build-shim.sh
+
+      # jniLibs/**/*.so 被 gitignore：本地图 Rust 库靠 symlink、libc++_shared 靠手工放入，
+      # CI 没有这些产物，缺了就是残缺 APK（libgscp_app_lib.so 不打包 / AR 进屏即闪退）。
+      - name: 备齐 jniLibs（Rust 库 + libc++_shared）
+        run: |
+          set -euo pipefail
+          LIBS=crates/gscp-app/gen/android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$LIBS"
+          cp target/aarch64-linux-android/release/libgscp_app_lib.so "$LIBS/"
+          cp "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$LIBS/"
+          ls -l "$LIBS"
 
       - name: 生成 tauri.settings.gradle（BuildTask 直调 cargo，需自行生成）
         run: ./scripts/gen-tauri-settings.sh
@@ -143,6 +177,24 @@ jobs:
           "$APKSIGNER" verify --print-certs "$APK"
           "$APKSIGNER" verify "$APK"
           echo "已验证 release 签名: $APK"
+
+      # 2026-10-14 教训：CI 出过只有 libconscrypt_jni.so 的残缺包（缺 libncnnshim.so
+      # 进 AR 即 UnsatisfiedLinkError 闪退、缺 libgscp_app_lib.so、版本号回落 1.0），
+      # 此校验让任何一步遗漏在 CI 直接红，而不是装到真机上才发现。
+      - name: 验证 APK 完整性（native 库清单 + 版本号）
+        run: |
+          set -euo pipefail
+          APK=$(ls crates/gscp-app/gen/android/app/build/outputs/apk/arm64/release/*.apk | head -n1)
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          for lib in libgscp_app_lib.so libncnn.so libncnnshim.so libc++_shared.so; do
+            unzip -l "$APK" | grep -q "lib/arm64-v8a/$lib" \
+              || { echo "::error::APK 缺少 lib/arm64-v8a/${lib}（检查 ncnn/shim/jniLibs 构建步骤）"; exit 1; }
+          done
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
+          "$AAPT2" dump badging "$APK" | grep -o "versionName='[^']*' versionCode='[^']*'" | head -n1
+          "$AAPT2" dump badging "$APK" | grep -q "versionName='$VERSION'" \
+            || { echo "::error::versionName 不是 ${VERSION}（tauri.properties 未生成？）"; exit 1; }
+          echo "✓ APK 完整性校验通过: $APK"
 
       - name: 统一 APK 命名（gscp_<版本>_aarch64.apk）
         run: |

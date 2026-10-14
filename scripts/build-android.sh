@@ -57,6 +57,10 @@ export PATH="$TOOLCHAIN:$PATH"
 export CC_aarch64_linux_android=aarch64-linux-android24-clang
 export AR_aarch64_linux_android=llvm-ar
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android24-clang"
+# cmake 系依赖（audiopus_sys/opus 等）按 ANDROID_NDK / ANDROID_NDK_ROOT 定位 NDK，
+# 与 NDK_HOME 同步导出，避免依赖调用方 shell 是否已设置
+export ANDROID_NDK="$NDK_HOME"
+export ANDROID_NDK_ROOT="$NDK_HOME"
 echo "✓ SDK:  $ANDROID_HOME"
 echo "✓ NDK:  $NDK_HOME"
 

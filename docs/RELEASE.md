@@ -19,6 +19,7 @@ scripts/build-android.sh            # 只构建不安装
 | `libncnnshim.so` **不在 Gradle/Rust 构建链内**（源码 `tools/ncnn/ar_face_live.cpp`，AR 人脸跟踪管线） | 改了 `tools/ncnn/*.cpp` 后绕过脚本构建，APK 静默打包旧库；或手动跑 `build-shim.sh` 与正式出包脱节 → "native 改动没生效/行为不一致"的误判，排查数小时 | 每次构建统一重编 shim |
 | Rust 交叉编译环境（CC/AR/linker）缺失 | 裸 `./gradlew` 在 `ring` 等依赖上直接失败（找不到 `aarch64-linux-android24-clang`） | 自动探测 SDK/NDK 路径并注入环境变量 |
 | `tauri.settings.gradle` 为 gitignored 生成物 | 依赖变更后缺失或过期 | 按 `Cargo.lock` 统一刷新 |
+| CI 与脚本同链路：jniLibs 的 so（含 `libgscp_app_lib.so`、`libc++_shared.so`）与 `app/tauri.properties` 都是 gitignored 本地产物，CI checkout 天生没有 | 2026-10-14 CI 打出只有 `libconscrypt_jni.so` 的残缺包：进 AR 即 `UnsatisfiedLinkError: libncnnshim.so` 闪退，versionName 回落 1.0 | ci.yml 补齐 ncnn 拉取/构建、shim、jniLibs、tauri.properties 生成，并校验 APK 的 so 清单与版本号（缺了 CI 直接红） |
 
 ## 发布前检查清单
 
