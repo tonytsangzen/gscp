@@ -154,14 +154,15 @@ jobs:
       - name: 构建 ncnnshim（ar_face_live.cpp → jniLibs/arm64-v8a）
         run: ./tools/ncnn/build-shim.sh
 
-      # jniLibs/**/*.so 被 gitignore：本地图 Rust 库靠 symlink、libc++_shared 靠手工放入，
+      # jniLibs/**/*.so 被 gitignore：本地图 Rust 库靠 symlink、libncnn/libc++_shared 靠手工放入，
       # CI 没有这些产物，缺了就是残缺 APK（libgscp_app_lib.so 不打包 / AR 进屏即闪退）。
-      - name: 备齐 jniLibs（Rust 库 + libc++_shared）
+      - name: 备齐 jniLibs（Rust 库 + ncnn + libc++_shared）
         run: |
           set -euo pipefail
           LIBS=crates/gscp-app/gen/android/app/src/main/jniLibs/arm64-v8a
           mkdir -p "$LIBS"
           cp target/aarch64-linux-android/release/libgscp_app_lib.so "$LIBS/"
+          cp tools/ncnn/build-android-arm64/src/libncnn.so "$LIBS/"
           cp "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$LIBS/"
           ls -l "$LIBS"
 
