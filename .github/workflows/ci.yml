@@ -131,17 +131,22 @@ jobs:
           git -C tools/ncnn/src checkout 6c52e59dfb610cbd77946bea19099aaf96f8dcc1
           git -C tools/ncnn/src submodule update --init --depth 1 glslang
 
-      - name: 构建 ncnn（arm64-v8a shared + Vulkan，与本地 tools/ncnn/build-android-arm64 同参）
+      - name: 构建 ncnn（arm64-v8a shared + Vulkan，与本地同参；swap + 限并行防 runner OOM）
         run: |
           set -euo pipefail
           sudo apt-get install -y libvulkan-dev
+          # glslang 单文件编译内存峰值大，--parallel 会并发多个直接把 runner 内存打爆
+          # （2026-10-14 exit 143 SIGTERM 教训）：加 4G swap、-j2、只编 ncnn 目标
+          sudo fallocate -l 4G /swapfile || true
+          sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
           cmake -S tools/ncnn/src -B tools/ncnn/build-android-arm64 \
             -DCMAKE_TOOLCHAIN_FILE="$NDK_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
             -DCMAKE_BUILD_TYPE=Release \
             -DNCNN_SHARED_LIB=ON -DNCNN_VULKAN=ON -DNCNN_OPENMP=OFF \
             -DNCNN_BUILD_TOOLS=OFF -DNCNN_BUILD_EXAMPLES=OFF
-          cmake --build tools/ncnn/build-android-arm64 --parallel
+          cmake --build tools/ncnn/build-android-arm64 --target ncnn --parallel 2
+          sudo swapoff /swapfile || true
 
       - name: 预构建 Rust 库（解包 registry 源码并预热编译）
         run: cargo build --release --package gscp-app --lib --target aarch64-linux-android
