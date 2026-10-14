@@ -197,8 +197,10 @@ jobs:
               || { echo "::error::APK 缺少 lib/arm64-v8a/${lib}（检查 ncnn/shim/jniLibs 构建步骤）"; exit 1; }
           done
           AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
-          "$AAPT2" dump badging "$APK" | grep -o "versionName='[^']*' versionCode='[^']*'" | head -n1
-          "$AAPT2" dump badging "$APK" | grep -q "versionName='$VERSION'" \
+          # badging 首行：package: name='...' versionCode='...' versionName='...'
+          BADGING=$("$AAPT2" dump badging "$APK" | head -n1)
+          echo "$BADGING"
+          echo "$BADGING" | grep -q "versionName='$VERSION'" \
             || { echo "::error::versionName 不是 ${VERSION}（tauri.properties 未生成？）"; exit 1; }
           echo "✓ APK 完整性校验通过: $APK"
 
