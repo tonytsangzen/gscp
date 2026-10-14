@@ -32,4 +32,5 @@ scripts/build-android.sh            # 只构建不安装
 
 | 版本 | 主要变更 |
 |---|---|
+| 1.2.6 | CI Android 出包修复：补齐 ncnn/shim/jniLibs 构建链与 tauri.properties 生成，新增 APK so 清单+版本号校验（修复 CI 包缺 `libncnnshim.so` 进 AR 即 `UnsatisfiedLinkError` 闪退、版本号回落 1.0）；`build-android.sh` 显式导出 `ANDROID_NDK`（audiopus/opus 的 cmake 构建不再依赖调用方 shell 环境） |
 | 1.2.5 | 修复 Wi-Fi 保活 daemon 启动即被杀：`adb tcpip` 切换重启 adbd 时会按 cgroup 连带杀掉 shell 拉起的进程，daemon 部署移至 TCP 模式切换完成之后经 TCP 连接执行；新增 `daemon_deploy_e2e` 设备端时序测试 |
